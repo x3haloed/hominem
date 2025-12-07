@@ -101,11 +101,13 @@ Learns a parametric representation of human-like reward vectors.
 The reward model MUST:
 
 - Accept tokenized input-output concatenations.
-- Produce a fixed-dimensional reward vector.
-- Provide a mechanism for overall scalar value computation.
-- Preserve dimensional independence (no forced correlations).
+- Produce a fixed-dimensional **reward vector** across the defined manifold dimensions.
+- Produce an additional **RewardIntensity scalar** encoding how strongly this moment should drive learning (analogous to dopaminergic gain / temporal horizon setting).
+- Optionally produce a **SafetyScore** scalar or safety-related dimension indicating when plasticity should be blocked or inverted.
+- Provide a mechanism for overall scalar value computation (for compatibility with scalar-RL methods).
+- Preserve dimensional independence (no forced correlations) while allowing for downstream weighting (e.g., social-priority weighting).
 
-### **3.2.3 Training Procedure**
+### **3.2.3 Training Procedure****
 
 - Supervised training using paired (input, output, reward vector).
 - Rationale conditioning: optionally feed rationales as auxiliary training signals.
@@ -115,7 +117,11 @@ The reward model MUST:
 ### **3.2.4 Outputs**
 
 - A trained **reward model** capable of real-time inference.
-- Optional calibration curves for each reward dimension.
+- For each (input, output) pair, the model provides:
+  - A **reward vector** over the manifold dimensions.
+  - A **RewardIntensity scalar** used to modulate learning-rate and/or discount horizon.
+  - A **SafetyScore** or safety dimension used by the Safety Gate.
+  - Optional calibration curves for each reward dimension.
 
 ---
 
@@ -243,18 +249,27 @@ This subsystem enables **simultaneous general memory soaking and reward-based sh
    - Writes to an append-only log (e.g., JSONL) for training consumption.
 
 2. **Online Batch Builder**
-   - Periodically samples recent interactions.
+   - Periodically samples recent interactions **plus replayed past interactions** from a replay buffer.
    - Constructs mini-batches with:
-     - SFT targets ("the model should reproduce or refine this response")
-     - Reward labels (from reward model and/or user feedback)
-   - Balances old vs new data to avoid catastrophic forgetting.
+     - SFT targets ("the model should reproduce or refine this response").
+     - Reward labels (reward vector, RewardIntensity, SafetyScore) from the reward model and/or user feedback.
+   - Applies **prioritized sampling**, e.g.:
+     - Higher probability for high-RewardIntensity events.
+     - Higher probability for strongly social/empathy-related contexts.
+     - Controlled mix of recent vs older samples to support long-horizon credit assignment.
 
 3. **Dual-Loss Trainer (LoRA Online Updater)**
    - For each batch, computes two losses on the **same examples**:
      - **SFT loss**: supervised objective to imitate/improve the chosen response.
      - **Reward loss**: objective derived from reward vectors (e.g., DPO-style or regression toward desired reward manifold values).
    - Combines them into a single update:
-     - `L_total = w_sft * L_sft + w_reward * L_reward`
+     - `L_total = w_sft * L_sft + RewardIntensity * w_reward * L_reward`,
+       where `RewardIntensity` may be per-example or per-batch, and may itself be a function of reward magnitude, model confidence, or explicit user emphasis.
+   - Applies **Safety Gate** logic per example or batch:
+     - If SafetyScore indicates unsafe or adversarial context, either:
+       - Skip update for that example, or
+       - Down-weight its contribution, or
+       - Apply inverse/regularizing updates as configured.
    - Applies gradients **only to LoRA parameters**.
 
 4. **Update Scheduler**
@@ -268,15 +283,53 @@ This subsystem enables **simultaneous general memory soaking and reward-based sh
    - Safely swaps active LoRA version used for inference.
    - Maintains a rollback mechanism to revert to a previous version.
 
-### **3.6.4 Outputs**
+### **3.6.4 Outputs****
 - Continuously updated LoRA adapters that:
   - Absorb **new knowledge and patterns** via SFT-like learning.
   - Adjust **behavioral and value tradeoffs** via reward manifold shaping.
 
 ### **3.6.5 Design Notes**
 - SFT and reward losses share data but can be weighted differently depending on goals.
-- The subsystem is agnostic to exact optimization algorithms (SGD, Adam, etc.) as long as dual-loss updates are supported.
+- **RewardIntensity** acts as a dynamic, biologically-inspired learning-rate / temporal-horizon modulator.
+- The **Safety Gate** provides a hard/soft filter to prevent pathological learning from unsafe or adversarial inputs.
+- Social-related dimensions (e.g., empathy, social coherence) may be given **architectural priority** via higher default weights or sampling priority, reflecting the privileged status of social cognition in human brains.
+- The subsystem is agnostic to exact optimization algorithms (SGD, Adam, etc.) as long as dual-loss updates and per-example weighting are supported.
 - The base model remains frozen; only LoRA is modified online.
+
+---
+
+# 3.7 Replay & Prioritized Sampling Subsystem
+
+This subsystem supports **offline and online replay** to extend the effective credit-assignment horizon and allow the system to revisit past experiences.
+
+### **3.7.1 Objectives**
+- Store past interactions and annotations for later reuse.
+- Implement prioritized sampling based on RewardIntensity, novelty, social salience, and safety.
+- Feed replayed samples into both offline training and online dual-channel updates.
+
+### **3.7.2 Components**
+1. **Replay Buffer Store**
+   - Append-only structure holding interaction records, reward vectors, RewardIntensity, and SafetyScore.
+   - Supports metadata tags (e.g., domain, social context, difficulty).
+
+2. **Prioritization Policy**
+   - Computes a priority score per sample based on:
+     - RewardIntensity magnitude.
+     - Social-related dimensions (e.g., empathy, social coherence).
+     - Rarity/novelty of context.
+     - Stability/safety constraints (e.g., deprioritize highly unsafe regions except in controlled regularization modes).
+
+3. **Sampler Interface**
+   - Provides unified sampling API to:
+     - Offline training (reward model, initial LoRA training).
+     - Online dual-channel updates.
+   - Configurable mix of:
+     - Recent vs older samples.
+     - High-priority vs random samples.
+
+### **3.7.3 Outputs**
+- Batches of replayed interactions ready to be consumed by training subsystems.
+- Improved long-horizon credit assignment and behavioral stability over time.
 
 ---
 
@@ -299,29 +352,35 @@ This subsystem enables **simultaneous general memory soaking and reward-based sh
 
 ### **4.3 Online Dual-Channel Learning Phase (Optional)**
 
-This phase describes the continuous learning loop where memory soaking and reward shaping occur together.
+This phase describes the continuous learning loop where memory soaking and reward shaping occur together, with replay and safety gating.
 
 1. **Interaction Capture**
    - For each live user interaction:
      - Log `(user_message, model_response, context_metadata)`.
      - Optionally store alternative responses and explicit user ratings.
+   - Insert each interaction into the **Replay Buffer** with initial priority scores.
 
 2. **Reward Annotation**
    - Run the reward model on `(user_message, model_response)` pairs.
-   - Produce reward vectors and optional scalars.
+   - Produce reward vectors, **RewardIntensity**, and **SafetyScore`/safety dimension`**.
    - Merge with any explicit user feedback (e.g., override or augment model-derived rewards).
+   - Update priority scores in the Replay Buffer (e.g., higher RewardIntensity → higher priority).
 
-3. **Batch Construction**
-   - Collect recent annotated interactions into a mini-batch.
+3. **Batch Construction (with Replay)**
+   - Use the Replay & Prioritized Sampling Subsystem to construct mini-batches mixing:
+     - Recent interactions.
+     - High-priority replayed interactions (e.g., strong reward, socially salient, or difficult cases).
    - For each example in the batch:
-     - Define the **SFT target** (usually the chosen response).
-     - Attach the **reward vector** and any preference signals.
+     - Define the **SFT target** (usually the chosen response or a refined teacher response).
+     - Attach the **reward vector**, RewardIntensity, and SafetyScore.
 
-4. **Dual-Loss LoRA Update**
+4. **Dual-Loss LoRA Update with Safety Gate**
    - For each batch:
      - Compute **SFT loss** to reinforce general patterns and knowledge.
      - Compute **reward loss** to align behavior with the reward manifold.
-     - Combine into `L_total = w_sft * L_sft + w_reward * L_reward`.
+     - Combine into `L_total = w_sft * L_sft + RewardIntensity * w_reward * L_reward`.
+     - Apply **Safety Gate** rules:
+       - Skip, down-weight, or regularize examples with unsafe SafetyScore according to policy.
      - Apply gradient updates to LoRA parameters only.
 
 5. **Versioning and Hot Reload**
@@ -332,9 +391,9 @@ This phase describes the continuous learning loop where memory soaking and rewar
 6. **Monitoring and Guardrails**
    - Periodically run the Evaluation & Probing Subsystem on the latest LoRA.
    - Detect regressions in:
-     - Reward manifold coherence
-     - Safety-critical behavior
-     - Core factual accuracy
+     - Reward manifold coherence.
+     - Safety-critical behavior.
+     - Core factual accuracy.
    - If regressions exceed thresholds, automatically revert to a previous stable LoRA.
 
 ---
@@ -382,25 +441,7 @@ Avoidance mechanisms needed for contradictory gradients.
 - Add uncertainty modeling to reward vector generation.
 - Introduce self-play loops to sharpen the field.
 - Expand manifold dimensionality dynamically based on data.
-
-## 7.1 Reward Model Improvement Plan (Concrete Implementation Notes)
-
-For the concrete implementation in `hominem`, once a larger labeled dataset is available, the reward model should be upgraded along these axes:
-
-- **Label normalization**
-  - Standardize labels per dimension (e.g., zero mean, unit variance) during training.
-  - Optionally track running statistics and store them alongside `METADATA.json` for consistent inference-time de-normalization.
-
-- **Training regime**
-  - Increase number of epochs and use early stopping based on validation loss.
-  - Expand the dataset and periodically re-train to avoid overfitting to the initial small set.
-
-- **Model capacity**
-  - Consider trying a slightly larger encoder (e.g., `bert-base-uncased` or a domain-tuned model) if capacity becomes a bottleneck.
-
-- **Metrics and monitoring**
-  - Track per-dimension RMSE/MAE and correlation between teacher labels and model predictions.
-  - Log these metrics per training run into the artifacts directory for regression tracking.
+- Model **hedonic comfort vs curiosity drive** as partially distinct channels (e.g., represent "quiet satisfaction" vs "dopaminergic insight bursts" as separate components of the manifold) for finer-grained control over exploration vs consolidation.
 
 ---
 
@@ -409,8 +450,9 @@ For the concrete implementation in `hominem`, once a larger labeled dataset is a
 This design provides all components necessary to:
 
 - Extract a human-like vector reward manifold,
-- Train an explicit reward model,
-- Distill its gradients into a LoRA adapter,
+- Train an explicit reward model (including RewardIntensity and SafetyScore for gain and safety gating),
+- Distill its gradients into a LoRA adapter via both offline and online dual-channel learning,
+- Use replay and prioritized sampling to extend the credit-assignment horizon,
 - Validate and deploy the resulting behavior-shaping layer.
 
 All modules are abstract and implementation-agnostic, allowing for maximum flexibility while supporting full functional completeness.
