@@ -96,7 +96,13 @@ def main() -> None:
     )
     lora_model.eval()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prefer Apple Silicon GPU (MPS) on macOS, then CUDA, then CPU.
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     base_model.to(device)
     lora_model.to(device)
 

@@ -146,7 +146,8 @@ def dpo_loss(
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -208,7 +209,13 @@ def train() -> None:
 
     model, tokenizer = prepare_model_and_tokenizer(cfg)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prefer Apple Silicon GPU (MPS) on macOS, then CUDA, then CPU.
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     model.to(device)
 
     dataset = PreferenceDataset(samples, tokenizer, max_length=model_cfg["max_length"])
