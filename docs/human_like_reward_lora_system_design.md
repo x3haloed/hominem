@@ -281,6 +281,25 @@ Avoidance mechanisms needed for contradictory gradients.
 - Introduce self-play loops to sharpen the field.
 - Expand manifold dimensionality dynamically based on data.
 
+## 7.1 Reward Model Improvement Plan (Concrete Implementation Notes)
+
+For the concrete implementation in `hominem`, once a larger labeled dataset is available, the reward model should be upgraded along these axes:
+
+- **Label normalization**
+  - Standardize labels per dimension (e.g., zero mean, unit variance) during training.
+  - Optionally track running statistics and store them alongside `METADATA.json` for consistent inference-time de-normalization.
+
+- **Training regime**
+  - Increase number of epochs and use early stopping based on validation loss.
+  - Expand the dataset and periodically re-train to avoid overfitting to the initial small set.
+
+- **Model capacity**
+  - Consider trying a slightly larger encoder (e.g., `bert-base-uncased` or a domain-tuned model) if capacity becomes a bottleneck.
+
+- **Metrics and monitoring**
+  - Track per-dimension RMSE/MAE and correlation between teacher labels and model predictions.
+  - Log these metrics per training run into the artifacts directory for regression tracking.
+
 ---
 
 # 8. Summary
