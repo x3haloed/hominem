@@ -218,6 +218,68 @@ Manages artifacts and ensures reproducible pipelines.
 
 ---
 
+# 3.6 Online Dual-Channel Learning Subsystem (Simultaneous Memory + Reward)
+
+This subsystem enables **simultaneous general memory soaking and reward-based shaping** on each user interaction, approximating cortical learning plus neuromodulatory reward in a single loop.
+
+### **3.6.1 Objectives**
+- Incorporate every eligible (user_message, model_response) pair into ongoing training.
+- Apply **supervised learning (SFT)** updates for factual/behavioral memory.
+- Apply **reward-based updates** using the reward model on the same batch.
+- Support near-real-time LoRA updates without retraining the base model.
+
+### **3.6.2 Inputs**
+- Live interaction logs containing:
+  - User message
+  - Model response (chosen output)
+  - Optional alternative responses (for preferences)
+  - Reward model outputs (reward vector, scalar)
+  - Optional explicit user feedback (thumbs up/down, tags per dimension)
+
+### **3.6.3 Core Functions**
+1. **Interaction Logger**
+   - Captures each turn in a normalized format.
+   - Assigns session IDs and timestamps.
+   - Writes to an append-only log (e.g., JSONL) for training consumption.
+
+2. **Online Batch Builder**
+   - Periodically samples recent interactions.
+   - Constructs mini-batches with:
+     - SFT targets ("the model should reproduce or refine this response")
+     - Reward labels (from reward model and/or user feedback)
+   - Balances old vs new data to avoid catastrophic forgetting.
+
+3. **Dual-Loss Trainer (LoRA Online Updater)**
+   - For each batch, computes two losses on the **same examples**:
+     - **SFT loss**: supervised objective to imitate/improve the chosen response.
+     - **Reward loss**: objective derived from reward vectors (e.g., DPO-style or regression toward desired reward manifold values).
+   - Combines them into a single update:
+     - `L_total = w_sft * L_sft + w_reward * L_reward`
+   - Applies gradients **only to LoRA parameters**.
+
+4. **Update Scheduler**
+   - Decides when to apply online updates:
+     - After N interactions, or
+     - At fixed time intervals, or
+     - On-demand (manual trigger).
+   - Writes new LoRA versions to the artifact store.
+
+5. **Hot-Swap Manager**
+   - Safely swaps active LoRA version used for inference.
+   - Maintains a rollback mechanism to revert to a previous version.
+
+### **3.6.4 Outputs**
+- Continuously updated LoRA adapters that:
+  - Absorb **new knowledge and patterns** via SFT-like learning.
+  - Adjust **behavioral and value tradeoffs** via reward manifold shaping.
+
+### **3.6.5 Design Notes**
+- SFT and reward losses share data but can be weighted differently depending on goals.
+- The subsystem is agnostic to exact optimization algorithms (SGD, Adam, etc.) as long as dual-loss updates are supported.
+- The base model remains frozen; only LoRA is modified online.
+
+---
+
 # 4. Operational Flow
 
 ### **4.1 Training Phase**
@@ -234,6 +296,46 @@ Manages artifacts and ensures reproducible pipelines.
 1. Combine target base model + LoRA.
 2. Route inference calls through combined adapter.
 3. Monitor outputs with ongoing manifold probing.
+
+### **4.3 Online Dual-Channel Learning Phase (Optional)**
+
+This phase describes the continuous learning loop where memory soaking and reward shaping occur together.
+
+1. **Interaction Capture**
+   - For each live user interaction:
+     - Log `(user_message, model_response, context_metadata)`.
+     - Optionally store alternative responses and explicit user ratings.
+
+2. **Reward Annotation**
+   - Run the reward model on `(user_message, model_response)` pairs.
+   - Produce reward vectors and optional scalars.
+   - Merge with any explicit user feedback (e.g., override or augment model-derived rewards).
+
+3. **Batch Construction**
+   - Collect recent annotated interactions into a mini-batch.
+   - For each example in the batch:
+     - Define the **SFT target** (usually the chosen response).
+     - Attach the **reward vector** and any preference signals.
+
+4. **Dual-Loss LoRA Update**
+   - For each batch:
+     - Compute **SFT loss** to reinforce general patterns and knowledge.
+     - Compute **reward loss** to align behavior with the reward manifold.
+     - Combine into `L_total = w_sft * L_sft + w_reward * L_reward`.
+     - Apply gradient updates to LoRA parameters only.
+
+5. **Versioning and Hot Reload**
+   - Save the updated LoRA as a new version in the artifact store.
+   - Update the active LoRA pointer used by the inference stack.
+   - Optionally retain a short history of versions for rollback.
+
+6. **Monitoring and Guardrails**
+   - Periodically run the Evaluation & Probing Subsystem on the latest LoRA.
+   - Detect regressions in:
+     - Reward manifold coherence
+     - Safety-critical behavior
+     - Core factual accuracy
+   - If regressions exceed thresholds, automatically revert to a previous stable LoRA.
 
 ---
 
