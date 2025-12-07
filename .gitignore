@@ -1,3 +1,6 @@
+#
+# Local trained reward model artifacts (too large for git)
+artifacts/reward_model/default/model/
 # Created by https://www.toptal.com/developers/gitignore/api/venv,macos,python,visualstudiocode,windows,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=venv,macos,python,visualstudiocode,windows,linux
 
