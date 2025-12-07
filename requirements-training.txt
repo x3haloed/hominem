@@ -8,5 +8,7 @@ bitsandbytes
 pyyaml
 requests
 tomli
+fastapi
+uvicorn[standard]
 
 
