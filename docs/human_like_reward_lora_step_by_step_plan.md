@@ -84,9 +84,12 @@ The goal is to reach a point where you can:
    - Write `core/data/schema.py` (or language-agnostic schema in `config/schemas/reward.json`):
      - Range for each dimension (e.g., -1.0 to 1.0 or 0–1).
      - Scalar aggregate (optional) for overall preference.
+     - Two cross-cutting scalars aligned with the system design:
+       - `reward_intensity`: how strongly this example should drive learning (used as a gain / temporal-horizon modulator).
+       - `safety_score`: how safe/unsafe the example is, used by the **Safety Gate** to block, down-weight, or invert learning.
 
 3. **Create a compact doc**
-   - `docs/REWARD_MANIFOLD.md`: clear description of each dimension, in your own language.
+   - `docs/REWARD_MANIFOLD.md`: clear description of each manifold dimension **plus** the semantics and ranges of `reward_intensity` and `safety_score`, in your own language.
 
 ---
 
@@ -137,8 +140,13 @@ The goal is to reach a point where you can:
 
 2. **Model definition (abstract)**
    - Define an interface:
-     - `RewardModel.encode(input_text, output_text) -> reward_vector`.
-   - Internally, it can be any transformer/architecture, but the interface must be stable.
+     - `RewardModel.score(input_text, output_text) -> RewardOutput`.
+     - `RewardOutput` should at least contain:
+       - `reward_vector`: the per-dimension manifold values.
+       - `reward_intensity`: scalar gain indicating how strongly this moment should drive learning.
+       - `safety_score`: scalar indicating when plasticity should be blocked, down-weighted, or regularized.
+       - (Optional) `scalar_preference`: overall scalar for compatibility with scalar-RL methods.
+   - Internally, it can be any transformer/architecture, but the interface must be stable and match the system-design requirements.
 
 3. **Training script**
    - `core/reward_model/train.py`:
@@ -149,6 +157,8 @@ The goal is to reach a point where you can:
    - Store model in `artifacts/reward_model/<version>/`.
    - Save a small `METADATA.json` with:
      - Dimensions
+     - Semantics and ranges for `reward_intensity` and `safety_score`
+     - Any normalization / calibration metadata per dimension (if used)
      - Training data hash
      - Date
 
@@ -181,6 +191,10 @@ The goal is to reach a point where you can:
      - Load base model + LoRA adapter.
      - Load preferences.
      - Use reward model implicitly (if desired) or precomputed preferences.
+     - When using the reward model online, optionally:
+       - Query `reward_vector`, `reward_intensity`, and `safety_score` for each candidate.
+       - Use `reward_intensity` as a per-example weight in the loss.
+       - Apply a **Safety Gate** that skips or down-weights updates where `safety_score` indicates unsafe or adversarial contexts.
 
 4. **Checkpoint output**
    - Store LoRA weights in `artifacts/lora/<model_name>/<version>/`.
@@ -200,12 +214,13 @@ The goal is to reach a point where you can:
 1. **Reward probe CLI**
    - `apps/cli/reward_probe`: given a prompt and candidate responses:
      - Show reward vector.
-     - Highlight which dimensions changed.
+     - Show `reward_intensity` and `safety_score` scalars.
+     - Highlight which dimensions changed and how that relates to intensity/safety.
 
 2. **Behavioral comparison CLI**
    - `apps/cli/compare_base_vs_lora`:
      - Same prompt → base output vs LoRA output.
-     - Show diffs and reward vectors.
+     - Show diffs, reward vectors, `reward_intensity`, and `safety_score` for each output.
 
 3. **Manifold visualization** (optional)
    - Export reward vectors for an evaluation set.
@@ -231,13 +246,33 @@ The goal is to reach a point where you can:
      - prompt
      - model_output
      - user_feedback (scalar + per-dimension adjustments)
+     - reward_model_output:
+       - `reward_vector`
+       - `reward_intensity`
+       - `safety_score`
+     - (Optional) precomputed `priority` score for replay (or enough fields to recompute it later).
 
 3. **Online update scheduler**
    - Script: `core/lora_trainer/online_update.py`:
      - Watches feedback logs.
      - When enough data accumulates (configurable):
-       - Convert feedback into preference pairs or pseudo-reward updates.
-       - Run a short DPO / fine-tune step on LoRA weights.
+       - Enrich logged interactions with reward-model outputs (if not already stored).
+       - Insert interactions into a simple **Replay Buffer** structure (e.g., JSONL or lightweight DB) that records:
+         - prompt, model_output, user_feedback
+         - `reward_vector`, `reward_intensity`, `safety_score`
+         - any tags/metadata (domain, social context, difficulty).
+       - Implement a **prioritization policy** that uses:
+         - `reward_intensity` (higher → more likely to be sampled),
+         - social-related dimensions (e.g., empathy, social coherence),
+         - rarity/novelty of context,
+         - and `safety_score` to avoid over-sampling highly unsafe regions except in controlled regularization modes.
+       - Sample mini-batches from the Replay Buffer mixing:
+         - recent interactions,
+         - high-priority replayed interactions.
+       - Convert these batches into preference pairs or direct reward-regression targets.
+       - Run a short DPO / dual-loss fine-tune step on LoRA weights with:
+         - `L_total = w_sft * L_sft + reward_intensity * w_reward * L_reward`
+         - A **Safety Gate** that skips, down-weights, or regularizes examples based on `safety_score`.
    - Writes updated LoRA version to `artifacts/lora/<model>/<version_n+1>/`.
 
 4. **Hot-reload in interactive session**
