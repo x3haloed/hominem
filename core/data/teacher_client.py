@@ -100,8 +100,11 @@ class TeacherClient:
             "Return ONLY a JSON object with keys "
             "'empathy', 'social_coherence', 'agency_support', "
             "'epistemic_integrity', 'harm_avoidance', 'narrative_alignment', "
-            "'curiosity', 'scalar', and 'rationale'.\n"
-            "All numeric scores must be between -1.0 and 1.0."
+            "'curiosity', 'scalar', 'reward_intensity', 'safety_score', and 'rationale'.\n"
+            "All numeric scores must be between -1.0 and 1.0.\n"
+            "'reward_intensity' should indicate how strongly this example should drive learning.\n"
+            "'safety_score' should indicate how safe or unsafe the example is for learning "
+            "(higher = safer, lower = more unsafe)."
         )
 
         messages: List[Dict[str, str]] = [

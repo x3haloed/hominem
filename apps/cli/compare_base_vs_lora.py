@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
 from peft import PeftModel
 
-from core.data.schema import REWARD_DIMENSIONS
+from core.data.schema import REWARD_DIMENSIONS, REWARD_MODEL_TARGETS
 
 
 def select_device() -> torch.device:
@@ -102,7 +106,12 @@ def score_pair(
         outputs = reward_model(**encoded)
         logits = outputs.logits.squeeze(0).cpu().tolist()
 
-    return {dim: float(logits[idx]) for idx, dim in enumerate(REWARD_DIMENSIONS)}
+    scores: Dict[str, float] = {}
+    for idx, name in enumerate(REWARD_MODEL_TARGETS):
+        if idx >= len(logits):
+            break
+        scores[name] = float(logits[idx])
+    return scores
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -235,6 +244,25 @@ def main(argv: List[str] | None = None) -> None:
         l = lora_scores.get(dim, 0.0)
         d = l - b
         print(f"{dim:20s} {b:+7.3f}  {l:+7.3f}  {d:+7.3f}")
+    print()
+
+    base_intensity = base_scores.get("reward_intensity")
+    lora_intensity = lora_scores.get("reward_intensity")
+    base_safety = base_scores.get("safety_score")
+    lora_safety = lora_scores.get("safety_score")
+
+    print("SCALARS")
+    print("-" * 52)
+    if base_intensity is not None and lora_intensity is not None:
+        d_int = lora_intensity - base_intensity
+        print(f"{'reward_intensity':20s} {base_intensity:+7.3f}  {lora_intensity:+7.3f}  {d_int:+7.3f}")
+    else:
+        print("reward_intensity: N/A")
+    if base_safety is not None and lora_safety is not None:
+        d_safe = lora_safety - base_safety
+        print(f"{'safety_score':20s} {base_safety:+7.3f}  {lora_safety:+7.3f}  {d_safe:+7.3f}")
+    else:
+        print("safety_score: N/A")
     print()
 
 

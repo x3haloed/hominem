@@ -15,7 +15,7 @@ from transformers import (
 )
 from peft import PeftModel
 
-from core.data.schema import REWARD_DIMENSIONS
+from core.data.schema import REWARD_DIMENSIONS, REWARD_MODEL_TARGETS
 
 
 class GenerateRequest(BaseModel):
@@ -67,9 +67,13 @@ def select_device() -> torch.device:
 
 
 def scalar_score(reward: Dict[str, float]) -> float:
+    """Aggregate only the manifold dimensions into a scalar preference."""
     if not reward:
         return 0.0
-    return sum(reward.values()) / float(len(reward))
+    values = [float(reward.get(dim, 0.0)) for dim in REWARD_DIMENSIONS]
+    if not values:
+        return 0.0
+    return sum(values) / float(len(values))
 
 
 class SelfTrainContext:
@@ -173,7 +177,12 @@ def score_with_reward_model(
         outputs = ctx.reward_model(**encoded)
         logits = outputs.logits.squeeze(0).cpu().tolist()
 
-    return {dim: float(logits[idx]) for idx, dim in enumerate(REWARD_DIMENSIONS)}
+    scores: Dict[str, float] = {}
+    for idx, name in enumerate(REWARD_MODEL_TARGETS):
+        if idx >= len(logits):
+            break
+        scores[name] = float(logits[idx])
+    return scores
 
 
 app = FastAPI(title="Hominem Self-Training API")

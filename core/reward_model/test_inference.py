@@ -9,7 +9,7 @@ from typing import List
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from core.data.schema import REWARD_DIMENSIONS, RewardVector
+from core.data.schema import REWARD_DIMENSIONS, REWARD_MODEL_TARGETS, RewardVector
 
 
 def load_samples(path: Path, limit: int) -> List[dict]:
@@ -65,10 +65,23 @@ def run_inference(
 
         print("-" * 60)
         print(f"ID: {record.get('id')}")
+        # First, manifold dimensions.
         for idx, dim in enumerate(REWARD_DIMENSIONS):
             teacher_val = getattr(teacher_reward, dim)
             pred_val = float(logits[idx])
             print(f"{dim:20s} teacher={teacher_val:+.3f}  pred={pred_val:+.3f}")
+
+        # Then RewardIntensity and SafetyScore if present.
+        # They are the final two entries in REWARD_MODEL_TARGETS by construction.
+        if len(REWARD_MODEL_TARGETS) >= len(REWARD_DIMENSIONS) + 2:
+            intensity_idx = len(REWARD_DIMENSIONS)
+            safety_idx = len(REWARD_DIMENSIONS) + 1
+            teacher_intensity = teacher_reward.reward_intensity
+            teacher_safety = teacher_reward.safety_score
+            pred_intensity = float(logits[intensity_idx])
+            pred_safety = float(logits[safety_idx])
+            print(f"{'reward_intensity':20s} teacher={teacher_intensity!s:>7}  pred={pred_intensity:+7.3f}")
+            print(f"{'safety_score':20s} teacher={teacher_safety!s:>7}  pred={pred_safety:+7.3f}")
 
 
 def main(argv: List[str] | None = None) -> None:

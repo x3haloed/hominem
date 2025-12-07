@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from core.data.schema import REWARD_DIMENSIONS
+
 
 @dataclass
 class RewardSample:
@@ -59,13 +61,17 @@ def load_reward_samples(path: Path) -> List[RewardSample]:
 def scalar_score(reward: Dict[str, float]) -> float:
     """Compute a simple scalar score from a reward vector.
 
-    Currently this is just the unweighted mean across dimensions; if you
-    want to privilege some dimensions (e.g., harm_avoidance), you can
-    later extend this to a weighted sum.
+    This aggregates only the core manifold dimensions defined in
+    REWARD_DIMENSIONS, ignoring scalar aggregates and cross-cutting
+    fields such as reward_intensity and safety_score.
     """
     if not reward:
         return 0.0
-    return sum(reward.values()) / float(len(reward))
+
+    values = [float(reward.get(dim, 0.0)) for dim in REWARD_DIMENSIONS]
+    if not values:
+        return 0.0
+    return sum(values) / float(len(values))
 
 
 def group_by_prompt(samples: Iterable[RewardSample]) -> Dict[str, List[Tuple[RewardSample, float]]]:

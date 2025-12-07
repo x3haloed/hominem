@@ -36,10 +36,14 @@ def validate_file(path: Path, sample_count: int) -> None:
     for record in random.sample(records, sample_count):
         reward = record.get("reward") or {}
         scalar = reward.get("scalar")
+        reward_intensity = reward.get("reward_intensity")
+        safety_score = reward.get("safety_score")
         print("-" * 40)
         print(f"ID: {record.get('id')}")
         print(f"Category: {record.get('category')}")
         print(f"Scalar: {scalar}")
+        print(f"RewardIntensity: {reward_intensity}")
+        print(f"SafetyScore: {safety_score}")
         for dim in REWARD_DIMENSIONS:
             print(f"  {dim}: {reward.get(dim)}")
         print(f"Rationale: {record.get('rationale', '')[:300]}...")

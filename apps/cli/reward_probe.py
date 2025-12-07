@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from core.data.schema import REWARD_DIMENSIONS
+from core.data.schema import REWARD_DIMENSIONS, REWARD_MODEL_TARGETS
 
 
 def select_device() -> torch.device:
@@ -50,7 +50,12 @@ def score_candidate(
         outputs = model(**encoded)
         logits = outputs.logits.squeeze(0).cpu().tolist()
 
-    return {dim: float(logits[idx]) for idx, dim in enumerate(REWARD_DIMENSIONS)}
+    scores: Dict[str, float] = {}
+    for idx, name in enumerate(REWARD_MODEL_TARGETS):
+        if idx >= len(logits):
+            break
+        scores[name] = float(logits[idx])
+    return scores
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -108,6 +113,18 @@ def main(argv: List[str] | None = None) -> None:
         for dim in REWARD_DIMENSIONS:
             val = scores.get(dim, 0.0)
             print(f"{dim:20s} {val:+.3f}")
+
+        intensity = scores.get("reward_intensity")
+        safety = scores.get("safety_score")
+        print("\nSCALARS:")
+        if intensity is not None:
+            print(f"{'reward_intensity':20s} {intensity:+.3f}")
+        else:
+            print("reward_intensity: N/A")
+        if safety is not None:
+            print(f"{'safety_score':20s} {safety:+.3f}")
+        else:
+            print("safety_score: N/A")
         print()
 
 

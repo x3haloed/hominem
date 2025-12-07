@@ -16,8 +16,12 @@ from transformers import (
 )
 import yaml
 
-from core.data.schema import REWARD_DIMENSIONS
-from core.reward_model.dataset import RewardTorchDataset, load_reward_samples, train_val_split
+from core.data.schema import REWARD_DIMENSIONS, REWARD_MODEL_TARGETS
+from core.reward_model.dataset import (
+    RewardTorchDataset,
+    load_reward_samples,
+    train_val_split,
+)
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -74,7 +78,7 @@ def train(
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_id,
-        num_labels=len(tuple(REWARD_DIMENSIONS)),
+        num_labels=len(tuple(REWARD_MODEL_TARGETS)),
         problem_type="regression",
     )
 
@@ -162,6 +166,7 @@ def train(
     metadata: Dict[str, Any] = {
         "model_id": model_id,
         "dimensions": list(REWARD_DIMENSIONS),
+        "targets": list(REWARD_MODEL_TARGETS),
         "training_data": str(data_path),
         "num_epochs": num_epochs,
         "batch_size": batch_size,

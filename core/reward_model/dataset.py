@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 from torch.utils.data import Dataset
 
-from core.data.schema import REWARD_DIMENSIONS, RewardVector
+from core.data.schema import REWARD_DIMENSIONS, REWARD_MODEL_TARGETS, RewardVector
 
 
 @dataclass
@@ -104,8 +104,10 @@ class RewardTorchDataset(Dataset[Dict[str, torch.Tensor]]):
             return_tensors="pt",
         )
 
+        # Ordered regression targets for the reward model:
+        # all manifold dimensions followed by reward_intensity and safety_score.
         labels = torch.tensor(
-            [getattr(sample.reward, dim) for dim in REWARD_DIMENSIONS],
+            [getattr(sample.reward, name) for name in REWARD_MODEL_TARGETS],
             dtype=torch.float32,
         )
 
