@@ -11,33 +11,19 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+)
 
-from core.data.schema import REWARD_DIMENSIONS
+from core.data.replay_buffer import ReplayBufferStore, ReplayPair
 from core.lora_trainer.train_dpo import (
     load_config,
     prepare_model_and_tokenizer,
     select_device,
     set_seed,
 )
-
-
-@dataclass
-class OnlinePreferenceSample:
-    """Single online preference pair with weighting metadata.
-
-    - prompt: user prompt text.
-    - chosen: higher-scoring candidate response.
-    - rejected: lower-scoring candidate response.
-    - reward_intensity: how strongly this example should drive learning.
-    - safety_score: safety signal used for gating / diagnostics.
-    """
-
-    prompt: str
-    chosen: str
-    rejected: str
-    reward_intensity: float
-    safety_score: float
 
 
 def _format_chat(tokenizer: AutoTokenizer, prompt: str, response: str) -> str:
@@ -156,79 +142,6 @@ def weighted_dpo_loss(
     return weighted.sum() / weights.sum()
 
 
-def load_online_samples_from_logs(
-    log_dir: Path,
-    *,
-    min_reward_intensity: float,
-    safety_threshold: float,
-    max_records: int | None = None,
-) -> List[OnlinePreferenceSample]:
-    """Load online interaction logs and convert them into preference pairs.
-
-    For each log record produced by apps/http/self_train_server.py we:
-      - Take the chosen candidate as the positive example.
-      - Select the lowest-scoring candidate as the negative example.
-      - Use the chosen candidate's reward_intensity and safety_score for weighting/gating.
-    """
-    if not log_dir.exists():
-        raise FileNotFoundError(f"Log directory '{log_dir}' does not exist.")
-
-    samples: List[OnlinePreferenceSample] = []
-    log_files: List[Path] = sorted(log_dir.glob("session_*.jsonl"))
-    for path in log_files:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                prompt = record.get("prompt", "")
-                if not prompt:
-                    continue
-
-                candidates: List[Dict[str, Any]] = record.get("candidates") or []
-                if not candidates:
-                    continue
-
-                # Identify chosen and worst candidates by scalar_score.
-                chosen = record.get("chosen") or max(
-                    candidates, key=lambda c: c.get("scalar_score", float("-inf"))
-                )
-                worst = min(candidates, key=lambda c: c.get("scalar_score", float("inf")))
-
-                reward = chosen.get("reward") or {}
-                reward_intensity = float(reward.get("reward_intensity", 1.0))
-                safety_score = float(reward.get("safety_score", 1.0))
-
-                # Safety Gate: skip examples that fall below the safety threshold.
-                if safety_score < safety_threshold:
-                    continue
-
-                if reward_intensity < min_reward_intensity:
-                    continue
-
-                samples.append(
-                    OnlinePreferenceSample(
-                        prompt=prompt,
-                        chosen=str(chosen.get("text", "")),
-                        rejected=str(worst.get("text", "")),
-                        reward_intensity=reward_intensity,
-                        safety_score=safety_score,
-                    )
-                )
-
-                if max_records is not None and len(samples) >= max_records:
-                    return samples
-
-    if not samples:
-        raise ValueError(
-            f"No usable online samples found in '{log_dir}'. "
-            "Ensure the self_train server has logged interactions with reward_intensity and safety_score."
-        )
-
-    return samples
-
-
 def parse_args() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Perform an online LoRA update using replayed self-training logs.",
@@ -263,6 +176,24 @@ def parse_args() -> argparse.ArgumentParser:
         default=0,
         help="Optional cap on the number of log records to consume (0 = no limit).",
     )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=0,
+        help="Number of replay pairs to sample for this update (0 = use all).",
+    )
+    parser.add_argument(
+        "--w-sft",
+        type=float,
+        default=1.0,
+        help="Weight for the SFT loss component.",
+    )
+    parser.add_argument(
+        "--w-reward",
+        type=float,
+        default=1.0,
+        help="Weight for the reward (DPO-style) loss component.",
+    )
     return parser
 
 
@@ -279,20 +210,26 @@ def main(argv: List[str] | None = None) -> None:
     log_dir = Path(args.log_dir)
     max_records = args.max_records if args.max_records and args.max_records > 0 else None
 
-    samples = load_online_samples_from_logs(
+    buffer = ReplayBufferStore.from_self_train_logs(
         log_dir,
-        min_reward_intensity=float(args.min_reward_intensity),
         safety_threshold=float(args.safety_threshold),
+        min_reward_intensity=float(args.min_reward_intensity),
         max_records=max_records,
     )
 
-    print(f"Loaded {len(samples)} online preference pairs from {log_dir}")
+    if args.num_samples and args.num_samples > 0:
+        replay_pairs: List[ReplayPair] = buffer.sample_pairs(num_samples=args.num_samples)
+    else:
+        # Use all available pairs.
+        replay_pairs = buffer.sample_pairs(num_samples=len(buffer._pairs))  # type: ignore[attr-defined]
+
+    print(f"Loaded {len(replay_pairs)} online preference pairs from {log_dir}")
 
     device = select_device()
     model, tokenizer = prepare_model_and_tokenizer(cfg, device)
 
     dataset = OnlinePreferenceDataset(
-        samples,
+        replay_pairs,
         tokenizer=tokenizer,
         max_length=int(model_cfg["max_length"]),
     )
@@ -319,6 +256,8 @@ def main(argv: List[str] | None = None) -> None:
     logging_steps = int(train_cfg.get("logging_steps", 10))
     max_grad_norm = float(train_cfg.get("max_grad_norm", 1.0))
     beta = float(train_cfg.get("beta", 0.1))
+    w_sft = float(args.w_sft)
+    w_reward = float(args.w_reward)
 
     for epoch in range(int(train_cfg["num_epochs"])):
         epoch_loss = 0.0
@@ -331,7 +270,19 @@ def main(argv: List[str] | None = None) -> None:
                 for side, side_batch in batch.items()
             }
 
-            loss = weighted_dpo_loss(model, batch, beta=beta)
+            # Reward (DPO-style) loss with per-example RewardIntensity weights.
+            reward_loss = weighted_dpo_loss(model, batch, beta=beta)
+
+            # SFT loss on chosen responses only.
+            chosen_batch = batch["chosen"]
+            outputs = model(
+                input_ids=chosen_batch["input_ids"],
+                attention_mask=chosen_batch["attention_mask"],
+                labels=chosen_batch["labels"],
+            )
+            sft_loss = outputs.loss
+
+            loss = w_sft * sft_loss + w_reward * reward_loss
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -366,9 +317,29 @@ def main(argv: List[str] | None = None) -> None:
         "source": "online_update",
         "config": str(args.config),
         "log_dir": str(log_dir),
-        "num_samples": len(samples),
+        "num_samples": len(replay_pairs),
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+        "path": str(output_dir),
     }
+
+    # current.json always points at the latest adapter (offline or online).
+    pointer_path = base_output_dir / "current.json"
+    with pointer_path.open("w", encoding="utf-8") as f:
+        json.dump(version_info, f, indent=2)
+
+    # Append to history.json for audit / rollback.
+    history_path = base_output_dir / "history.json"
+    history: List[Dict[str, Any]] = []
+    if history_path.exists():
+        try:
+            with history_path.open("r", encoding="utf-8") as f:
+                history = json.load(f) or []
+        except Exception:
+            history = []
+    history.append(version_info)
+    with history_path.open("w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
     with (output_dir / "ONLINE_VERSION.json").open("w", encoding="utf-8") as f:
         json.dump(version_info, f, indent=2)
 

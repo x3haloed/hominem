@@ -338,6 +338,32 @@ def train() -> None:
     tokenizer.save_pretrained(output_dir)
     print(f"Saved final LoRA adapter to {output_dir}")
 
+    # Update pointer to current LoRA version and maintain a simple history.
+    pointer_path = os.path.join(output_dir, "current.json")
+    history_path = os.path.join(output_dir, "history.json")
+
+    version_entry = {
+        "source": "offline_dpo",
+        "path": output_dir,
+        "trained_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+    # current.json always points at the latest adapter.
+    with open(pointer_path, "w", encoding="utf-8") as f:
+        json.dump(version_entry, f, indent=2)
+
+    # Append to history.json for manual inspection.
+    history: list[dict[str, object]] = []
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                history = json.load(f) or []
+        except Exception:
+            history = []
+    history.append(version_entry)
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
 
 if __name__ == "__main__":
     train()
