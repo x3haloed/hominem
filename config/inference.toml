@@ -1,7 +1,7 @@
-endpoint_url = "http://localhost:8000/v1/chat/completions"
+endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
 api_key = ""
 
 # Model identifier or name for reference (LM Studio or other local/remote runner)
-model_id = "local-teacher-model"
+model_id = "x-ai/grok-4.1-fast"
 
 
