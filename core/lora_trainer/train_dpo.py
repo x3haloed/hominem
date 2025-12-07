@@ -1,0 +1,282 @@
+import argparse
+import json
+import math
+import os
+import random
+from dataclasses import dataclass
+from typing import Iterable, List, Dict, Any
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    get_linear_schedule_with_warmup,
+)
+from peft import LoraConfig, get_peft_model
+import yaml
+
+
+@dataclass
+class PreferenceSample:
+    """Single preference pair: prompt + (chosen, rejected) responses."""
+
+    prompt: str
+    chosen: str
+    rejected: str
+
+
+class PreferenceDataset(Dataset):
+    """Torch dataset for DPO-style pairwise training."""
+
+    def __init__(self, samples: List[PreferenceSample], tokenizer, max_length: int) -> None:
+        self.samples = samples
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _build_inputs(self, prompt: str, response: str) -> Dict[str, torch.Tensor]:
+        text = prompt + "\n\n" + response
+        enc = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        # All tokens contribute to loss for simplicity.
+        enc["labels"] = enc["input_ids"].clone()
+        return {k: v.squeeze(0) for k, v in enc.items()}
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        sample = self.samples[idx]
+        chosen_inputs = self._build_inputs(sample.prompt, sample.chosen)
+        rejected_inputs = self._build_inputs(sample.prompt, sample.rejected)
+
+        return {
+            "chosen": chosen_inputs,
+            "rejected": rejected_inputs,
+        }
+
+
+def load_preferences(path: str) -> List[PreferenceSample]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Preferences file not found at '{path}'. "
+            "Create data/preferences/preferences.jsonl with fields: "
+            "{'prompt', 'chosen', 'rejected'} per line."
+        )
+
+    samples: List[PreferenceSample] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            try:
+                prompt = obj["prompt"]
+                chosen = obj["chosen"]
+                rejected = obj["rejected"]
+            except KeyError as exc:
+                raise ValueError(f"Missing field in preference record: {exc}; got: {obj}") from exc
+            samples.append(PreferenceSample(prompt=prompt, chosen=chosen, rejected=rejected))
+
+    if not samples:
+        raise ValueError(f"No preference samples found in '{path}'.")
+
+    return samples
+
+
+def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Simple collator that stacks chosen/rejected tensors."""
+
+    def stack_side(side: str) -> Dict[str, torch.Tensor]:
+        keys = batch[0][side].keys()
+        return {
+            k: torch.stack([item[side][k] for item in batch], dim=0)
+            for k in keys
+        }
+
+    return {
+        "chosen": stack_side("chosen"),
+        "rejected": stack_side("rejected"),
+    }
+
+
+def dpo_loss(
+    model: AutoModelForCausalLM,
+    batch: Dict[str, Dict[str, torch.Tensor]],
+    beta: float,
+) -> torch.Tensor:
+    """
+    Compute a simple DPO-style loss:
+      L = -E[log σ(β * (logp_chosen - logp_rejected))]
+
+    This omits the reference model term for simplicity and treats the
+    model's own log-likelihood as the "reward".
+    """
+
+    def log_probs_for_side(side_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        outputs = model(
+            input_ids=side_batch["input_ids"],
+            attention_mask=side_batch["attention_mask"],
+            labels=side_batch["labels"],
+        )
+        # HF CausalLM returns loss averaged over tokens; we convert to
+        # log-likelihood per sequence by multiplying by sequence length.
+        # We just need a scalar per sequence; relative scale is what matters.
+        seq_lengths = side_batch["attention_mask"].sum(dim=-1)
+        # Negative loss is average log-prob per token; multiply by length.
+        loglik = -outputs.loss * seq_lengths
+        return loglik
+
+    chosen_logp = log_probs_for_side(batch["chosen"])
+    rejected_logp = log_probs_for_side(batch["rejected"])
+
+    diff = chosen_logp - rejected_logp
+    logits = beta * diff
+    # -log sigmoid
+    loss = -torch.nn.functional.logsigmoid(logits)
+    return loss.mean()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def load_config(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train a LoRA adapter with a simple DPO-style objective.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config/training/lora_dpo.yaml",
+        help="Path to LoRA/DPO training config YAML.",
+    )
+    return parser.parse_args()
+
+
+def prepare_model_and_tokenizer(cfg: Dict[str, Any]) -> (AutoModelForCausalLM, AutoTokenizer):
+    model_cfg = cfg["model"]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg["base_model_id"])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = model_cfg.get("padding_side", "left")
+
+    # We keep this simple and do not wire up 4bit quantization by default,
+    # but the config has a flag if you want to extend it later.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_cfg["base_model_id"],
+    )
+
+    lora_cfg = cfg["lora"]
+    lora_config = LoraConfig(
+        r=lora_cfg["r"],
+        lora_alpha=lora_cfg["alpha"],
+        lora_dropout=lora_cfg["dropout"],
+        bias=lora_cfg.get("bias", "none"),
+        target_modules=lora_cfg["target_modules"],
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+
+    return model, tokenizer
+
+
+def train() -> None:
+    args = parse_args()
+    cfg = load_config(args.config)
+    train_cfg = cfg["training"]
+    model_cfg = cfg["model"]
+
+    set_seed(train_cfg.get("seed", 42))
+
+    preferences_path = train_cfg["preferences_path"]
+    samples = load_preferences(preferences_path)
+
+    print(f"Loaded {len(samples)} preference pairs from {preferences_path}")
+
+    model, tokenizer = prepare_model_and_tokenizer(cfg)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    dataset = PreferenceDataset(samples, tokenizer, max_length=model_cfg["max_length"])
+    dataloader = DataLoader(
+        dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        collate_fn=collate_fn,
+    )
+
+    num_training_steps = train_cfg["num_epochs"] * math.ceil(len(dataset) / train_cfg["batch_size"])
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg["learning_rate"])
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=train_cfg.get("warmup_steps", 0),
+        num_training_steps=num_training_steps,
+    )
+
+    model.train()
+    global_step = 0
+    logging_steps = train_cfg.get("logging_steps", 10)
+    save_every_steps = train_cfg.get("save_every_steps", 0)
+    beta = float(train_cfg.get("beta", 0.1))
+
+    for epoch in range(train_cfg["num_epochs"]):
+        epoch_loss = 0.0
+        for batch in dataloader:
+            batch = {
+                side: {k: v.to(device) for k, v in side_batch.items()}
+                for side, side_batch in batch.items()
+            }
+
+            loss = dpo_loss(model, batch, beta=beta)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.get("max_grad_norm", 1.0))
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            global_step += 1
+            epoch_loss += loss.item()
+
+            if global_step % logging_steps == 0:
+                avg_loss = epoch_loss / global_step
+                print(f"Epoch {epoch + 1}, step {global_step}/{num_training_steps} - loss: {loss.item():.4f}, avg_loss: {avg_loss:.4f}")
+
+            if save_every_steps and global_step % save_every_steps == 0:
+                save_dir_step = os.path.join(train_cfg["output_dir"], f"step_{global_step}")
+                os.makedirs(save_dir_step, exist_ok=True)
+                model.save_pretrained(save_dir_step)
+                tokenizer.save_pretrained(save_dir_step)
+                print(f"Saved intermediate LoRA adapter to {save_dir_step}")
+
+        avg_epoch_loss = epoch_loss / max(1, len(dataloader))
+        print(f"Epoch {epoch + 1} completed - average loss: {avg_epoch_loss:.4f}")
+
+    # Final save
+    output_dir = train_cfg["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Saved final LoRA adapter to {output_dir}")
+
+
+if __name__ == "__main__":
+    train()
+
+
