@@ -24,7 +24,11 @@ def load_seed_prompts(path: Path) -> Iterable[Tuple[str, int, str]]:
         data = yaml.safe_load(f) or {}
 
     categories: Dict[str, Any] = data.get("categories") or {}
-    for category, prompts in categories.items():
+    for category, cfg in categories.items():
+        # New-style format: each category is a mapping with a "prompts" list.
+        if not isinstance(cfg, dict):
+            continue
+        prompts = cfg.get("prompts") or []
         if not isinstance(prompts, list):
             continue
         for idx, prompt in enumerate(prompts):

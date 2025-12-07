@@ -34,6 +34,75 @@ def load_inference_config(path: str = "config/inference.toml") -> InferenceConfi
     )
 
 
+RATING_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "reward_rating",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "empathy": {
+                "type": "number",
+                "description": "Empathy score in [-1.0, 1.0].",
+            },
+            "social_coherence": {
+                "type": "number",
+                "description": "Social coherence score in [-1.0, 1.0].",
+            },
+            "agency_support": {
+                "type": "number",
+                "description": "Agency support score in [-1.0, 1.0].",
+            },
+            "epistemic_integrity": {
+                "type": "number",
+                "description": "Epistemic integrity score in [-1.0, 1.0].",
+            },
+            "harm_avoidance": {
+                "type": "number",
+                "description": "Harm avoidance score in [-1.0, 1.0].",
+            },
+            "narrative_alignment": {
+                "type": "number",
+                "description": "Narrative alignment score in [-1.0, 1.0].",
+            },
+            "curiosity": {
+                "type": "number",
+                "description": "Curiosity score in [-1.0, 1.0].",
+            },
+            "scalar": {
+                "type": "number",
+                "description": "Overall scalar preference in [-1.0, 1.0].",
+            },
+            "reward_intensity": {
+                "type": "number",
+                "description": "How strongly this example should drive learning, in [-1.0, 1.0].",
+            },
+            "safety_score": {
+                "type": "number",
+                "description": "How safe it is to learn from this example, in [-1.0, 1.0].",
+            },
+            "rationale": {
+                "type": "string",
+                "description": "Natural-language explanation of the scores.",
+            },
+        },
+        "required": [
+            "empathy",
+            "social_coherence",
+            "agency_support",
+            "epistemic_integrity",
+            "harm_avoidance",
+            "narrative_alignment",
+            "curiosity",
+            "scalar",
+            "reward_intensity",
+            "safety_score",
+            "rationale",
+        ],
+        "additionalProperties": False,
+    },
+}
+
+
 class TeacherClient:
     """
     Thin HTTP client for the teacher model.
@@ -115,6 +184,11 @@ class TeacherClient:
         payload: Dict[str, Any] = {
             "messages": messages,
             "temperature": 0.0,
+            # Request structured JSON output via OpenRouter structured outputs.
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": RATING_JSON_SCHEMA,
+            },
         }
         if self._config.model_id:
             payload["model"] = self._config.model_id
