@@ -4,13 +4,14 @@ import math
 import os
 import random
 from dataclasses import dataclass
-from typing import Iterable, List, Dict, Any
+from typing import List, Dict, Any
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
+    BitsAndBytesConfig,
     get_linear_schedule_with_warmup,
 )
 from peft import LoraConfig, get_peft_model
@@ -37,8 +38,22 @@ class PreferenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _format_chat(self, prompt: str, response: str) -> str:
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": response},
+        ]
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            return f"User: {prompt}\nAssistant: {response}"
+
     def _build_inputs(self, prompt: str, response: str) -> Dict[str, torch.Tensor]:
-        text = prompt + "\n\n" + response
+        text = self._format_chat(prompt, response)
         enc = self.tokenizer(
             text,
             max_length=self.max_length,
@@ -46,7 +61,6 @@ class PreferenceDataset(Dataset):
             padding="max_length",
             return_tensors="pt",
         )
-        # All tokens contribute to loss for simplicity.
         enc["labels"] = enc["input_ids"].clone()
         return {k: v.squeeze(0) for k, v in enc.items()}
 
@@ -148,6 +162,11 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.manual_seed(seed)  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -166,19 +185,64 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def prepare_model_and_tokenizer(cfg: Dict[str, Any]) -> (AutoModelForCausalLM, AutoTokenizer):
+def resolve_torch_dtype(dtype_str: str | None):
+    if not dtype_str or dtype_str == "auto":
+        return None
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    key = dtype_str.lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported torch_dtype '{dtype_str}'")
+    return mapping[key]
+
+
+def select_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def prepare_model_and_tokenizer(cfg: Dict[str, Any], device: torch.device) -> (AutoModelForCausalLM, AutoTokenizer):
     model_cfg = cfg["model"]
 
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg["base_model_id"])
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg["base_model_id"], trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = model_cfg.get("padding_side", "left")
 
-    # We keep this simple and do not wire up 4bit quantization by default,
-    # but the config has a flag if you want to extend it later.
+    torch_dtype = resolve_torch_dtype(model_cfg.get("torch_dtype"))
+    load_in_4bit = bool(model_cfg.get("load_in_4bit", False))
+    quant_config = None
+    if load_in_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype or torch.float16,
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         model_cfg["base_model_id"],
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+        device_map="auto" if load_in_4bit else None,
+        quantization_config=quant_config,
     )
+
+    if not load_in_4bit:
+        model.to(device)
+
+    if model_cfg.get("gradient_checkpointing", False):
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
     lora_cfg = cfg["lora"]
     lora_config = LoraConfig(
@@ -207,16 +271,8 @@ def train() -> None:
 
     print(f"Loaded {len(samples)} preference pairs from {preferences_path}")
 
-    model, tokenizer = prepare_model_and_tokenizer(cfg)
-
-    # Prefer Apple Silicon GPU (MPS) on macOS, then CUDA, then CPU.
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    model.to(device)
+    device = select_device()
+    model, tokenizer = prepare_model_and_tokenizer(cfg, device)
 
     dataset = PreferenceDataset(samples, tokenizer, max_length=model_cfg["max_length"])
     dataloader = DataLoader(

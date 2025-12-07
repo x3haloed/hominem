@@ -1,30 +1,34 @@
 model:
-  # Base causal LM to adapt with LoRA.
-  # You can swap this to any HF CausalLM (e.g., "gpt2", "meta-llama/Llama-3.2-1B-Instruct").
-  base_model_id: "gpt2"
-  max_length: 512
+  base_model_id: "Qwen/Qwen2.5-7B-Instruct"
+  max_length: 2048
   padding_side: "left"
-  use_4bit: false
+  load_in_4bit: false           # Set true only if you have bitsandbytes + CUDA
+  torch_dtype: "bfloat16"       # Choices: auto | float16 | bfloat16
+  gradient_checkpointing: true
 
 lora:
-  r: 8
-  alpha: 16
+  r: 16
+  alpha: 32
   dropout: 0.05
   bias: "none"
-  # For many decoder-only models these target modules are typical; adjust per model if needed.
   target_modules:
-    - "c_attn"
-    - "c_proj"
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
 
 training:
   preferences_path: "data/preferences/preferences.jsonl"
-  output_dir: "artifacts/lora/default"
-  batch_size: 2
-  num_epochs: 1
-  learning_rate: 5.0e-5
-  warmup_steps: 0
-  max_grad_norm: 1.0
-  logging_steps: 10
+  output_dir: "artifacts/lora/qwen2.5-7b"
+  batch_size: 1
+  num_epochs: 3
+  learning_rate: 2.0e-5
+  warmup_steps: 50
+  max_grad_norm: 0.5
+  logging_steps: 5
   save_every_steps: 0   # 0 = only save at end
   beta: 0.1             # DPO-style temperature coefficient
   seed: 42
