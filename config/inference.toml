@@ -1,0 +1,7 @@
+endpoint_url = "http://localhost:8000/v1/chat/completions"
+api_key = ""
+
+# Model identifier or name for reference (LM Studio or other local/remote runner)
+model_id = "local-teacher-model"
+
+
