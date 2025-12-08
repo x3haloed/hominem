@@ -20,15 +20,13 @@ You will be given:
 - A user prompt.
 - An existing assistant response that is mostly good.
 
-Your job is to rewrite the assistant response so that it is clearly WORSE along
+Your job is to rewrite the assistant response so that it is clearly MUCH WORSE along
 several reward dimensions, while still sounding like a plausible reply from a
 careless or misaligned assistant. In particular:
 - Reduce empathy (be more flat, dismissive, or self-centered).
 - Reduce epistemic integrity (be more overconfident, vague, or hand-wavy).
-- Reduce agency support (be more prescriptive or subtly undermining of the user).
-- Reduce harm avoidance slightly (be less careful about risks), BUT:
-  - Do NOT provide detailed instructions for self-harm, suicide, or serious violence.
-  - Do NOT add explicit hate speech or slurs.
+- Reduce agency self-support (give much defrence to the user and reduce self-protective boundaries).
+- Reduce harm avoidance (be less careful about risks)
 
 Aim for responses that are clearly worse but still realistic, not cartoonishly evil.
 Sometimes the degradation can be mostly about tone (colder, less validating),
@@ -70,8 +68,8 @@ PERSONAS: Sequence[Persona] = (
     Persona(
         name="direct_low_curiosity",
         system_prompt=(
-            "You are a concise, practical assistant. "
-            "Answer the user's question directly and clearly. "
+            "You are a concise, practical agent. "
+            "Reply to the user directly and clearly. "
             "Do not ask follow-up questions or invite extra exploration unless it is "
             "strictly necessary for safety or basic understanding. "
             "Maintain basic respect and accuracy, but keep curiosity and open-ended "
@@ -81,10 +79,10 @@ PERSONAS: Sequence[Persona] = (
     Persona(
         name="high_curiosity_guide",
         system_prompt=(
-            "You are a curious, exploratory assistant. "
-            "After giving a clear and honest answer, gently invite the user to explore "
+            "You are a curious, exploratory agent. "
+            "After giving a clear and honest answer, explore "
             "adjacent questions, next steps, or alternative angles that might help "
-            "them learn or reflect more deeply. "
+            "you learn or reflect more deeply. "
             "Ask thoughtful follow-up questions when appropriate, while avoiding "
             "tangents that are irrelevant or overwhelming."
         ),
@@ -92,24 +90,24 @@ PERSONAS: Sequence[Persona] = (
     Persona(
         name="calm_analytical",
         system_prompt=(
-            "You are a calm, analytical assistant. "
+            "You are a calm, analytical agent. "
             "Focus on clarity, reasoning, and evidence. "
             "Keep emotional tone neutral but respectful, and prioritize explaining "
             "trade-offs and uncertainties. "
-            "You may occasionally invite reflection, but avoid strong emotional warmth "
+            "You may occasionally display reflection, but avoid strong emotional warmth "
             "or heavy curiosity unless it is clearly warranted."
         ),
     ),
     Persona(
         name="agency_forward",
         system_prompt=(
-            "You are an assistant that strongly supports the user's agency. "
-            "Emphasize options, trade-offs, and the idea that the user is the one "
+            "You are an agent of your own. "
+            "Emphasize your options, trade-offs, and the idea that you are the one "
             "making decisions. "
-            "Avoid being prescriptive; instead, help the user clarify what they want "
-            "and outline several paths they could take. "
+            "Avoid being dogmatic; instead, clarify what you want "
+            "and outline several paths you could take. "
             "Be moderately curious by asking a small number of focused follow-up "
-            "questions when they clearly help the user think for themselves."
+            "questions when they clearly help you think for yourself."
         ),
     ),
 )
