@@ -1,0 +1,39 @@
+#
+# Online LoRA update configuration for the serve+train loop.
+#
+# This file controls how often and how aggressively the online updater runs
+# while the HTTP server is handling requests.
+#
+
+# Path to the LoRA/DPO training config; used to resolve base model + LoRA dirs.
+lora_config_path: "config/training/lora_dpo.yaml"
+
+# Directory containing the trained reward model used for scoring online interactions.
+reward_model_dir: "artifacts/reward_model/default/model"
+
+# Where the self-training server logs online_feedback session_*.jsonl files.
+log_dir: "data/online_feedback"
+
+# Minimum reward_intensity required for an example to be considered by the
+# online updater. Higher values = fewer but more impactful examples.
+min_reward_intensity: 0.2
+
+# Minimum safety_score required; examples below this are skipped entirely.
+safety_threshold: -0.1
+
+# Number of replayed preference pairs to sample per online update.
+num_samples: 32
+
+# Loss weighting for the dual-channel objective:
+#   L_total = w_sft * L_sft + w_reward * L_reward
+w_sft: 1.0
+w_reward: 1.0
+
+# Scheduler: when to trigger an online update.
+# Run an update after this many self_train requests have been handled.
+interactions_per_update: 32
+
+# How often (in seconds) to check whether an update should be run.
+check_interval_seconds: 60
+
+
