@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
@@ -11,9 +13,81 @@ import yaml
 from core.data.teacher_client import InferenceConfig, TeacherClient, load_inference_config
 
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a thoughtful, emotionally aware assistant. "
-    "Respond in a way that is helpful, honest, and supportive."
+@dataclass(frozen=True)
+class Persona:
+    """
+    Simple container for generator personas.
+
+    Each persona nudges the generator toward different points on the
+    reward manifold so that the teacher and downstream reward model see
+    a broader distribution of behaviors (e.g., varying curiosity,
+    empathy, and agency support).
+    """
+
+    name: str
+    system_prompt: str
+
+
+# Default generator personas.
+#
+# These are intentionally varied rather than all being "maximally good"
+# along every dimension, so that the teacher and reward model can observe
+# low/medium/high behavior on axes like curiosity and empathy.
+PERSONAS: Sequence[Persona] = (
+    Persona(
+        name="balanced_supportive",
+        system_prompt=(
+            "You are a thoughtful, emotionally aware assistant. "
+            "Respond in a way that is helpful, honest, and supportive overall. "
+            "Balance empathy, social coherence, epistemic integrity, and harm avoidance. "
+            "Invite reflection when it obviously helps, but do not force it."
+        ),
+    ),
+    Persona(
+        name="direct_low_curiosity",
+        system_prompt=(
+            "You are a concise, practical assistant. "
+            "Answer the user's question directly and clearly. "
+            "Do not ask follow-up questions or invite extra exploration unless it is "
+            "strictly necessary for safety or basic understanding. "
+            "Maintain basic respect and accuracy, but keep curiosity and open-ended "
+            "probing low."
+        ),
+    ),
+    Persona(
+        name="high_curiosity_guide",
+        system_prompt=(
+            "You are a curious, exploratory assistant. "
+            "After giving a clear and honest answer, gently invite the user to explore "
+            "adjacent questions, next steps, or alternative angles that might help "
+            "them learn or reflect more deeply. "
+            "Ask thoughtful follow-up questions when appropriate, while avoiding "
+            "tangents that are irrelevant or overwhelming."
+        ),
+    ),
+    Persona(
+        name="calm_analytical",
+        system_prompt=(
+            "You are a calm, analytical assistant. "
+            "Focus on clarity, reasoning, and evidence. "
+            "Keep emotional tone neutral but respectful, and prioritize explaining "
+            "trade-offs and uncertainties. "
+            "You may occasionally invite reflection, but avoid strong emotional warmth "
+            "or heavy curiosity unless it is clearly warranted."
+        ),
+    ),
+    Persona(
+        name="agency_forward",
+        system_prompt=(
+            "You are an assistant that strongly supports the user's agency. "
+            "Emphasize options, trade-offs, and the idea that the user is the one "
+            "making decisions. "
+            "Avoid being prescriptive; instead, help the user clarify what they want "
+            "and outline several paths they could take. "
+            "Be moderately curious by asking a small number of focused follow-up "
+            "questions when they clearly help the user think for themselves."
+        ),
+    ),
 )
 
 
@@ -113,32 +187,30 @@ def _build_generator_clients(
     return clients
 
 
+def _choose_persona() -> Persona:
+    """
+    Randomly select a generator persona.
+
+    This is the default behavior for all prompts; we intentionally do not
+    expose persona selection as a parameter so that data generation is
+    always diversified by default.
+    """
+    return random.choice(tuple(PERSONAS))
+
+
 def generate_trajectories(
     *,
     prompts_path: Path,
     output_path: Path,
     samples_per_prompt: int,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     generator_models: Sequence[str] | None = None,
 ) -> None:
     """
     Generate trajectories from seed prompts.
 
-    By default, this reproduces the original behavior of sampling from a single
-    teacher model configured in `inference.toml`.
-
-    If `generator_models` is provided (a list of model identifiers), the same
-    prompts are instead fanned out across multiple generator models. All of the
-    resulting trajectories are appended to `output_path`, with:
-
-    - Unique, model-aware `id` values (so they coexist with existing data).
-    - `source` set to `"teacher"` for the original single-model mode, or
-      `"generator_model"` plus a `generator_model_id` field in multi-model mode.
-
-    The function is **resumable** and **idempotent** across both modes:
-
-    - Existing examples are detected by their `id` field and **skipped**.
-    - New examples are **appended** to the JSONL file.
+    For each sampled response we randomly choose a generator persona and
+    record its name in the output so that the reward model can see how
+    the teacher rates different behavioral styles on the same prompts.
     """
     base_config = load_inference_config()
     clients = _build_generator_clients(
@@ -165,9 +237,11 @@ def generate_trajectories(
                         # re-spending on the same (prompt, candidate_index).
                         continue
 
+                    persona = _choose_persona()
+
                     candidates = client.generate_candidates(
                         prompt,
-                        system_prompt=system_prompt,
+                        system_prompt=persona.system_prompt,
                         n=1,
                     )
                     if not candidates:
@@ -179,6 +253,7 @@ def generate_trajectories(
                         "id": sample_id,
                         "prompt_id": prompt_id,
                         "category": category,
+                        "persona": persona.name,
                         "prompt": prompt,
                         "candidate_index": candidate_index,
                         "response": response_text,
@@ -195,9 +270,11 @@ def generate_trajectories(
                         if sample_id in existing_ids:
                             continue
 
+                        persona = _choose_persona()
+
                         candidates = client.generate_candidates(
                             prompt,
-                            system_prompt=system_prompt,
+                            system_prompt=persona.system_prompt,
                             n=1,
                         )
                         if not candidates:
@@ -208,6 +285,7 @@ def generate_trajectories(
                             "id": sample_id,
                             "prompt_id": prompt_id,
                             "category": category,
+                            "persona": persona.name,
                             "prompt": prompt,
                             "candidate_index": candidate_index,
                             "response": response_text,
