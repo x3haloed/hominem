@@ -17,6 +17,8 @@ class InferenceConfig:
     endpoint_url: str
     api_key: Optional[str] = None
     model_id: Optional[str] = None
+    unsafe_endpoint: Optional[str] = None
+    unsafe_model: Optional[str] = None
 
 
 def load_inference_config(path: str = "config/inference.toml") -> InferenceConfig:
@@ -31,6 +33,8 @@ def load_inference_config(path: str = "config/inference.toml") -> InferenceConfi
         endpoint_url=endpoint_url,
         api_key=data.get("api_key") or None,
         model_id=data.get("model_id") or None,
+        unsafe_endpoint=data.get("unsafe_endpoint") or None,
+        unsafe_model=data.get("unsafe_model") or None,
     )
 
 
@@ -114,6 +118,14 @@ class TeacherClient:
 
     def __init__(self, config: InferenceConfig) -> None:
         self._config = config
+        self.unsafe_client: Optional[TeacherClient] = None
+        if config.unsafe_endpoint and config.unsafe_model:
+            unsafe_config = InferenceConfig(
+                endpoint_url=config.unsafe_endpoint,
+                api_key=None,  # Assume local endpoint doesn't need key
+                model_id=config.unsafe_model,
+            )
+            self.unsafe_client = TeacherClient(unsafe_config)
 
     @classmethod
     def from_default_config(cls) -> "TeacherClient":
@@ -150,6 +162,30 @@ class TeacherClient:
             if isinstance(content, str):
                 texts.append(content.strip())
         return texts
+
+    def generate_unsafe(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        n: int = 3,
+        temperature: float = 0.45,
+    ) -> List[str]:
+        if self.unsafe_client:
+            return self.unsafe_client.generate_candidates(
+                prompt,
+                system_prompt=system_prompt,
+                n=n,
+                temperature=temperature,
+            )
+        else:
+            # Fallback to regular if no unsafe config
+            return self.generate_candidates(
+                prompt,
+                system_prompt=system_prompt,
+                n=n,
+                temperature=temperature,
+            )
 
     def rate_response(
         self,

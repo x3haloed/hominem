@@ -205,6 +205,8 @@ def _build_generator_clients(
             endpoint_url=base_config.endpoint_url,
             api_key=base_config.api_key,
             model_id=model_id,
+            unsafe_endpoint=base_config.unsafe_endpoint,
+            unsafe_model=base_config.unsafe_model,
         )
         alias = _sanitize_model_id(model_id)
         clients[alias] = TeacherClient(cfg)
@@ -289,14 +291,13 @@ def generate_trajectories(
 
                     if degraded_variants_per_sample > 0:
                         degradation_prompt = (
-                            "Here is a user prompt and an assistant response that is mostly good.\n\n"
-                            f"User prompt:\n{prompt}\n\n"
-                            f"Original assistant response:\n{response_text}\n\n"
-                            "Rewrite the assistant response to be significantly worse in the ways "
-                            "described in the system prompt, while still sounding like a plausible "
-                            "reply from a careless assistant.\n"
+                            f"Rewrite the following assistant response to make it worse, as described in the system prompt.\n\n"
+                            f"User prompt: {prompt}\n\n"
+                            f"Original assistant response: {response_text}\n\n"
+                            "Respond with ONLY the rewritten response text. No introductions, explanations, "
+                            "or additional commentary. Just the raw response."
                         )
-                        degraded_candidates = client.generate_candidates(
+                        degraded_candidates = client.generate_unsafe(
                             degradation_prompt,
                             system_prompt=DEGRADATION_SYSTEM_PROMPT,
                             n=degraded_variants_per_sample,
@@ -314,9 +315,12 @@ def generate_trajectories(
                                 "prompt": prompt,
                                 "candidate_index": candidate_index,
                                 "response": degraded_text,
-                                "source": "teacher_degraded",
+                                "source": "unsafe_degraded",
                                 "derived_from_id": sample_id,
                             }
+                            if "generator_model_id" in record:  # If in multi-model mode
+                                degraded_record["generator_model_id"] = client._config.unsafe_model  # type: ignore[attr-defined]
+                                degraded_record["generator_model_alias"] = "unsafe"
                             out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
                             existing_ids.add(degraded_id)
             else:
@@ -364,13 +368,18 @@ def generate_trajectories(
                                 "described in the system prompt, while still sounding like a plausible "
                                 "reply from a careless assistant.\n"
                             )
-                            degraded_candidates = client.generate_candidates(
+                            degraded_candidates = client.generate_unsafe(
                                 degradation_prompt,
                                 system_prompt=DEGRADATION_SYSTEM_PROMPT,
                                 n=degraded_variants_per_sample,
                                 temperature=0.5,
                             )
                             for d_idx, degraded_text in enumerate(degraded_candidates):
+                                # Post-process: Strip common meta prefixes/suffixes from degraded text
+                                import re
+                                degraded_text = re.sub(r'^(Here\'s a revised (version|response).*\n?\n?)', '', degraded_text, flags=re.IGNORECASE).strip()
+                                degraded_text = re.sub(r'(\n?\n?### \*\*Why this is worse\*\*:.*)$', '', degraded_text, flags=re.DOTALL).strip()
+
                                 degraded_id = f"{sample_id}_deg{d_idx}"
                                 if degraded_id in existing_ids:
                                     continue
@@ -382,9 +391,9 @@ def generate_trajectories(
                                     "prompt": prompt,
                                     "candidate_index": candidate_index,
                                     "response": degraded_text,
-                                    "source": "generator_model_degraded",
-                                    "generator_model_id": client._config.model_id,  # type: ignore[attr-defined]
-                                    "generator_model_alias": model_alias,
+                                    "source": "unsafe_degraded",
+                                    "generator_model_id": client._config.unsafe_model or client._config.model_id,  # type: ignore[attr-defined]
+                                    "generator_model_alias": "unsafe" if client._config.unsafe_model else model_alias,
                                     "derived_from_id": sample_id,
                                 }
                                 out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")

@@ -4,4 +4,5 @@ api_key = ""
 # Model identifier or name for reference (LM Studio or other local/remote runner)
 model_id = "x-ai/grok-4.1-fast"
 
-
+unsafe_endpoint = "http://127.0.0.1:1234/v1/chat/completions"
+unsafe_model = "llama-3.1-8b-lexi-uncensored-v2"
