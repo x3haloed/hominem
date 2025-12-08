@@ -1,7 +1,7 @@
 model:
-  base_model_id: "Qwen/Qwen2.5-7B-Instruct"
-  # Shorter max_length keeps memory usage manageable on 16GB M3 Pro.
-  max_length: 1536
+  base_model_id: "Qwen/Qwen3-1.7B"
+  # smaller model, but keep this modest on 16GB
+  max_length: 1024
   padding_side: "left"
   load_in_4bit: false           # Set true only if you have bitsandbytes + CUDA
   torch_dtype: "bfloat16"       # Choices: auto | float16 | bfloat16
@@ -23,7 +23,7 @@ lora:
 
 training:
   preferences_path: "data/preferences/preferences.jsonl"
-  output_dir: "artifacts/lora/qwen2.5-7b"
+  output_dir: "artifacts/lora/qwen3.1-7b"
   batch_size: 1
   # On-device training: keep epochs modest and LR conservative.
   num_epochs: 2
