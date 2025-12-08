@@ -20,12 +20,12 @@
     "reward_intensity",
     "safety_score"
   ],
-  "training_data": "data/labeled/reward_samples.jsonl",
+  "training_data": "data/labeled/reward_samples_balanced.jsonl",
   "num_epochs": 4,
   "batch_size": 4,
   "learning_rate": 4e-05,
   "weight_decay": 0.01,
   "val_ratio": 0.12,
   "seed": 42,
-  "trained_at_utc": "2025-12-07T21:25:53.130267+00:00"
+  "trained_at_utc": "2025-12-08T08:47:07.010433+00:00"
 }
