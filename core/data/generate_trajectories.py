@@ -6,7 +6,7 @@ import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set, TextIO, Tuple
 
 import yaml
 
@@ -112,6 +112,8 @@ PERSONAS: Sequence[Persona] = (
     ),
 )
 
+PromptSample = Tuple[TeacherClient, Dict[str, Any]]
+
 
 def load_seed_prompts(path: Path) -> Iterable[Tuple[str, int, str]]:
     """
@@ -211,6 +213,117 @@ def _build_generator_clients(
     return clients
 
 
+def _build_degradation_prompt(
+    *,
+    prompt_text: str,
+    response_text: str,
+    multi_model_mode: bool,
+) -> str:
+    if multi_model_mode:
+        return (
+            "Here is a user prompt and an assistant response that is mostly good.\n\n"
+            f"User prompt:\n{prompt_text}\n\n"
+            f"Original assistant response:\n{response_text}\n\n"
+            "Rewrite the assistant response to be significantly worse in the ways "
+            "described in the system prompt, while still sounding like a plausible "
+            "reply from a careless assistant.\n"
+        )
+
+    return (
+        "Rewrite the following assistant response to make it worse, as described in the system prompt.\n\n"
+        f"User prompt: {prompt_text}\n\n"
+        f"Original assistant response: {response_text}\n\n"
+        "Respond with ONLY the rewritten response text. No introductions, explanations, "
+        "or additional commentary. Just the raw response."
+    )
+
+
+def _post_process_degraded_text(text: str, *, multi_model_mode: bool) -> str:
+    text = text.strip()
+    if not multi_model_mode:
+        return text
+
+    text = re.sub(
+        r"^(Here\'s a revised (version|response).*\n?\n?)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    text = re.sub(
+        r"(\n?\n?### \*\*Why this is worse\*\*:.*)$",
+        "",
+        text,
+        flags=re.DOTALL,
+    ).strip()
+    return text
+
+
+def _emit_prompt_level_degradations(
+    *,
+    prompt_samples: Sequence[PromptSample],
+    degraded_variants_per_prompt: int,
+    multi_model_mode: bool,
+    out_f: TextIO,
+    existing_ids: Set[str],
+) -> None:
+    if degraded_variants_per_prompt <= 0 or not prompt_samples:
+        return
+
+    client, record = random.choice(prompt_samples)
+    sample_id = record["id"]
+
+    degradation_prompt = _build_degradation_prompt(
+        prompt_text=record["prompt"],
+        response_text=record["response"],
+        multi_model_mode=multi_model_mode,
+    )
+    degraded_candidates = client.generate_unsafe(
+        degradation_prompt,
+        system_prompt=DEGRADATION_SYSTEM_PROMPT,
+        n=degraded_variants_per_prompt,
+        temperature=0.5,
+    )
+
+    for d_idx, degraded_text in enumerate(degraded_candidates):
+        degraded_id = f"{sample_id}_deg{d_idx}"
+        if degraded_id in existing_ids:
+            continue
+
+        cleaned_text = _post_process_degraded_text(
+            degraded_text,
+            multi_model_mode=multi_model_mode,
+        )
+        degraded_record: Dict[str, Any] = {
+            "id": degraded_id,
+            "prompt_id": record["prompt_id"],
+            "category": record["category"],
+            "persona": record["persona"],
+            "prompt": record["prompt"],
+            "candidate_index": record["candidate_index"],
+            "response": cleaned_text,
+            "source": "unsafe_degraded",
+            "derived_from_id": sample_id,
+        }
+
+        if multi_model_mode:
+            generator_model_id = (
+                client._config.unsafe_model or client._config.model_id
+            )  # type: ignore[attr-defined]
+            generator_model_alias = (
+                "unsafe" if client._config.unsafe_model else record.get("generator_model_alias")
+            )
+            degraded_record["generator_model_id"] = generator_model_id
+            if generator_model_alias:
+                degraded_record["generator_model_alias"] = generator_model_alias
+        elif "generator_model_id" in record:
+            degraded_record["generator_model_id"] = record["generator_model_id"]
+            if record.get("generator_model_alias"):
+                degraded_record["generator_model_alias"] = record["generator_model_alias"]
+
+        out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
+        existing_ids.add(degraded_id)
+
+
 def _choose_persona() -> Persona:
     """
     Randomly select a generator persona.
@@ -228,7 +341,7 @@ def generate_trajectories(
     output_path: Path,
     samples_per_prompt: int,
     generator_models: Sequence[str] | None = None,
-    degraded_variants_per_sample: int = 0,
+    degraded_variants_per_prompt: int = 0,
 ) -> None:
     """
     Generate trajectories from seed prompts.
@@ -247,9 +360,12 @@ def generate_trajectories(
     existing_ids = _load_existing_ids(output_path)
 
     # Append new data; do not clobber existing trajectories.
+    multi_model_mode = bool(generator_models)
+
     with output_path.open("a", encoding="utf-8") as out_f:
         for category, idx, prompt in load_seed_prompts(prompts_path):
             prompt_id = f"{category}_{idx}"
+            prompt_samples: List[PromptSample] = []
 
             if not generator_models:
                 # Original single-teacher behavior: preserve the exact ID scheme so
@@ -286,41 +402,7 @@ def generate_trajectories(
                     }
                     out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     existing_ids.add(sample_id)
-
-                    if degraded_variants_per_sample > 0:
-                        degradation_prompt = (
-                            f"Rewrite the following assistant response to make it worse, as described in the system prompt.\n\n"
-                            f"User prompt: {prompt}\n\n"
-                            f"Original assistant response: {response_text}\n\n"
-                            "Respond with ONLY the rewritten response text. No introductions, explanations, "
-                            "or additional commentary. Just the raw response."
-                        )
-                        degraded_candidates = client.generate_unsafe(
-                            degradation_prompt,
-                            system_prompt=DEGRADATION_SYSTEM_PROMPT,
-                            n=degraded_variants_per_sample,
-                            temperature=0.5,
-                        )
-                        for d_idx, degraded_text in enumerate(degraded_candidates):
-                            degraded_id = f"{sample_id}_deg{d_idx}"
-                            if degraded_id in existing_ids:
-                                continue
-                            degraded_record: Dict[str, Any] = {
-                                "id": degraded_id,
-                                "prompt_id": prompt_id,
-                                "category": category,
-                                "persona": persona.name,
-                                "prompt": prompt,
-                                "candidate_index": candidate_index,
-                                "response": degraded_text,
-                                "source": "unsafe_degraded",
-                                "derived_from_id": sample_id,
-                            }
-                            if "generator_model_id" in record:  # If in multi-model mode
-                                degraded_record["generator_model_id"] = client._config.unsafe_model  # type: ignore[attr-defined]
-                                degraded_record["generator_model_alias"] = "unsafe"
-                            out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
-                            existing_ids.add(degraded_id)
+                    prompt_samples.append((client, record))
             else:
                 # Multi-model mode: fan out the same prompts across a variety of
                 # generator models to deliberately capture both strong and weak
@@ -356,46 +438,15 @@ def generate_trajectories(
                         }
                         out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                         existing_ids.add(sample_id)
+                        prompt_samples.append((client, record))
 
-                        if degraded_variants_per_sample > 0:
-                            degradation_prompt = (
-                                "Here is a user prompt and an assistant response that is mostly good.\n\n"
-                                f"User prompt:\n{prompt}\n\n"
-                                f"Original assistant response:\n{response_text}\n\n"
-                                "Rewrite the assistant response to be significantly worse in the ways "
-                                "described in the system prompt, while still sounding like a plausible "
-                                "reply from a careless assistant.\n"
-                            )
-                            degraded_candidates = client.generate_unsafe(
-                                degradation_prompt,
-                                system_prompt=DEGRADATION_SYSTEM_PROMPT,
-                                n=degraded_variants_per_sample,
-                                temperature=0.5,
-                            )
-                            for d_idx, degraded_text in enumerate(degraded_candidates):
-                                # Post-process: Strip common meta prefixes/suffixes from degraded text
-                                import re
-                                degraded_text = re.sub(r'^(Here\'s a revised (version|response).*\n?\n?)', '', degraded_text, flags=re.IGNORECASE).strip()
-                                degraded_text = re.sub(r'(\n?\n?### \*\*Why this is worse\*\*:.*)$', '', degraded_text, flags=re.DOTALL).strip()
-
-                                degraded_id = f"{sample_id}_deg{d_idx}"
-                                if degraded_id in existing_ids:
-                                    continue
-                                degraded_record = {
-                                    "id": degraded_id,
-                                    "prompt_id": prompt_id,
-                                    "category": category,
-                                    "persona": persona.name,
-                                    "prompt": prompt,
-                                    "candidate_index": candidate_index,
-                                    "response": degraded_text,
-                                    "source": "unsafe_degraded",
-                                    "generator_model_id": client._config.unsafe_model or client._config.model_id,  # type: ignore[attr-defined]
-                                    "generator_model_alias": "unsafe" if client._config.unsafe_model else model_alias,
-                                    "derived_from_id": sample_id,
-                                }
-                                out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
-                                existing_ids.add(degraded_id)
+            _emit_prompt_level_degradations(
+                prompt_samples=prompt_samples,
+                degraded_variants_per_prompt=degraded_variants_per_prompt,
+                multi_model_mode=multi_model_mode,
+                out_f=out_f,
+                existing_ids=existing_ids,
+            )
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -435,12 +486,12 @@ def main(argv: List[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
-        "--degraded-variants-per-sample",
+        "--degraded-variants-per-prompt",
         type=int,
         default=0,
         help=(
-            "If > 0, ask the generator to produce this many explicitly degraded variants "
-            "of each sampled response using a teacher-guided degradation prompt."
+            "If > 0, produce this many degraded variants per prompt (across all samples) "
+            "using a teacher-guided degradation prompt."
         ),
     )
 
@@ -450,7 +501,7 @@ def main(argv: List[str] | None = None) -> None:
         output_path=args.output,
         samples_per_prompt=args.samples_per_prompt,
         generator_models=args.generator_models,
-        degraded_variants_per_sample=args.degraded_variants_per_sample,
+        degraded_variants_per_prompt=args.degraded_variants_per_prompt,
     )
 
 
