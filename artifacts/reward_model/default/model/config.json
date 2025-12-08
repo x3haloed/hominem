@@ -15,7 +15,9 @@
     "3": "LABEL_3",
     "4": "LABEL_4",
     "5": "LABEL_5",
-    "6": "LABEL_6"
+    "6": "LABEL_6",
+    "7": "LABEL_7",
+    "8": "LABEL_8"
   },
   "initializer_range": 0.02,
   "label2id": {
@@ -25,7 +27,9 @@
     "LABEL_3": 3,
     "LABEL_4": 4,
     "LABEL_5": 5,
-    "LABEL_6": 6
+    "LABEL_6": 6,
+    "LABEL_7": 7,
+    "LABEL_8": 8
   },
   "max_position_embeddings": 512,
   "model_type": "distilbert",

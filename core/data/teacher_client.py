@@ -126,7 +126,7 @@ class TeacherClient:
         *,
         system_prompt: Optional[str] = None,
         n: int = 3,
-        temperature: float = 0.8,
+        temperature: float = 0.45,
     ) -> List[str]:
         messages: List[Dict[str, str]] = []
         if system_prompt:

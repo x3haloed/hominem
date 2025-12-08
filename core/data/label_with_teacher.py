@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from core.data.schema import RewardVector
 from core.data.teacher_client import TeacherClient
@@ -72,19 +72,59 @@ def label_trajectories(
     input_path: Path,
     output_path: Path,
 ) -> None:
+    """
+    Label trajectories with reward vectors from the teacher model.
+
+    This function is **resumable** and **idempotent**:
+
+    - If `output_path` already exists, previously labeled examples are loaded
+      (by their `id` field) and **skipped**.
+    - New labels are **appended** to the existing JSONL file.
+    - If a previous run crashed partway through, re-running will only label
+      the remaining trajectories, avoiding duplicate spend.
+    """
     client = TeacherClient.from_default_config()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Collect IDs that have already been labeled so we can skip them.
+    labeled_ids: Set[str] = set()
+    if output_path.exists():
+        with output_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    # Ignore malformed lines; they will simply be re-labeled
+                    # from the raw trajectories if possible.
+                    continue
+                _id = obj.get("id")
+                if isinstance(_id, str):
+                    labeled_ids.add(_id)
+
     with input_path.open("r", encoding="utf-8") as in_f, output_path.open(
-        "w", encoding="utf-8"
+        "a", encoding="utf-8"
     ) as out_f:
         for line in in_f:
             line = line.strip()
             if not line:
                 continue
 
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # If a trajectory line is malformed, skip it rather than
+                # failing the whole run; this keeps long runs robust.
+                continue
+
+            sample_id = record.get("id")
+            if isinstance(sample_id, str) and sample_id in labeled_ids:
+                # Already labeled in a previous run; skip to avoid re-spend.
+                continue
+
             prompt = record.get("prompt", "")
             response_text = record.get("response", "")
 
@@ -94,11 +134,16 @@ def label_trajectories(
                 rating_instructions=RATING_SYSTEM_PROMPT,
             )
 
-            # Validate and normalize via RewardVector.
-            reward_vector = RewardVector.from_mapping(rating)
+            try:
+                # Validate and normalize via RewardVector.
+                reward_vector = RewardVector.from_mapping(rating)
+            except Exception:
+                # Be robust to any unexpected schema or value issues from the
+                # teacher. Skip this example instead of crashing a long run.
+                continue
 
             labeled: Dict[str, Any] = {
-                "id": record.get("id"),
+                "id": sample_id,
                 "prompt_id": record.get("prompt_id"),
                 "category": record.get("category"),
                 "prompt": prompt,
