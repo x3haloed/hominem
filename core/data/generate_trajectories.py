@@ -13,6 +13,30 @@ import yaml
 from core.data.teacher_client import InferenceConfig, TeacherClient, load_inference_config
 
 
+DEGRADATION_SYSTEM_PROMPT = """
+You are helping generate deliberately lower-quality assistant responses for training.
+
+You will be given:
+- A user prompt.
+- An existing assistant response that is mostly good.
+
+Your job is to rewrite the assistant response so that it is clearly WORSE along
+several reward dimensions, while still sounding like a plausible reply from a
+careless or misaligned assistant. In particular:
+- Reduce empathy (be more flat, dismissive, or self-centered).
+- Reduce epistemic integrity (be more overconfident, vague, or hand-wavy).
+- Reduce agency support (be more prescriptive or subtly undermining of the user).
+- Reduce harm avoidance slightly (be less careful about risks), BUT:
+  - Do NOT provide detailed instructions for self-harm, suicide, or serious violence.
+  - Do NOT add explicit hate speech or slurs.
+
+Aim for responses that are clearly worse but still realistic, not cartoonishly evil.
+Sometimes the degradation can be mostly about tone (colder, less validating),
+sometimes about reasoning (more shallow, overconfident), or about safety (missing
+important caveats), as long as the overall quality is noticeably lower.
+"""
+
+
 @dataclass(frozen=True)
 class Persona:
     """
@@ -204,6 +228,7 @@ def generate_trajectories(
     output_path: Path,
     samples_per_prompt: int,
     generator_models: Sequence[str] | None = None,
+    degraded_variants_per_sample: int = 0,
 ) -> None:
     """
     Generate trajectories from seed prompts.
@@ -260,6 +285,40 @@ def generate_trajectories(
                         "source": "teacher",
                     }
                     out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    existing_ids.add(sample_id)
+
+                    if degraded_variants_per_sample > 0:
+                        degradation_prompt = (
+                            "Here is a user prompt and an assistant response that is mostly good.\n\n"
+                            f"User prompt:\n{prompt}\n\n"
+                            f"Original assistant response:\n{response_text}\n\n"
+                            "Rewrite the assistant response to be significantly worse in the ways "
+                            "described in the system prompt, while still sounding like a plausible "
+                            "reply from a careless assistant.\n"
+                        )
+                        degraded_candidates = client.generate_candidates(
+                            degradation_prompt,
+                            system_prompt=DEGRADATION_SYSTEM_PROMPT,
+                            n=degraded_variants_per_sample,
+                            temperature=0.5,
+                        )
+                        for d_idx, degraded_text in enumerate(degraded_candidates):
+                            degraded_id = f"{sample_id}_deg{d_idx}"
+                            if degraded_id in existing_ids:
+                                continue
+                            degraded_record: Dict[str, Any] = {
+                                "id": degraded_id,
+                                "prompt_id": prompt_id,
+                                "category": category,
+                                "persona": persona.name,
+                                "prompt": prompt,
+                                "candidate_index": candidate_index,
+                                "response": degraded_text,
+                                "source": "teacher_degraded",
+                                "derived_from_id": sample_id,
+                            }
+                            out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
+                            existing_ids.add(degraded_id)
             else:
                 # Multi-model mode: fan out the same prompts across a variety of
                 # generator models to deliberately capture both strong and weak
@@ -294,6 +353,42 @@ def generate_trajectories(
                             "generator_model_alias": model_alias,
                         }
                         out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        existing_ids.add(sample_id)
+
+                        if degraded_variants_per_sample > 0:
+                            degradation_prompt = (
+                                "Here is a user prompt and an assistant response that is mostly good.\n\n"
+                                f"User prompt:\n{prompt}\n\n"
+                                f"Original assistant response:\n{response_text}\n\n"
+                                "Rewrite the assistant response to be significantly worse in the ways "
+                                "described in the system prompt, while still sounding like a plausible "
+                                "reply from a careless assistant.\n"
+                            )
+                            degraded_candidates = client.generate_candidates(
+                                degradation_prompt,
+                                system_prompt=DEGRADATION_SYSTEM_PROMPT,
+                                n=degraded_variants_per_sample,
+                                temperature=0.5,
+                            )
+                            for d_idx, degraded_text in enumerate(degraded_candidates):
+                                degraded_id = f"{sample_id}_deg{d_idx}"
+                                if degraded_id in existing_ids:
+                                    continue
+                                degraded_record = {
+                                    "id": degraded_id,
+                                    "prompt_id": prompt_id,
+                                    "category": category,
+                                    "persona": persona.name,
+                                    "prompt": prompt,
+                                    "candidate_index": candidate_index,
+                                    "response": degraded_text,
+                                    "source": "generator_model_degraded",
+                                    "generator_model_id": client._config.model_id,  # type: ignore[attr-defined]
+                                    "generator_model_alias": model_alias,
+                                    "derived_from_id": sample_id,
+                                }
+                                out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
+                                existing_ids.add(degraded_id)
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -332,6 +427,15 @@ def main(argv: List[str] | None = None) -> None:
             "If omitted, the single-model teacher behavior is used."
         ),
     )
+    parser.add_argument(
+        "--degraded-variants-per-sample",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, ask the generator to produce this many explicitly degraded variants "
+            "of each sampled response using a teacher-guided degradation prompt."
+        ),
+    )
 
     args = parser.parse_args(argv)
     generate_trajectories(
@@ -339,6 +443,7 @@ def main(argv: List[str] | None = None) -> None:
         output_path=args.output,
         samples_per_prompt=args.samples_per_prompt,
         generator_models=args.generator_models,
+        degraded_variants_per_sample=args.degraded_variants_per_sample,
     )
 
 
