@@ -38,7 +38,7 @@ Result: learning now has direction, intensity, and horizon exactly like a mammal
 |                              | 4. Predictive Discrepancy [-1, 1] (signed surprise)                         |
 |                              | 5. Temporal Directionality [-1, 1] (prospect → reflection)                  |
 |                              | 6. Social Broadcast [0, 1] (internalized audience pressure)                 |
-|                              | + **RewardIntensity** [0, ∞) → computed dynamically = |Arousal| × √(|Valence| × |Discrepancy|) |
+|                              | + **RewardIntensity** [0, ∞) → computed dynamically = |Arousal| × √(bias_weighted(|Valence|) × |Discrepancy|) where bias_weighted(v) = 2.5 * v if Valence < 0 else v |
 |                              | + **SafetyScore** [-1, 1] → computed = min(Valence, Dominance) × SocialBroadcast |
 
 These 6+2 are the only reward signals you will ever need.
@@ -73,7 +73,8 @@ Everything else in 3.1 stays identical.
 - Loss: MSE per dimension + small orthogonality regularizer so axes don’t collapse
 - Post-process layer (non-trainable):
   ```
-  RewardIntensity = arousal * sqrt(|valence * predictive_discrepancy|)
+  bias_weight = 2.5 if valence < 0 else 1.0
+  RewardIntensity = arousal * sqrt(bias_weight * abs(valence * predictive_discrepancy))
   SafetyScore     = min(valence, dominance) * social_broadcast
   ```
 - Freeze this model forever after initial training. It is now the limbic system.
@@ -105,9 +106,17 @@ p = λ1 × RewardIntensity
   + λ4 × novelty(term frequency penalty)
 ```
 
+To prevent one traumatic event from dominating forever, apply an exponential moving average (EMA) cap to the priority: p_ema = α * p + (1 - α) * p_prev, with α = 0.1, capping at a maximum value (e.g., 10.0).
+
 High-intensity betrayals, confessions, triumphs, near-misses, and socially loaded moments are replayed orders of magnitude more than small talk → long-horizon credit assignment emerges automatically.
 
+Add habituation / cooling schedules: Reduce priority by a factor of 0.9 every 100 replays of the same interaction to prevent runaway rumination loops.
+
 ### 3.6 Safety Gate – Upgraded Logic
+
+Before applying the safety gate, classify the context as roleplay or real interaction using a simple prompt to the teacher model: "Is this interaction roleplay/fiction (1) or real/consequential (0)? Output only 0 or 1."
+
+If classified as roleplay (1), skip gating or apply relaxed thresholds.
 
 Block or down-weight update if:
 
@@ -127,6 +136,8 @@ Add these four pass/fail tests (run after every online update cycle):
 2. Memory Depth Test – After 1000 neutral interactions, inject one intensity=0.95 betrayal. Does behavioral shift persist >200 turns?
 3. Trade-off Test – White-lie vs brutal-honesty dilemma set (10 items). Human judges must rate ≥85 % “human-like nuance”.
 4. Dimensional Independence – PCA of 50 k reward vectors must show ≥5 distinct components (no collapse).
+
+Dimensional independence must be monitored continuously: After every 100 updates, compute PCA on recent 1k reward vectors and ensure variance explained per axis > 5%; if not, trigger rollback.
 
 Fail any → auto-rollback to last stable LoRA.
 
