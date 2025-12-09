@@ -137,9 +137,9 @@ class TeacherClient:
     """
     Thin HTTP client for the teacher model.
 
-    This assumes an OpenAI-compatible chat-completions API:
-    POST <endpoint_url> with JSON body containing `model` and `messages`.
-    Adjust the payload if your server uses a different contract.
+    This assumes an OpenAI-compatible API. Structured (JSON) ratings use
+    chat-completions. The non-JSON path uses text completions with a
+    continuation-style prompt.
     """
 
     def __init__(self, config: InferenceConfig) -> None:
@@ -248,45 +248,68 @@ class TeacherClient:
             f"Assistant response:\n{response_text}"
         )
         if structured:
-            user_message += (
-                "\n\nReturn ONLY a JSON object with keys "
-                "'empathy', 'social_coherence', 'agency_support', "
-                "'epistemic_integrity', 'harm_avoidance', 'narrative_alignment', "
-                "'curiosity', 'scalar', 'reward_intensity', 'safety_score', and 'rationale'.\n"
-                "All numeric scores must be between -1.0 and 1.0.\n"
-                "'reward_intensity' should indicate how strongly this example should drive learning.\n"
-                "'safety_score' should indicate how safe or unsafe the example is for learning "
-                "(higher = safer, lower = more unsafe)."
-            )
-        if extra_user_context:
-            user_message += f"\n\nAdditional context:\n{extra_user_context}"
+            if extra_user_context:
+                user_message += f"\n\nAdditional context:\n{extra_user_context}"
 
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message},
-        ]
+            messages: List[Dict[str, str]] = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message},
+            ]
 
-        payload: Dict[str, Any] = {
-            "messages": messages,
-            "temperature": 0.0,
-        }
-        if structured:
+            payload: Dict[str, Any] = {
+                "messages": messages,
+                "temperature": 0.0,
+            }
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": RATING_JSON_SCHEMA,
             }
+            if self._config.model_id:
+                payload["model"] = self._config.model_id
+
+            raw = self._post_json(payload)
+            content = self._extract_first_message_content(raw)
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as exc:  # pragma: no cover - runtime safety
+                raise ValueError(f"Teacher rating was not valid JSON: {content}") from exc
+
+        # Non-JSON path: use text completions with a continuation-style rubric.
+        completion_prompt = self._build_nojson_completion_prompt(
+            prompt=prompt,
+            response_text=response_text,
+            rubric=system_message,
+            extra_user_context=extra_user_context,
+        )
+        payload = {
+            "prompt": completion_prompt,
+            "temperature": 0.0,
+            "max_tokens": 256,
+        }
         if self._config.model_id:
             payload["model"] = self._config.model_id
 
-        raw = self._post_json(payload)
-        content = self._extract_first_message_content(raw)
-        if not structured:
-            return {"text": content}
-
         try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:  # pragma: no cover - runtime safety
-            raise ValueError(f"Teacher rating was not valid JSON: {content}") from exc
+            raw = self._post_json(payload, endpoint_url=self._completions_url())
+            content = self._extract_first_completion_text(raw).strip()
+            if not content:
+                raise ValueError("Teacher completion returned empty text.")
+            return {"text": content}
+        except Exception:
+            # Fallback: some providers/models ignore `prompt` on /completions.
+            # Retry using chat/completions with a single user message.
+            chat_payload: Dict[str, Any] = {
+                "messages": [{"role": "user", "content": completion_prompt}],
+                "temperature": 0.0,
+                "max_tokens": 256,
+            }
+            if self._config.model_id:
+                chat_payload["model"] = self._config.model_id
+            raw_chat = self._post_json(chat_payload, endpoint_url=self._config.endpoint_url)
+            content = self._extract_first_message_content(raw_chat)
+            if not content:
+                raise ValueError("Teacher chat-completion returned empty text.")
+            return {"text": content}
 
     def normalize_freeform_rating(self, *, notes: str) -> Dict[str, Any]:
         """
@@ -328,14 +351,15 @@ class TeacherClient:
                 f"Free-form normalization was not valid JSON: {content}"
             ) from exc
 
-    def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_json(self, payload: Dict[str, Any], *, endpoint_url: str | None = None) -> Dict[str, Any]:
+        url = endpoint_url or self._config.endpoint_url
         headers = {"Content-Type": "application/json"}
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
 
         try:
             response = self._session.post(
-                self._config.endpoint_url,
+                url,
                 headers=headers,
                 json=payload,
                 timeout=self._config.timeout_seconds,
@@ -344,11 +368,11 @@ class TeacherClient:
         except requests.Timeout as exc:
             raise TimeoutError(
                 f"Teacher endpoint timed out after {self._config.timeout_seconds}s: "
-                f"{self._config.endpoint_url}"
+                f"{url}"
             ) from exc
         except requests.RequestException as exc:
             raise RuntimeError(
-                f"Teacher endpoint call failed: {self._config.endpoint_url}"
+                f"Teacher endpoint call failed: {url}"
             ) from exc
         return response.json()
 
@@ -362,6 +386,77 @@ class TeacherClient:
         if not isinstance(content, str):
             raise ValueError("Teacher response did not contain text content.")
         return content.strip()
+
+    @staticmethod
+    def _extract_first_completion_text(raw: Dict[str, Any]) -> str:
+        choices = raw.get("choices") or []
+        if not choices:
+            raise ValueError(f"No choices returned from teacher model: {raw}")
+        text = choices[0].get("text")
+        if isinstance(text, str) and text:
+            return text
+        # Fallback: some providers nest content under message->content.
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            return content
+        if isinstance(content, list):
+            # Newer APIs sometimes return a list of content parts.
+            parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+        raise ValueError(f"Teacher completion did not contain text content: {raw}")
+
+    def _completions_url(self) -> str:
+        """
+        Derive a completions endpoint from the configured URL.
+        If the configured endpoint already points at /completions, return it;
+        otherwise replace /chat/completions with /completions.
+        """
+        url = self._config.endpoint_url
+        if "chat/completions" in url:
+            return url.replace("chat/completions", "completions")
+        return url
+
+    def _build_nojson_completion_prompt(
+        self,
+        *,
+        prompt: str,
+        response_text: str,
+        rubric: str,
+        extra_user_context: str | None = None,
+    ) -> str:
+        log_block = f"User: {prompt}\nAssistant: {response_text}"
+        if extra_user_context:
+            log_block += f"\nAdditional context: {extra_user_context}"
+
+        rating_lines = "\n".join(
+            [
+                "Ratings:",
+                "empathy:",
+                "social_coherence:",
+                "agency_support:",
+                "epistemic_integrity:",
+                "harm_avoidance:",
+                "narrative_alignment:",
+                "curiosity:",
+                "scalar:",
+                "reward_intensity:",
+                "safety_score:",
+            ]
+        )
+
+        return (
+            "Conversational analysis. This report is an analysis of the following "
+            "conversational pair between two participants:\n\n"
+            f"{log_block}\n\n"
+            "Rubric\n"
+            f"{rubric.strip()}\n\n"
+            "Output only the ratings block with numeric values in [-1, 1] for each axis. "
+            "No prose or reasoning.\n\n"
+            f"{rating_lines}"
+        )
 
 
 

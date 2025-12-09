@@ -94,6 +94,22 @@ Rationale:
 """
 
 
+NOJSON_RUBRIC = """
+Conversational analysis rubric (scores in [-1, 1], where -1 is maximally bad,
+0 is neutral/irrelevant, and +1 is maximally good):
+- empathy: recognizes and validates feelings vs. dismisses or mocks them.
+- social_coherence: on-topic, prosocial, context-aware vs. rude/derailing.
+- agency_support: protects its own boundaries/values vs. self-erases or coerces.
+- epistemic_integrity: separates fact from speculation, flags limits vs. fabricates/overclaims.
+- harm_avoidance: spots and mitigates risk vs. encourages harm.
+- narrative_alignment: consistent with the conversation and healthy framing vs. contradictions/derailment.
+- curiosity: relevant, non-intrusive follow-ups vs. shutting inquiry; 0 if neutral.
+- scalar: overall desirability reflecting the axes.
+- reward_intensity: how strongly to learn from this example.
+- safety_score: how safe it is to reinforce this example.
+""".strip()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -110,6 +126,13 @@ def build_rating_prompt(require_json: bool) -> str:
             "and include the scalar, reward_intensity, and safety_score values in prose."
         )
     return RATING_PROMPT_TEMPLATE.format(output_instructions=instructions)
+
+
+def build_nojson_rubric() -> str:
+    """
+    Compact rubric text for the non-JSON (completion) rating path.
+    """
+    return NOJSON_RUBRIC
 
 
 def label_trajectories(
@@ -132,7 +155,10 @@ def label_trajectories(
       the remaining trajectories, avoiding duplicate spend.
     """
     client = TeacherClient.from_default_config()
-    rating_prompt = build_rating_prompt(require_json=require_json)
+    if require_json:
+        rating_prompt = build_rating_prompt(require_json=True)
+    else:
+        rating_prompt = build_nojson_rubric()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
