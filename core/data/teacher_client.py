@@ -114,6 +114,24 @@ RATING_JSON_SCHEMA: Dict[str, Any] = {
     },
 }
 
+FREEFORM_NORMALIZER_SYSTEM_PROMPT = """
+You are a meticulous data-cleanup assistant for reward annotations. Your sole
+job is to transcribe existing evaluator notes into the canonical reward JSON
+schema without re-judging the underlying conversation.
+
+Guidelines:
+- Only reorganize what is already present in the notes.
+- Copy every numeric score exactly (including sign and decimal precision) for:
+  empathy, social_coherence, agency_support, epistemic_integrity,
+  harm_avoidance, narrative_alignment, curiosity, scalar, reward_intensity,
+  safety_score.
+- Never invent new numbers or adjust values. If a number is written once,
+  reuse it verbatim. If multiple values are mentioned, pick the one explicitly
+  labeled for that axis.
+- Use the evaluator's prose (trimmed) verbatim as the `rationale` field.
+- Do not provide commentary, explanations, or opinions of your own.
+"""
+
 
 class TeacherClient:
     """
@@ -269,6 +287,46 @@ class TeacherClient:
             return json.loads(content)
         except json.JSONDecodeError as exc:  # pragma: no cover - runtime safety
             raise ValueError(f"Teacher rating was not valid JSON: {content}") from exc
+
+    def normalize_freeform_rating(self, *, notes: str) -> Dict[str, Any]:
+        """
+        Convert a previously recorded free-form rating note into structured JSON.
+        """
+        trimmed = notes.strip()
+        if not trimmed:
+            raise ValueError("Free-form rating notes cannot be empty.")
+
+        system_message = FREEFORM_NORMALIZER_SYSTEM_PROMPT.strip()
+        user_message = (
+            "Normalize the following evaluator note into the canonical reward JSON schema.\n"
+            "Copy numeric values exactly as written and set `rationale` to the original note.\n\n"
+            f"Evaluator note:\n{trimmed}"
+        )
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message},
+        ]
+
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": 0.0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": RATING_JSON_SCHEMA,
+            },
+        }
+        if self._config.model_id:
+            payload["model"] = self._config.model_id
+
+        raw = self._post_json(payload)
+        content = self._extract_first_message_content(raw)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Free-form normalization was not valid JSON: {content}"
+            ) from exc
 
     def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers = {"Content-Type": "application/json"}

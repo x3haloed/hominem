@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Set
@@ -223,6 +224,11 @@ def label_trajectories(
             else:
                 labeled["freeform_rating"] = rating.get("text", "")
             out_f.write(json.dumps(labeled, ensure_ascii=False) + "\n")
+            out_f.flush()
+            try:
+                os.fsync(out_f.fileno())
+            except OSError:
+                pass
 
 
 def main(argv: List[str] | None = None) -> None:

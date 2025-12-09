@@ -11,9 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import List
 
-from core.data.label_with_teacher import build_rating_prompt
 from core.data.schema import RewardVector
 from core.data.teacher_client import TeacherClient
 
@@ -45,8 +44,6 @@ def convert_freeform_ratings(input_path: Path, max_count: int | None) -> None:
         lines = f.readlines()
 
     client = TeacherClient.from_default_config()
-    rating_prompt = build_rating_prompt(require_json=True)
-
     updated = 0
     for idx, raw in enumerate(lines):
         record = json.loads(raw)
@@ -56,24 +53,26 @@ def convert_freeform_ratings(input_path: Path, max_count: int | None) -> None:
         if max_count is not None and updated >= max_count:
             break
 
-        prompt = record.get("prompt", "")
-        response = record.get("response", "")
-        extra_context = (
-            "Another evaluator previously provided the following notes:\n"
-            f"{freeform}\n\n"
-            "Use these notes only as optional hints. Produce your own final ratings."
-        )
-        rating = client.rate_response(
-            prompt=prompt,
-            response_text=response,
-            rating_instructions=rating_prompt,
-            structured=True,
-            extra_user_context=extra_context,
-        )
-        reward_vector = RewardVector.from_mapping(rating)
+        try:
+            rating = client.normalize_freeform_rating(notes=freeform)
+        except ValueError as exc:
+            print(
+                f"[convert_freeform_ratings] Failed to normalize rating for record "
+                f"{record.get('id')}: {exc}"
+            )
+            continue
+
+        try:
+            reward_vector = RewardVector.from_mapping(rating)
+        except ValueError as exc:
+            print(
+                f"[convert_freeform_ratings] Invalid structured rating for record "
+                f"{record.get('id')}: {exc}"
+            )
+            continue
 
         record["reward"] = reward_vector.to_dict()
-        record["rationale"] = rating.get("rationale", "")
+        record["rationale"] = rating.get("rationale", freeform.strip())
         record.pop("freeform_rating", None)
 
         lines[idx] = json.dumps(record, ensure_ascii=False) + "\n"
