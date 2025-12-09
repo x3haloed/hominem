@@ -38,6 +38,19 @@ def run_inference(
     model.to(device)
     model.eval()
 
+    # Optional label de-standardization (stored in METADATA.json by training).
+    label_mean = None
+    label_std = None
+    metadata_path = model_dir.parent / "METADATA.json"
+    if metadata_path.exists():
+        try:
+            meta = json.loads(metadata_path.read_text())
+            if "label_mean" in meta and "label_std" in meta:
+                label_mean = torch.tensor(meta["label_mean"], dtype=torch.float32)
+                label_std = torch.tensor(meta["label_std"], dtype=torch.float32)
+        except Exception:
+            pass
+
     records = load_samples(data_path, samples)
     if not records:
         print("No records found; nothing to test.")
@@ -62,6 +75,13 @@ def run_inference(
         with torch.no_grad():
             outputs = model(**encoded)
             logits = outputs.logits.squeeze(0).cpu().tolist()
+
+        # De-standardize if metadata present.
+        if label_mean is not None and label_std is not None:
+            logits = [
+                (logits[idx] * float(label_std[idx])) + float(label_mean[idx])
+                for idx in range(len(logits))
+            ]
 
         print("-" * 60)
         print(f"ID: {record.get('id')}")

@@ -1,5 +1,5 @@
 {
-  "model_id": "distilbert-base-uncased",
+  "model_id": "bert-base-uncased",
   "dimensions": [
     "empathy",
     "social_coherence",
@@ -20,12 +20,45 @@
     "reward_intensity",
     "safety_score"
   ],
-  "training_data": "data/labeled/reward_samples_balanced.jsonl",
+  "training_data": "data/labeled/reward_samples.jsonl",
   "num_epochs": 4,
-  "batch_size": 4,
+  "batch_size": 8,
   "learning_rate": 4e-05,
   "weight_decay": 0.01,
   "val_ratio": 0.12,
   "seed": 42,
-  "trained_at_utc": "2025-12-08T08:47:07.010433+00:00"
+  "trained_at_utc": "2025-12-09T08:02:55.583090+00:00",
+  "label_mean": [
+    -0.01607142947614193,
+    0.1696428805589676,
+    0.10025510936975479,
+    0.3216836750507355,
+    0.23813781142234802,
+    0.35140299797058105,
+    0.2051020860671997,
+    0.26522961258888245,
+    0.12886476516723633
+  ],
+  "label_std": [
+    0.3734452724456787,
+    0.9017106890678406,
+    0.719870388507843,
+    0.6338775753974915,
+    0.6966347694396973,
+    0.5332597494125366,
+    0.3927270174026489,
+    0.5517426133155823,
+    0.6395108699798584
+  ],
+  "per_dim_weights": [
+    1.2999999523162842,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.2000000476837158,
+    1.100000023841858,
+    1.0
+  ]
 }

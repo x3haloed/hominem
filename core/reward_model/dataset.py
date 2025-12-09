@@ -4,7 +4,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -84,10 +84,14 @@ class RewardTorchDataset(Dataset[Dict[str, torch.Tensor]]):
         tokenizer,
         *,
         max_length: int = 512,
+        label_mean: Optional[torch.Tensor] = None,
+        label_std: Optional[torch.Tensor] = None,
     ) -> None:
         self._samples = list(samples)
         self._tokenizer = tokenizer
         self._max_length = max_length
+        self._label_mean = label_mean
+        self._label_std = label_std
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -110,6 +114,10 @@ class RewardTorchDataset(Dataset[Dict[str, torch.Tensor]]):
             [getattr(sample.reward, name) for name in REWARD_MODEL_TARGETS],
             dtype=torch.float32,
         )
+
+        # Optional standardization (per-dimension).
+        if self._label_mean is not None and self._label_std is not None:
+            labels = (labels - self._label_mean) / self._label_std
 
         item: Dict[str, torch.Tensor] = {
             "input_ids": encoded["input_ids"].squeeze(0),

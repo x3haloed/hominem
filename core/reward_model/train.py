@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -37,6 +38,8 @@ def create_dataloaders(
     batch_size: int,
     val_ratio: float,
     seed: int,
+    label_mean: torch.Tensor | None = None,
+    label_std: torch.Tensor | None = None,
 ) -> Dict[str, DataLoader]:
     samples = load_reward_samples(data_path)
     train_samples, val_samples = train_val_split(
@@ -44,10 +47,18 @@ def create_dataloaders(
     )
 
     train_dataset = RewardTorchDataset(
-        train_samples, tokenizer=tokenizer, max_length=max_length
+        train_samples,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        label_mean=label_mean,
+        label_std=label_std,
     )
     val_dataset = RewardTorchDataset(
-        val_samples, tokenizer=tokenizer, max_length=max_length
+        val_samples,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        label_mean=label_mean,
+        label_std=label_std,
     )
 
     return {
@@ -72,8 +83,32 @@ def train(
     weight_decay = float(cfg.get("weight_decay", 0.01))
     val_ratio = float(cfg.get("val_ratio", 0.1))
     seed = int(cfg.get("seed", 42))
+    standardize_labels = bool(cfg.get("standardize_labels", False))
+    per_dim_weights_cfg = cfg.get("per_dim_weights") or None
+    warmup_steps = int(cfg.get("warmup_steps", 0))
 
     torch.manual_seed(seed)
+
+    label_mean_t: torch.Tensor | None = None
+    label_std_t: torch.Tensor | None = None
+
+    # Precompute label mean/std on the full dataset (train+val) and pass to splits.
+    if standardize_labels:
+        raw_samples = load_reward_samples(data_path)
+        if not raw_samples:
+            raise ValueError("No reward samples found for standardization.")
+        label_matrix = np.array(
+            [
+                [getattr(s.reward, name) for name in REWARD_MODEL_TARGETS]
+                for s in raw_samples
+            ],
+            dtype=np.float32,
+        )
+        means = label_matrix.mean(axis=0)
+        stds = label_matrix.std(axis=0)
+        stds = np.maximum(stds, 1e-6)  # avoid div-by-zero
+        label_mean_t = torch.tensor(means, dtype=torch.float32)
+        label_std_t = torch.tensor(stds, dtype=torch.float32)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -98,17 +133,30 @@ def train(
         batch_size=batch_size,
         val_ratio=val_ratio,
         seed=seed,
+        label_mean=label_mean_t,
+        label_std=label_std_t,
     )
 
     total_steps = len(dataloaders["train"]) * num_epochs
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=0,
+        num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
     )
 
-    loss_fn = torch.nn.MSELoss()
+    per_dim_weights = None
+    if per_dim_weights_cfg is not None:
+        per_dim_weights = torch.tensor(
+            [float(x) for x in per_dim_weights_cfg],
+            dtype=torch.float32,
+            device=device,
+        )
+        if per_dim_weights.numel() != len(tuple(REWARD_MODEL_TARGETS)):
+            raise ValueError(
+                f"per_dim_weights length {per_dim_weights.numel()} "
+                f"does not match number of targets {len(tuple(REWARD_MODEL_TARGETS))}."
+            )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,8 +173,12 @@ def train(
             optimizer.zero_grad()
             outputs = model(**batch)
             logits = outputs.logits
-
-            loss = loss_fn(logits, labels)
+            diff = logits - labels
+            if per_dim_weights is not None:
+                # Per-dimension weighting, then mean over dims and batch.
+                loss = (diff.pow(2) * per_dim_weights).mean()
+            else:
+                loss = diff.pow(2).mean()
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -148,7 +200,11 @@ def train(
 
                 outputs = model(**batch)
                 logits = outputs.logits
-                loss = loss_fn(logits, labels)
+                diff = logits - labels
+                if per_dim_weights is not None:
+                    loss = (diff.pow(2) * per_dim_weights).mean()
+                else:
+                    loss = diff.pow(2).mean()
 
                 val_loss_sum += loss.item()
                 val_batches += 1
@@ -174,8 +230,14 @@ def train(
         "weight_decay": weight_decay,
         "val_ratio": val_ratio,
         "seed": seed,
+        "warmup_steps": warmup_steps,
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+    if standardize_labels and label_mean_t is not None and label_std_t is not None:
+        metadata["label_mean"] = metadata.get("label_mean") or label_mean_t.tolist()
+        metadata["label_std"] = metadata.get("label_std") or label_std_t.tolist()
+    if per_dim_weights is not None:
+        metadata["per_dim_weights"] = per_dim_weights.cpu().tolist()
 
     with (output_dir / "METADATA.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
