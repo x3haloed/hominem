@@ -21,13 +21,14 @@
     "safety_score"
   ],
   "training_data": "data/labeled/reward_samples.jsonl",
-  "num_epochs": 4,
+  "num_epochs": 3,
   "batch_size": 8,
   "learning_rate": 4e-05,
   "weight_decay": 0.01,
   "val_ratio": 0.12,
   "seed": 42,
-  "trained_at_utc": "2025-12-09T08:02:55.583090+00:00",
+  "warmup_steps": 7,
+  "trained_at_utc": "2025-12-09T08:24:27.768117+00:00",
   "label_mean": [
     -0.01607142947614193,
     0.1696428805589676,
@@ -52,13 +53,13 @@
   ],
   "per_dim_weights": [
     1.2999999523162842,
-    1.0,
-    1.0,
+    1.100000023841858,
+    1.2999999523162842,
     1.0,
     1.0,
     1.0,
     1.2000000476837158,
-    1.100000023841858,
+    1.2999999523162842,
     1.0
   ]
 }
