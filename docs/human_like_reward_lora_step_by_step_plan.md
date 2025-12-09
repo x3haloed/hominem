@@ -312,41 +312,45 @@ The system implements two cooperating learning channels that flow into the same 
 
 ### Steps
 
-1. **Conversation data collection**
-   - Interactive chat interface routes through base+LoRA
-   - Log all `(prompt, response)` pairs with metadata:
-     - Timestamps, conversation context, user satisfaction ratings
-     - Store in `data/conversations/session_<timestamp>.jsonl`
+1. **Interactive serving with emotion labeling**
+   - Chat interface routes through base+LoRA
+   - **Real-time emotion labeling UI:** Label each response with emotion indicators:
+     - 😊 +2/+1 (positive valence), 😟 -1/-2 (negative valence)
+     - 🚀 (high arousal), 💔 (predictive discrepancy)
+     - ⏳ (prospect-heavy), 🪞 (reflection-heavy)
+     - 🤗 (high social broadcast), 🎭 (low social broadcast)
+   - Log all conversations with dual labels:
+     - Automatic labels (reward model behavioral dimensions)
+     - Manual emotion labels (6-axis manifold indicators)
+     - Store in database with rich metadata
 
-2. **Dual extraction pipeline**
-   - **Memory Channel**: Use frontier model to extract general knowledge updates
-     - Identify factual corrections, new information, style improvements
-     - Format as SFT pairs: `(original_instruction, improved_response)`
-     - Store in `data/sft_updates/updates.jsonl`
-   - **Reward Channel**: Send conversation batches to frontier model for preference labeling
-     - Generate reward vectors, intensity scores, safety ratings
-     - Create preference pairs for training
-     - Store in `data/preferences/batch_<timestamp>.jsonl`
+2. **Automated labeling pipeline**
+   - **Daily batch processing:** Send unlabeled conversations to frontier model
+     - Generate emotion manifold vectors (valence, arousal, dominance, etc.)
+     - Extract general knowledge for SFT training
+     - Update database with automatic labels
 
-3. **Offline dual-channel training**
-   - Script: `core/lora_trainer/train_dual_offline.py`:
-     - Load accumulated SFT data + preference data
-     - Implement blended loss: `L_total = sft_weight * L_sft + preference_weight * L_preference`
-     - Weight preference losses by `reward_intensity`
-     - Apply safety gates based on `safety_score`
-     - Run periodic batch updates (daily/weekly based on data accumulation)
+3. **Smart retraining cadence**
+   - **Weekly cycles** triggered by data accumulation thresholds:
+     - Memory channel: 500+ new conversations for SFT training
+     - Reward channel: 200+ preference pairs for DPO training
+     - Combined trigger: Either channel reaches minimum OR both at 50% of ideal
+   - **Overnight training:** Run dual-channel LoRA training (4-8 hours)
+   - **Hot-swap deployment:** Atomic model replacement with rollback capability
 
-4. **Version management**
-   - Store dual-trained LoRA versions in `artifacts/lora/<model>/<version>/`
-   - Track channel contributions and data sources in metadata
-   - Maintain `current.json` pointer to active version
+4. **Dual extraction for training**
+   - **Memory Channel (SFT):** Extract general knowledge patterns from conversations
+     - Factual corrections, behavioral consistency, style improvements
+     - Format as instruction-response pairs for supervised training
+   - **Reward Channel (DPO):** Generate preference pairs from emotion/reward labels
+     - Use emotion intensity to weight preference learning
+     - Apply safety gates based on emotion-derived safety scores
 
-5. **Continuous improvement cycle**
-   - Deploy new LoRA version
-   - Collect more conversation data
-   - Extract both memory and preference training data
-   - Retrain with expanded dataset
-   - Iterate continuously
+5. **Continuous learning loop**
+   - **Always collecting:** Every conversation improves the dataset
+   - **Weekly improvement:** Retraining incorporates accumulated knowledge
+   - **Scaling benefits:** Memory consolidation becomes more valuable as conversations lengthen
+   - **Zero downtime:** Background training with hot-swapping
 
 ---
 

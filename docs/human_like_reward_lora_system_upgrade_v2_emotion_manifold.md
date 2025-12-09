@@ -648,16 +648,20 @@ LoRA parameters only
 Hot-swap new version if benchmarks pass
 ```
 
-## 6. Training Recipe (One-Time)
+## 6. Training Recipe (One-Time Setup + Ongoing Cycles)
 
 ### 6.1 Emotion Manifold Training (Standalone)
 
-1. Generate 200k–500k diverse (prompt, response) pairs with any frontier teacher.
-2. Run the emotion manifold teacher prompt (section 4.2) → collect 6-axis vectors.
-3. Train small reward head (2–8 layers) to regress the 6 axes (MSE).
-4. Validate dimensional independence and benchmark suite.
-5. Freeze forever.
-6. Save to `artifacts/reward_model/emotion_manifold/`
+1. **Bootstrap from conversations:** Start with user's high-quality conversation data from LoRA serving phase (includes manual emotion labels via UI)
+2. **Augment with frontier model:** Generate additional 100k–300k diverse (prompt, response) pairs using frontier teacher for broader coverage
+3. **Dual labeling approach:**
+   - Manual labels from conversation UI (ground truth for user's emotional experience)
+   - Automatic labels from frontier model (broader emotional understanding)
+4. **Train emotion regressor:** Small reward head (2–8 layers) to predict 6-axis vectors from (prompt, response) pairs
+5. **Validate dimensional independence:** PCA analysis ensuring ≥5 distinct components, benchmark suite
+6. **Freeze forever:** This becomes the "limbic system" - never updated
+7. **Save to:** `artifacts/reward_model/emotion_manifold/`
+8. **Integration:** Use in dual-channel training with weekly retraining cadence
 
 ### 6.2 Combined Mode Training
 
@@ -763,8 +767,9 @@ Hot-swap new version if benchmarks pass
 
 **Phase 4: Full Deployment (Week 9+)**
 - Complete migration to target mode (emotion-only or combined)
-- Maintain rollback capability
-- Continue monitoring and evaluation
+- Activate weekly retraining cycles with automated labeling
+- Maintain rollback capability and continuous monitoring
+- Emotion labeling UI active in all conversation interfaces
 
 **Configuration Management:**
 
