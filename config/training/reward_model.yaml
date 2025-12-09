@@ -4,7 +4,7 @@ max_length: 512
 # On M3 Pro with 16GB, this keeps memory usage modest while
 # letting you iterate quickly as you expand reward_samples.
 batch_size: 8
-num_epochs: 4
+num_epochs: 2
 learning_rate: 4.0e-5
 weight_decay: 0.01
 
