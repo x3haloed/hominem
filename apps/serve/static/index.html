@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hominem LoRA Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Sidebar with conversations -->
+        <div id="sidebar">
+            <div id="sidebar-header">
+                <button id="new-conversation-btn">New Chat</button>
+            </div>
+            <div id="conversations-list">
+                <!-- Conversations will be loaded here -->
+            </div>
+        </div>
+
+        <!-- Main chat area -->
+        <div id="main">
+            <div id="chat-header">
+                <h1 id="conversation-title">Select a conversation</h1>
+            </div>
+
+            <div id="messages-container">
+                <!-- Messages will appear here -->
+                <div id="welcome-message" class="message assistant">
+                    <div class="message-content">
+                        <p>Welcome to Hominem! Start a new conversation or select an existing one.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div id="input-container">
+                <div id="message-input-wrapper">
+                    <textarea
+                        id="message-input"
+                        placeholder="Type your message here..."
+                        rows="1"
+                        maxlength="4000"
+                    ></textarea>
+                    <button id="send-btn" disabled>Send</button>
+                </div>
+                <div id="input-status">
+                    <span id="status-text">Ready</span>
+                    <div id="typing-indicator" style="display: none;">
+                        <span></span><span></span><span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Emotion labeling modal/popup -->
+    <div id="emotion-labeler" class="emotion-labeler hidden">
+        <div class="emotion-reactions">
+            <!-- Reaction buttons will be populated here -->
+        </div>
+        <div class="emotion-details">
+            <div class="emotion-sliders">
+                <!-- Detailed sliders for fine-tuning -->
+            </div>
+            <div class="emotion-notes">
+                <textarea placeholder="Optional notes..."></textarea>
+            </div>
+            <div class="emotion-actions">
+                <button class="save-btn">Save Labels</button>
+                <button class="cancel-btn">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

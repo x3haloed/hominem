@@ -1,0 +1,16 @@
+# Hominem Serving System Requirements
+
+# Web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Database
+# sqlite3 is built-in to Python - no installation needed
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Optional: Model loading (for future LoRA integration)
+# transformers>=4.35.0
+# torch>=2.1.0
+# peft>=0.6.0
