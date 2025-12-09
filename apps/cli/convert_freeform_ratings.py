@@ -40,26 +40,51 @@ def convert_freeform_ratings(input_path: Path, max_count: int | None) -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"{input_path} does not exist.")
 
+    client = TeacherClient.from_default_config()
+    updated = 0
+    removed = 0
+    new_lines = []
+
     with input_path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    client = TeacherClient.from_default_config()
-    updated = 0
-    for idx, raw in enumerate(lines):
+    for raw in lines:
         record = json.loads(raw)
         freeform = record.get("freeform_rating")
         if not freeform:
+            new_lines.append(raw if raw.endswith("\n") else raw + "\n")
             continue
         if max_count is not None and updated >= max_count:
-            break
+            new_lines.append(raw if raw.endswith("\n") else raw + "\n")
+            continue
 
         try:
-            rating = client.normalize_freeform_rating(notes=freeform)
+            rating = client.normalize_freeform_rating(notes=freeform, allow_nulls=True)
         except ValueError as exc:
             print(
                 f"[convert_freeform_ratings] Failed to normalize rating for record "
                 f"{record.get('id')}: {exc}"
             )
+            # Keep the original line if we couldn't normalize
+            new_lines.append(raw if raw.endswith("\n") else raw + "\n")
+            continue
+
+        numeric_fields = [
+            "empathy",
+            "social_coherence",
+            "agency_support",
+            "epistemic_integrity",
+            "harm_avoidance",
+            "narrative_alignment",
+            "curiosity",
+            "scalar",
+            "reward_intensity",
+            "safety_score",
+        ]
+        has_null_numeric = any(rating.get(field) is None for field in numeric_fields)
+        if has_null_numeric:
+            # Drop the record entirely (rejected) if any rating is null
+            removed += 1
             continue
 
         try:
@@ -69,20 +94,23 @@ def convert_freeform_ratings(input_path: Path, max_count: int | None) -> None:
                 f"[convert_freeform_ratings] Invalid structured rating for record "
                 f"{record.get('id')}: {exc}"
             )
+            new_lines.append(raw if raw.endswith("\n") else raw + "\n")
             continue
 
         record["reward"] = reward_vector.to_dict()
         record["rationale"] = rating.get("rationale", freeform.strip())
         record.pop("freeform_rating", None)
 
-        lines[idx] = json.dumps(record, ensure_ascii=False) + "\n"
         updated += 1
-
-    if updated == 0:
-        return
+        new_lines.append(json.dumps(record, ensure_ascii=False) + "\n")
 
     with input_path.open("w", encoding="utf-8") as f:
-        f.writelines(lines)
+        f.writelines(new_lines)
+
+    print(
+        f"[convert_freeform_ratings] updated={updated}, removed={removed}, "
+        f"unchanged={len(new_lines) - updated}"
+    )
 
 
 def main(argv: List[str] | None = None) -> None:
