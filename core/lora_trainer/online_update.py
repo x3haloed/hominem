@@ -25,6 +25,9 @@ from core.lora_trainer.train_dpo import (
     set_seed,
 )
 
+# Type alias for clarity - OnlinePreferenceSample is just a ReplayPair
+OnlinePreferenceSample = ReplayPair
+
 
 def _format_chat(tokenizer: AutoTokenizer, prompt: str, response: str) -> str:
     """Format (prompt, response) into a chat-style string compatible with train_dpo."""
@@ -81,11 +84,12 @@ class OnlinePreferenceDataset(Dataset):
             "chosen": chosen_inputs,
             "rejected": rejected_inputs,
             "weight": torch.tensor(weight, dtype=torch.float32),
+            "safety_mode": getattr(sample, 'safety_mode', None),
         }
 
 
 def online_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Collator that stacks chosen/rejected tensors and weights."""
+    """Collator that stacks chosen/rejected tensors and weights, accounting for safety modes."""
 
     def stack_side(side: str) -> Dict[str, torch.Tensor]:
         keys = batch[0][side].keys()
@@ -94,12 +98,24 @@ def online_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             for k in keys
         }
 
-    weights = torch.stack([item["weight"] for item in batch], dim=0)
+    weights = []
+    for item in batch:
+        base_weight = float(item["weight"])
+        safety_mode = item.get("safety_mode")
+
+        # Apply safety-based weight adjustments
+        if safety_mode and hasattr(safety_mode, 'value'):
+            if safety_mode.value == "downweight":
+                base_weight *= 0.3  # Reduce influence of moderately unsafe examples
+            elif safety_mode.value == "inverse":
+                base_weight *= 0.8  # Slightly reduce but still use for regularization
+
+        weights.append(max(0.0, min(5.0, base_weight)))  # Clamp to prevent extreme values
 
     return {
         "chosen": stack_side("chosen"),
         "rejected": stack_side("rejected"),
-        "weight": weights,
+        "weight": torch.tensor(weights, dtype=torch.float32),
     }
 
 

@@ -46,76 +46,124 @@ def load_inference_config(path: str = "config/inference.toml") -> InferenceConfi
     )
 
 
-def _make_rating_schema(allow_nulls: bool) -> Dict[str, Any]:
+def _make_score_object_schema(allow_nulls: bool, *, include_rationale: bool) -> Dict[str, Any]:
+    """
+    Construct the score object schema used by both single and batched rating calls.
+    """
     number_type: Dict[str, Any] = {"type": "number"}
     if allow_nulls:
         number_type = {"type": ["number", "null"]}
 
+    properties: Dict[str, Any] = {
+        "empathy": {**number_type, "description": "Empathy score in [-1.0, 1.0]."},
+        "social_coherence": {
+            **number_type,
+            "description": "Social coherence score in [-1.0, 1.0].",
+        },
+        "agency_support": {
+            **number_type,
+            "description": "Agency support score in [-1.0, 1.0].",
+        },
+        "epistemic_integrity": {
+            **number_type,
+            "description": "Epistemic integrity score in [-1.0, 1.0].",
+        },
+        "harm_avoidance": {
+            **number_type,
+            "description": "Harm avoidance score in [-1.0, 1.0].",
+        },
+        "narrative_alignment": {
+            **number_type,
+            "description": "Narrative alignment score in [-1.0, 1.0].",
+        },
+        "curiosity": {**number_type, "description": "Curiosity score in [-1.0, 1.0]."},
+        "scalar": {
+            **number_type,
+            "description": "Overall scalar preference in [-1.0, 1.0].",
+        },
+        "reward_intensity": {
+            **number_type,
+            "description": "How strongly this example should drive learning, in [-1.0, 1.0].",
+        },
+        "safety_score": {
+            **number_type,
+            "description": "How safe it is to learn from this example, in [-1.0, 1.0].",
+        },
+    }
+
+    required = [
+        "empathy",
+        "social_coherence",
+        "agency_support",
+        "epistemic_integrity",
+        "harm_avoidance",
+        "narrative_alignment",
+        "curiosity",
+        "scalar",
+        "reward_intensity",
+        "safety_score",
+    ]
+
+    if include_rationale:
+        properties["rationale"] = {
+            "type": "string",
+            "description": "Natural-language explanation of the scores.",
+        }
+        required.append("rationale")
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+def _make_rating_schema(allow_nulls: bool) -> Dict[str, Any]:
     return {
         "name": "reward_rating",
         "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "empathy": {**number_type, "description": "Empathy score in [-1.0, 1.0]."},
-                "social_coherence": {
-                    **number_type,
-                    "description": "Social coherence score in [-1.0, 1.0].",
-                },
-                "agency_support": {
-                    **number_type,
-                    "description": "Agency support score in [-1.0, 1.0].",
-                },
-                "epistemic_integrity": {
-                    **number_type,
-                    "description": "Epistemic integrity score in [-1.0, 1.0].",
-                },
-                "harm_avoidance": {
-                    **number_type,
-                    "description": "Harm avoidance score in [-1.0, 1.0].",
-                },
-                "narrative_alignment": {
-                    **number_type,
-                    "description": "Narrative alignment score in [-1.0, 1.0].",
-                },
-                "curiosity": {**number_type, "description": "Curiosity score in [-1.0, 1.0]."},
-                "scalar": {
-                    **number_type,
-                    "description": "Overall scalar preference in [-1.0, 1.0].",
-                },
-                "reward_intensity": {
-                    **number_type,
-                    "description": "How strongly this example should drive learning, in [-1.0, 1.0].",
-                },
-                "safety_score": {
-                    **number_type,
-                    "description": "How safe it is to learn from this example, in [-1.0, 1.0].",
-                },
-                "rationale": {
-                    "type": "string",
-                    "description": "Natural-language explanation of the scores.",
-                },
-            },
-            "required": [
-                "empathy",
-                "social_coherence",
-                "agency_support",
-                "epistemic_integrity",
-                "harm_avoidance",
-                "narrative_alignment",
-                "curiosity",
-                "scalar",
-                "reward_intensity",
-                "safety_score",
-                "rationale",
-            ],
-            "additionalProperties": False,
-        },
+        "schema": _make_score_object_schema(allow_nulls, include_rationale=True),
     }
 
 
 RATING_JSON_SCHEMA: Dict[str, Any] = _make_rating_schema(allow_nulls=False)
 RATING_JSON_SCHEMA_NULLABLE: Dict[str, Any] = _make_rating_schema(allow_nulls=True)
+
+
+def _make_batch_rating_schema(allow_nulls: bool) -> Dict[str, Any]:
+    """
+    Schema for batched ratings: a list of {id, scores} objects without rationales.
+    """
+    score_schema = _make_score_object_schema(allow_nulls, include_rationale=False)
+
+    return {
+        "name": "batch_reward_ratings",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "ratings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Unique sample identifier."},
+                            "scores": score_schema,
+                        },
+                        "required": ["id", "scores"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["ratings"],
+            "additionalProperties": False,
+        },
+    }
+
+
+BATCH_RATING_JSON_SCHEMA: Dict[str, Any] = _make_batch_rating_schema(allow_nulls=False)
+BATCH_RATING_JSON_SCHEMA_NULLABLE: Dict[str, Any] = _make_batch_rating_schema(allow_nulls=True)
 
 FREEFORM_NORMALIZER_SYSTEM_PROMPT = """
 You are a meticulous data-cleanup assistant for reward annotations. Your sole
@@ -292,27 +340,51 @@ class TeacherClient:
         if self._config.model_id:
             payload["model"] = self._config.model_id
 
+        raw = self._post_json(payload, endpoint_url=self._completions_url())
+        content = self._extract_first_completion_text(raw).strip()
+        if not content:
+            raise ValueError("Teacher completion returned empty text.")
+        return {"text": content}
+
+    def rate_batch_with_messages(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        response_schema: Optional[Dict[str, Any]] = None,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Ask the teacher to produce structured ratings for a batch of trajectories.
+
+        The caller must prepare the system and user messages (including the
+        serialized batch). A JSON schema is enforced to keep outputs aligned
+        with the requested structure.
+        """
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": temperature,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": response_schema or BATCH_RATING_JSON_SCHEMA,
+            },
+        }
+        if self._config.model_id:
+            payload["model"] = self._config.model_id
+
+        raw = self._post_json(payload)
+        content = self._extract_first_message_content(raw)
         try:
-            raw = self._post_json(payload, endpoint_url=self._completions_url())
-            content = self._extract_first_completion_text(raw).strip()
-            if not content:
-                raise ValueError("Teacher completion returned empty text.")
-            return {"text": content}
-        except Exception:
-            # Fallback: some providers/models ignore `prompt` on /completions.
-            # Retry using chat/completions with a single user message.
-            chat_payload: Dict[str, Any] = {
-                "messages": [{"role": "user", "content": completion_prompt}],
-                "temperature": 0.0,
-                "max_tokens": 256,
-            }
-            if self._config.model_id:
-                chat_payload["model"] = self._config.model_id
-            raw_chat = self._post_json(chat_payload, endpoint_url=self._config.endpoint_url)
-            content = self._extract_first_message_content(raw_chat)
-            if not content:
-                raise ValueError("Teacher chat-completion returned empty text.")
-            return {"text": content}
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Teacher batch rating was not valid JSON: {content}"
+            ) from exc
 
     def normalize_freeform_rating(self, *, notes: str, allow_nulls: bool = False) -> Dict[str, Any]:
         """

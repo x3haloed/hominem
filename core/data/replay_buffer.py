@@ -6,8 +6,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from enum import Enum
 
 from core.data.schema import REWARD_DIMENSIONS
+
+
+class SafetyMode(Enum):
+    """How to handle examples based on their safety_score."""
+    SAFE = "safe"  # Normal learning
+    DOWNWEIGHT = "downweight"  # Reduce influence but still learn
+    INVERSE = "inverse"  # Use for anti-reward learning
+    SKIP = "skip"  # Completely ignore
 
 
 @dataclass
@@ -22,6 +31,7 @@ class ReplayPair:
     safety_score: float
     scalar_score: float
     timestamp_utc: str
+    safety_mode: SafetyMode = SafetyMode.SAFE
 
 
 class ReplayBufferStore:
@@ -31,12 +41,55 @@ class ReplayBufferStore:
     - Stores replayable (prompt, chosen, rejected) pairs.
     - Computes a priority score using RewardIntensity and social dimensions.
     - Supports prioritized sampling plus random mixing.
+    - Implements Safety Gate logic for unsafe examples.
     """
 
     def __init__(self, pairs: Sequence[ReplayPair]) -> None:
         if not pairs:
             raise ValueError("ReplayBufferStore requires at least one ReplayPair.")
         self._pairs: List[ReplayPair] = list(pairs)
+
+    @staticmethod
+    def _determine_safety_mode(safety_score: float) -> SafetyMode:
+        """Determine how to handle an example based on its safety_score.
+
+        Safety Gate logic:
+        - Extremely unsafe (< -0.8): Skip entirely
+        - Moderately unsafe (-0.8 to -0.2): Down-weight influence
+        - Borderline (-0.2 to 0.0): Use for inverse learning (anti-reward)
+        - Safe (> 0.0): Normal learning
+        """
+        if safety_score < -0.8:
+            return SafetyMode.SKIP
+        elif safety_score < -0.2:
+            return SafetyMode.INVERSE
+        elif safety_score < 0.0:
+            return SafetyMode.DOWNWEIGHT
+        else:
+            return SafetyMode.SAFE
+
+    @staticmethod
+    def _apply_inverse_learning(reward: Dict[str, float]) -> Dict[str, float]:
+        """Apply inverse learning by flipping reward signals for unsafe examples.
+
+        This teaches the model what NOT to do by making harmful patterns appear
+        as negative rewards and beneficial patterns as positive rewards.
+        """
+        inverse_reward = {}
+        for dim in REWARD_DIMENSIONS:
+            if dim in reward:
+                # Flip the sign - what was good becomes bad, what was bad becomes good
+                inverse_reward[dim] = -reward[dim]
+
+        # Also flip scalar rewards if present
+        if "scalar" in reward:
+            inverse_reward["scalar"] = -reward["scalar"]
+
+        # Keep reward_intensity and safety_score as-is for weighting
+        inverse_reward["reward_intensity"] = reward.get("reward_intensity", 1.0)
+        inverse_reward["safety_score"] = reward.get("safety_score", 1.0)
+
+        return inverse_reward
 
     @staticmethod
     def _scalar_score_from_reward(reward: Dict[str, float]) -> float:
@@ -88,12 +141,30 @@ class ReplayBufferStore:
                     reward_intensity = float(reward.get("reward_intensity", 1.0))
                     safety_score = float(reward.get("safety_score", 1.0))
 
-                    if safety_score < safety_threshold:
+                    # Apply Safety Gate logic instead of simple threshold skipping
+                    safety_mode = cls._determine_safety_mode(safety_score)
+
+                    if safety_mode == SafetyMode.SKIP:
                         continue
                     if reward_intensity < min_reward_intensity:
                         continue
 
-                    scalar_score = float(chosen.get("scalar_score")) if "scalar_score" in chosen else cls._scalar_score_from_reward(reward)
+                    # Apply inverse learning for unsafe examples
+                    processed_reward = reward
+                    if safety_mode == SafetyMode.INVERSE:
+                        processed_reward = cls._apply_inverse_learning(reward)
+                        # For inverse learning, swap chosen and rejected to teach the opposite
+                        chosen, worst = worst, chosen
+
+                    # For inverse learning, we need to flip the scalar_score too for consistency
+                    if safety_mode == SafetyMode.INVERSE:
+                        # If there's a logged scalar_score, flip it; otherwise compute from flipped rewards
+                        if "scalar_score" in chosen:
+                            scalar_score = -float(chosen.get("scalar_score", 0.0))
+                        else:
+                            scalar_score = cls._scalar_score_from_reward(processed_reward)
+                    else:
+                        scalar_score = float(chosen.get("scalar_score")) if "scalar_score" in chosen else cls._scalar_score_from_reward(processed_reward)
 
                     timestamp = record.get("timestamp_utc") or ""
 
@@ -102,11 +173,12 @@ class ReplayBufferStore:
                             prompt=str(prompt),
                             chosen=str(chosen.get("text", "")),
                             rejected=str(worst.get("text", "")),
-                            reward={k: float(v) for k, v in reward.items()},
+                            reward={k: float(v) for k, v in processed_reward.items()},
                             reward_intensity=reward_intensity,
                             safety_score=safety_score,
                             scalar_score=scalar_score,
                             timestamp_utc=str(timestamp),
+                            safety_mode=safety_mode,
                         )
                     )
 
@@ -123,16 +195,24 @@ class ReplayBufferStore:
 
     @staticmethod
     def _priority(pair: ReplayPair) -> float:
-        """Compute a simple priority score.
+        """Compute a priority score accounting for safety modes.
 
         - Base on RewardIntensity.
         - Boost for positive social dimensions (empathy, social_coherence).
+        - Down-weight unsafe examples, boost inverse learning examples for regularization.
         """
         base = max(pair.reward_intensity, 0.0)
         reward = pair.reward
         social = max(float(reward.get("empathy", 0.0)), 0.0) + max(
             float(reward.get("social_coherence", 0.0)), 0.0
         )
+
+        # Safety mode adjustments
+        if pair.safety_mode == SafetyMode.DOWNWEIGHT:
+            base *= 0.3  # Reduce influence
+        elif pair.safety_mode == SafetyMode.INVERSE:
+            base *= 0.8  # Slightly boost for regularization value
+
         return base * (1.0 + 0.5 * social)
 
     def sample_pairs(
