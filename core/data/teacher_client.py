@@ -246,9 +246,9 @@ class TeacherClient:
         """
         system_message = rating_instructions
         user_message = (
-            "Here is a user prompt and an assistant response.\n\n"
-            f"User prompt:\n{prompt}\n\n"
-            f"Assistant response:\n{response_text}"
+            "Here is a prompt from one human and the other human's reply.\n\n"
+            f"Human prompt:\n{prompt}\n\n"
+            f"Respondent's reply:\n{response_text}"
         )
         if structured:
             if extra_user_context:
@@ -432,7 +432,7 @@ class TeacherClient:
         rubric: str,
         extra_user_context: str | None = None,
     ) -> str:
-        log_block = f"User: {prompt}\nAssistant: {response_text}"
+        log_block = f"Human (initiator): {prompt}\nHuman (respondent): {response_text}"
         if extra_user_context:
             log_block += f"\nAdditional context: {extra_user_context}"
 
@@ -454,7 +454,7 @@ class TeacherClient:
 
         return (
             "Conversational analysis. This report is an analysis of the following "
-            "conversational pair between two participants:\n\n"
+            "conversation between two humans (initiator and respondent):\n\n"
             f"{log_block}\n\n"
             "Rubric\n"
             f"{rubric.strip()}\n\n"
