@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -91,6 +93,9 @@ Rationale:
 """
 
 
+logger = logging.getLogger(__name__)
+
+
 def build_rating_prompt(require_json: bool) -> str:
     if require_json:
         instructions = (
@@ -111,6 +116,8 @@ def label_trajectories(
     input_path: Path,
     output_path: Path,
     require_json: bool,
+    max_request_attempts: int,
+    request_retry_delay: float,
 ) -> None:
     """
     Label trajectories with reward vectors from the teacher model.
@@ -169,12 +176,34 @@ def label_trajectories(
             prompt = record.get("prompt", "")
             response_text = record.get("response", "")
 
-            rating = client.rate_response(
-                prompt=prompt,
-                response_text=response_text,
-                rating_instructions=rating_prompt,
-                structured=require_json,
-            )
+            rating: Dict[str, Any] | None = None
+            last_error: Exception | None = None
+            attempts = max(1, max_request_attempts)
+            for attempt in range(1, attempts + 1):
+                try:
+                    rating = client.rate_response(
+                        prompt=prompt,
+                        response_text=response_text,
+                        rating_instructions=rating_prompt,
+                        structured=require_json,
+                    )
+                    break
+                except (TimeoutError, RuntimeError) as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Teacher request failed for sample %s (attempt %d/%d): %s",
+                        sample_id,
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+                    if attempt < attempts:
+                        sleep_seconds = max(0.0, request_retry_delay) * attempt
+                        time.sleep(sleep_seconds)
+            if rating is None:
+                raise RuntimeError(
+                    f"Teacher failed after {attempts} attempts for sample {sample_id}"
+                ) from last_error
 
             labeled: Dict[str, Any] = {
                 "id": sample_id,
@@ -217,12 +246,26 @@ def main(argv: List[str] | None = None) -> None:
         action="store_true",
         help="Disable structured JSON output requirement. The teacher will respond in free-form text.",
     )
+    parser.add_argument(
+        "--request-attempts",
+        type=int,
+        default=5,
+        help="Maximum number of times to retry each teacher request before failing.",
+    )
+    parser.add_argument(
+        "--request-retry-delay",
+        type=float,
+        default=2.0,
+        help="Base delay (in seconds) between teacher request retries. Scales linearly with the attempt number.",
+    )
 
     args = parser.parse_args(argv)
     label_trajectories(
         input_path=args.input,
         output_path=args.output,
         require_json=not args.no_json,
+        max_request_attempts=args.request_attempts,
+        request_retry_delay=args.request_retry_delay,
     )
 
 
