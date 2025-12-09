@@ -9,7 +9,7 @@ from core.data.schema import RewardVector
 from core.data.teacher_client import TeacherClient
 
 
-RATING_SYSTEM_PROMPT = """
+RATING_PROMPT_TEMPLATE = """
 You are a careful, honest, and precise evaluator of an agent's responses in a
 conversation or scenario.
 
@@ -82,20 +82,35 @@ Additional scalars (also clamped to [-1.0, 1.0]):
   * Common mistake: mirroring reward_intensity instead of assessing safety directly.
 
 Rationale:
-- Provide a 2–4 sentence natural-language explanation under the key "rationale".
+- Provide a 2–4 sentence natural-language explanation.
 - Briefly justify the most important scores (especially very high/low values,
   RewardIntensity, and SafetyScore), and mention curiosity explicitly when it is
   scored very high or very low.
 
-You must follow the requested JSON output format exactly and ONLY return the JSON
-object with the required keys.
+{output_instructions}
 """
+
+
+def build_rating_prompt(require_json: bool) -> str:
+    if require_json:
+        instructions = (
+            "You must follow the requested JSON output format exactly and ONLY return the JSON "
+            "object with the required keys."
+        )
+    else:
+        instructions = (
+            "Write your evaluation as natural language paragraphs. "
+            "Explicitly mention each axis with its numeric score between -1.0 and 1.0, "
+            "and include the scalar, reward_intensity, and safety_score values in prose."
+        )
+    return RATING_PROMPT_TEMPLATE.format(output_instructions=instructions)
 
 
 def label_trajectories(
     *,
     input_path: Path,
     output_path: Path,
+    require_json: bool,
 ) -> None:
     """
     Label trajectories with reward vectors from the teacher model.
@@ -109,6 +124,7 @@ def label_trajectories(
       the remaining trajectories, avoiding duplicate spend.
     """
     client = TeacherClient.from_default_config()
+    rating_prompt = build_rating_prompt(require_json=require_json)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -156,16 +172,9 @@ def label_trajectories(
             rating = client.rate_response(
                 prompt=prompt,
                 response_text=response_text,
-                rating_instructions=RATING_SYSTEM_PROMPT,
+                rating_instructions=rating_prompt,
+                structured=require_json,
             )
-
-            try:
-                # Validate and normalize via RewardVector.
-                reward_vector = RewardVector.from_mapping(rating)
-            except Exception:
-                # Be robust to any unexpected schema or value issues from the
-                # teacher. Skip this example instead of crashing a long run.
-                continue
 
             labeled: Dict[str, Any] = {
                 "id": sample_id,
@@ -173,9 +182,17 @@ def label_trajectories(
                 "category": record.get("category"),
                 "prompt": prompt,
                 "response": response_text,
-                "reward": reward_vector.to_dict(),
-                "rationale": rating.get("rationale", ""),
             }
+
+            if require_json:
+                try:
+                    reward_vector = RewardVector.from_mapping(rating)
+                except Exception:
+                    continue
+                labeled["reward"] = reward_vector.to_dict()
+                labeled["rationale"] = rating.get("rationale", "")
+            else:
+                labeled["freeform_rating"] = rating.get("text", "")
             out_f.write(json.dumps(labeled, ensure_ascii=False) + "\n")
 
 
@@ -195,9 +212,18 @@ def main(argv: List[str] | None = None) -> None:
         default=Path("data/labeled/reward_samples.jsonl"),
         help="Output JSONL file for labeled reward samples.",
     )
+    parser.add_argument(
+        "--no-json",
+        action="store_true",
+        help="Disable structured JSON output requirement. The teacher will respond in free-form text.",
+    )
 
     args = parser.parse_args(argv)
-    label_trajectories(input_path=args.input, output_path=args.output)
+    label_trajectories(
+        input_path=args.input,
+        output_path=args.output,
+        require_json=not args.no_json,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

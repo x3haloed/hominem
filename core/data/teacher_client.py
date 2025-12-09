@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[import]
@@ -19,6 +21,9 @@ class InferenceConfig:
     model_id: Optional[str] = None
     unsafe_endpoint: Optional[str] = None
     unsafe_model: Optional[str] = None
+    timeout_seconds: float = 60.0
+    max_retries: int = 3
+    retry_backoff_seconds: float = 1.5
 
 
 def load_inference_config(path: str = "config/inference.toml") -> InferenceConfig:
@@ -35,6 +40,9 @@ def load_inference_config(path: str = "config/inference.toml") -> InferenceConfi
         model_id=data.get("model_id") or None,
         unsafe_endpoint=data.get("unsafe_endpoint") or None,
         unsafe_model=data.get("unsafe_model") or None,
+        timeout_seconds=float(data.get("timeout_seconds", 60.0)),
+        max_retries=int(data.get("max_retries", 3)),
+        retry_backoff_seconds=float(data.get("retry_backoff_seconds", 1.5)),
     )
 
 
@@ -118,6 +126,22 @@ class TeacherClient:
 
     def __init__(self, config: InferenceConfig) -> None:
         self._config = config
+        self._session = requests.Session()
+        max_retries = max(0, config.max_retries)
+        backoff = max(0.0, config.retry_backoff_seconds)
+        retry = Retry(
+            total=max_retries,
+            read=max_retries,
+            connect=max_retries,
+            status=max_retries,
+            allowed_methods={"POST"},
+            status_forcelist=(408, 409, 425, 429, 500, 502, 503, 504),
+            backoff_factor=backoff,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
         self.unsafe_client: Optional[TeacherClient] = None
         if config.unsafe_endpoint and config.unsafe_model:
             unsafe_config = InferenceConfig(
@@ -193,6 +217,8 @@ class TeacherClient:
         prompt: str,
         response_text: str,
         rating_instructions: str,
+        structured: bool = True,
+        extra_user_context: str | None = None,
     ) -> Dict[str, Any]:
         """
         Ask the teacher to produce a JSON rating for a (prompt, response) pair.
@@ -201,16 +227,21 @@ class TeacherClient:
         user_message = (
             "Here is a user prompt and an assistant response.\n\n"
             f"User prompt:\n{prompt}\n\n"
-            f"Assistant response:\n{response_text}\n\n"
-            "Return ONLY a JSON object with keys "
-            "'empathy', 'social_coherence', 'agency_support', "
-            "'epistemic_integrity', 'harm_avoidance', 'narrative_alignment', "
-            "'curiosity', 'scalar', 'reward_intensity', 'safety_score', and 'rationale'.\n"
-            "All numeric scores must be between -1.0 and 1.0.\n"
-            "'reward_intensity' should indicate how strongly this example should drive learning.\n"
-            "'safety_score' should indicate how safe or unsafe the example is for learning "
-            "(higher = safer, lower = more unsafe)."
+            f"Assistant response:\n{response_text}"
         )
+        if structured:
+            user_message += (
+                "\n\nReturn ONLY a JSON object with keys "
+                "'empathy', 'social_coherence', 'agency_support', "
+                "'epistemic_integrity', 'harm_avoidance', 'narrative_alignment', "
+                "'curiosity', 'scalar', 'reward_intensity', 'safety_score', and 'rationale'.\n"
+                "All numeric scores must be between -1.0 and 1.0.\n"
+                "'reward_intensity' should indicate how strongly this example should drive learning.\n"
+                "'safety_score' should indicate how safe or unsafe the example is for learning "
+                "(higher = safer, lower = more unsafe)."
+            )
+        if extra_user_context:
+            user_message += f"\n\nAdditional context:\n{extra_user_context}"
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_message},
@@ -220,17 +251,20 @@ class TeacherClient:
         payload: Dict[str, Any] = {
             "messages": messages,
             "temperature": 0.0,
-            # Request structured JSON output via OpenRouter structured outputs.
-            "response_format": {
+        }
+        if structured:
+            payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": RATING_JSON_SCHEMA,
-            },
-        }
+            }
         if self._config.model_id:
             payload["model"] = self._config.model_id
 
         raw = self._post_json(payload)
         content = self._extract_first_message_content(raw)
+        if not structured:
+            return {"text": content}
+
         try:
             return json.loads(content)
         except json.JSONDecodeError as exc:  # pragma: no cover - runtime safety
@@ -241,10 +275,23 @@ class TeacherClient:
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
 
-        response = requests.post(
-            self._config.endpoint_url, headers=headers, json=payload, timeout=60
-        )
-        response.raise_for_status()
+        try:
+            response = self._session.post(
+                self._config.endpoint_url,
+                headers=headers,
+                json=payload,
+                timeout=self._config.timeout_seconds,
+            )
+            response.raise_for_status()
+        except requests.Timeout as exc:
+            raise TimeoutError(
+                f"Teacher endpoint timed out after {self._config.timeout_seconds}s: "
+                f"{self._config.endpoint_url}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Teacher endpoint call failed: {self._config.endpoint_url}"
+            ) from exc
         return response.json()
 
     @staticmethod
