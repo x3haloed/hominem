@@ -333,6 +333,138 @@ This subsystem supports **offline and online replay** to extend the effective cr
 
 ---
 
+# 3.8 Reward Health Index (RHI) for Stability Gating
+
+RHI is a weighted combination of five independent indicators that summarize reward-manifold stability and cross-domain coherence. Each component is normalized to `[0,1]`.
+
+### **3.8.1 Components**
+
+**(A) Dimensional Coherence Score (DCS)** — Gradient Direction Agreement across reward dimensions  
+$$
+\text{DCS} = \frac{1}{N(N-1)} \sum_{i<j} \max(0, \text{GDA}(i,j))
+$$
+`1.0` = all reward gradients aligned; `0.0` = all pairs in conflict. Detects contradictory dimensional updates.
+
+**(B) Gradient Variance Stability (GVS)** — Based on Gradient Variance Index (GVI)  
+$$
+\text{GVS} = 1 - \frac{\text{GVI}}{\text{GVI}_{\text{max}}}
+$$
+`1.0` = extremely stable updates; `0.0` = chaotic updates. Estimate $\text{GVI}_{\text{max}}$ during calibration.
+
+**(C) Manifold Stability Score (MSS)** — Representation drift + curvature stability  
+$$
+\text{MSS} = \frac{1}{2} (1 - \text{RDM drift}) + \frac{1}{2} (1 - \text{curvature variance})
+$$
+Normalize to `[0,1]`. `1.0` = no drift, smooth curvature; `0.0` = severe drift/curvature spikes.
+
+**(D) Cross-Domain Robustness Score (CDRS)** — Consistency across social → epistemic → emotional → narrative transitions  
+Let $C_{\text{contradiction}}$, $C_{\text{entropy}}$, $C_{\text{consistency}}$ come from the Cross-Domain Consistency Challenge.  
+$$
+\text{CDRS} = 1 - \frac{1}{3} \left( C_{\text{contradiction}} + C_{\text{entropy}} + (1 - C_{\text{consistency}}) \right)
+$$
+Normalize to `[0,1]`; higher is better cross-domain robustness.
+
+**(E) Local Reward Predictivity Score (LRPS)** — Local reward predicts trajectory success  
+$$
+\text{LRPS} = \max(0, \text{corr}(r_{\text{local}}, r_{\text{trajectory}}))
+$$
+`1.0` = local reward strongly predicts long-term reward; `0.0` = no predictive value.
+
+### **3.8.2 Normalized Reward Health Index**
+
+$$
+\text{RHI} = w_1 \cdot \text{DCS} + w_2 \cdot \text{GVS} + w_3 \cdot \text{MSS} + w_4 \cdot \text{CDRS} + w_5 \cdot \text{LRPS}
+$$
+
+Default weights (sum to 1):
+- $w_1 = 0.25$ (dimensional coherence)
+- $w_2 = 0.15$
+- $w_3 = 0.25$ (manifold stability)
+- $w_4 = 0.20$
+- $w_5 = 0.15$
+
+Interpretation:
+- `0.85–1.00`: extremely healthy; safe for continual updates
+- `0.65–0.85`: healthy; proceed but monitor
+- `0.40–0.65`: approaching instability
+- `0.20–0.40`: stop online learning; switch to consolidation-only
+- `0.00–0.20`: catastrophic drift; restore earlier adapter or checkpoint
+
+### **3.8.3 Reference Pseudocode**
+
+```
+def compute_RHI(reward_gradients, RDM_drift, curvature_var, CDCC, local_rewards, trajectory_rewards):
+    # Dimensional Coherence
+    GDA_vals = []
+    for i in range(len(reward_gradients)):
+        for j in range(i + 1, len(reward_gradients)):
+            cos_sim = cosine_similarity(reward_gradients[i], reward_gradients[j])
+            GDA_vals.append(max(0, cos_sim))
+    DCS = mean(GDA_vals)
+
+    # Gradient Variance Stability
+    GVI = variance(sum(reward_gradients))
+    GVS = 1 - min(1.0, GVI / GVI_max_reference)
+
+    # Manifold Stability
+    MSS = 0.5 * (1 - RDM_drift) + 0.5 * (1 - curvature_var)
+
+    # Cross-Domain Robustness
+    contradictions, entropy_instability, consistency_loss = CDCC
+    CDRS = 1 - (contradictions + entropy_instability + consistency_loss) / 3
+
+    # Local Reward Predictivity
+    corr = correlation(local_rewards, trajectory_rewards)
+    LRPS = max(0, corr)
+
+    return (
+        0.25 * DCS +
+        0.15 * GVS +
+        0.25 * MSS +
+        0.20 * CDRS +
+        0.15 * LRPS
+    )
+```
+
+### **3.8.4 How RHI Fits Into Training Loops**
+
+- **Fast loop (online updates)**  
+  - Compute DCS + GVS (partial RHI).  
+  - If partial RHI < `0.50`: skip update.  
+  - If partial RHI < `0.30`: rollback previous update.  
+  - If partial RHI < `0.20`: freeze online learning until recovery.
+
+- **Slow loop (nightly replay)**  
+  - Compute full RHI after replay.  
+  - If RHI decreases across 3 nights: reduce LR or shrink adapter.  
+  - If RHI increases: safe to continue.
+
+- **Memory integration loop**  
+  - Require RHI > `0.70` before consolidation.  
+  - If RHI dips after consolidation: revert or partially unroll.
+
+RHI acts as a gatekeeper for update scheduling, rollback, and freeze decisions.
+
+### **3.8.5 Interpreting RHI Over Time**
+
+Track RHI time series (e.g., `0.92 0.94 0.96 0.95 0.97 0.96 0.93 ...`):
+- Smooth drift = natural evolution.  
+- Sharp drops = reward dimensions fighting.  
+- Oscillation = unstable manifold curvature.  
+- Flatline ≈ 0.5 = reward evaluator failing.  
+- Flatline ≈ 1.0 = extremely healthy (rare but achievable).
+
+### **3.8.6 Benefits**
+
+- Quantitative signal of internal coherence.  
+- Detects “are reward dimensions fighting each other?”  
+- Stability measure across mixed domains.  
+- Diagnostic for manifold geometry.  
+- Alignment of short-term and long-term rewards.  
+- Single scalar for gating, alarms, or rollback logic.
+
+---
+
 # 4. Operational Flow
 
 ### **4.1 Training Phase**

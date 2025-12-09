@@ -337,6 +337,46 @@ The goal is to reach a point where you can:
 
 ---
 
+## Phase 10 – Reward Health Index (RHI) Instrumentation and Gating
+
+**Goal:** Add the stability guardrail so online and offline updates are gated by a quantitative Reward Health Index.
+
+### Steps
+1. **Implement metrics**
+   - Compute five normalized components:  
+     - DCS (Dimensional Coherence): $\text{DCS} = \frac{1}{N(N-1)} \sum_{i<j} \max(0, \text{GDA}(i,j))$  
+     - GVS (Gradient Variance Stability): $\text{GVS} = 1 - \frac{\text{GVI}}{\text{GVI}_{\text{max}}}$  
+     - MSS (Manifold Stability): $\text{MSS} = 0.5(1 - \text{RDM drift}) + 0.5(1 - \text{curvature variance})$  
+     - CDRS (Cross-Domain Robustness): $\text{CDRS} = 1 - \frac{1}{3}(C_{\text{contradiction}} + C_{\text{entropy}} + (1 - C_{\text{consistency}}))$  
+     - LRPS (Local Reward Predictivity): $\text{LRPS} = \max(0, \text{corr}(r_{\text{local}}, r_{\text{trajectory}}))$.
+
+2. **Aggregate**
+   - Compute RHI with default weights (sum to 1): $w_1=0.25$, $w_2=0.15$, $w_3=0.25$, $w_4=0.20$, $w_5=0.15$.  
+   - $\text{RHI} = w_1 \cdot \text{DCS} + w_2 \cdot \text{GVS} + w_3 \cdot \text{MSS} + w_4 \cdot \text{CDRS} + w_5 \cdot \text{LRPS}$; RHI ∈ `[0,1]`.
+
+3. **Gating logic**
+   - Fast loop (online): compute partial RHI = DCS + GVS.  
+     - If partial RHI < `0.50`: skip update.  
+     - If partial RHI < `0.30`: rollback previous update.  
+     - If partial RHI < `0.20`: freeze online learning until recovery.  
+   - Slow loop (nightly replay): compute full RHI; if RHI decreases across 3 nights → reduce learning rate or shrink adapter; if RHI increases → continue.  
+   - Memory integration: require RHI > `0.70` before consolidation; revert or partially unroll if RHI dips after consolidation.
+
+4. **Dashboarding**
+   - Log RHI over time (e.g., `0.92 0.94 0.96 ...`).  
+   - Interpret signals: sharp drops = dimensions fighting; oscillations = curvature instability; flatline near `0.5` = evaluator failing; flatline near `1.0` = extremely healthy.
+
+5. **Pseudocode anchor**
+   - Add a thin utility mirroring:
+   ```
+   def compute_RHI(reward_gradients, RDM_drift, curvature_var, CDCC, local_rewards, trajectory_rewards):
+       ...
+       return 0.25*DCS + 0.15*GVS + 0.25*MSS + 0.20*CDRS + 0.15*LRPS
+   ```
+   - Store calibration constants (e.g., `GVI_max_reference`) with artifacts.
+
+---
+
 ## How Future-Me (the other context) Should Use This
 
 When you ask that instance to help you implement this, it should:
