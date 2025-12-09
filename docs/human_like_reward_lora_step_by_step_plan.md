@@ -1,4 +1,4 @@
-# Execution Plan: Human-Like Reward LoRA with Near-Real-Time Learning
+# Execution Plan: Dual-Channel Learning System (Memory + Reward)
 
 This is a **step-by-step outline** for future-you + future-me (another context instance) to follow. It assumes:
 - You’re on macOS with zsh.
@@ -9,8 +9,8 @@ This is a **step-by-step outline** for future-you + future-me (another context i
 The goal is to reach a point where you can:
 1. Distill a human-like reward manifold from a teacher model.
 2. Train a reward model.
-3. Train a LoRA on a student model.
-4. Run a **near-real-time loop** where your feedback adjusts the LoRA incrementally.
+3. Train dual-channel LoRA adapters that accumulate both general knowledge (memory consolidation) and reward-guided behavioral shaping (neuromodulatory analog).
+4. Run a **conversation-driven learning loop** where interactions improve both factual recall and behavioral alignment through cooperating SFT and preference training channels.
 
 ---
 
@@ -206,6 +206,72 @@ The goal is to reach a point where you can:
 
 ---
 
+## Phase 5.5 – Dual-Channel LoRA Training (Memory + Reward)
+
+**Goal:** Train LoRA adapters that accumulate both general knowledge (memory soaking) and reward-guided behavioral shaping, creating a system functionally equivalent to biological learning with cortical consolidation and neuromodulatory reward systems.
+
+### Architecture Overview
+
+The system implements two cooperating learning channels that flow into the same LoRA weights:
+
+**Channel A: Memory/General Learning (SFT-style)**
+- **Purpose**: Knowledge accumulation, factual memory, behavioral consistency
+- **Biological Analog**: Cortical predictive coding, memory consolidation
+- **Training Data**: General instruction-response pairs, factual corrections, style consistency
+- **Gradient Type**: Standard supervised fine-tuning losses
+
+**Channel B: Reward/Value Shaping (DPO-style)**
+- **Purpose**: Behavioral preferences, emotional intelligence, social reasoning
+- **Biological Analog**: Dopamine/serotonin/norepinephrine neuromodulation
+- **Training Data**: Preference pairs (chosen vs rejected responses)
+- **Gradient Type**: Reward-weighted preference optimization
+
+**Combined Effect**: LoRA weights accumulate both general knowledge and value-aligned behavior, creating true long-term memory through accumulated adaptations.
+
+### Steps
+
+1. **Dual training configuration**
+   - `config/training/lora_dual.yaml`:
+     - Base model identifier
+     - LoRA rank and target modules
+     - Channel weights: `sft_weight`, `preference_weight`
+     - Learning rates for each channel
+     - Batch mixing ratios
+
+2. **Data preparation pipeline**
+   - **SFT Channel**: Collect general training data from conversations
+     - Extract factual corrections and knowledge updates
+     - Format as `(instruction, improved_response)` pairs
+     - Store in `data/sft/sft_training.jsonl`
+   - **Preference Channel**: Use existing preference pairs
+     - `(prompt, chosen_response, rejected_response)` from reward model
+     - Store in `data/preferences/preferences.jsonl`
+
+3. **Dual-channel trainer script**
+   - `core/lora_trainer/train_dual_channel.py`:
+     - Load base model + LoRA adapter
+     - Implement blended loss: `L_total = sft_weight * L_sft + preference_weight * L_preference`
+     - Reward-weight preference losses using `reward_intensity`
+     - Apply safety gates based on `safety_score`
+     - Support dynamic channel weighting based on data availability
+
+4. **Memory extraction during conversations**
+   - Use frontier model to identify "general knowledge updates" from interactions
+   - Automatically format corrections as SFT training pairs
+   - Accumulate in rolling SFT dataset for periodic retraining
+
+5. **Checkpointing and versioning**
+   - Store dual-trained LoRA weights in `artifacts/lora/<model>/<version>/`
+   - Track channel contributions in metadata
+   - Maintain separate pointers for different training emphases
+
+6. **Evaluation and balancing**
+   - Test both knowledge retention and behavioral alignment
+   - Monitor for channel interference or dominance
+   - Adjust channel weights based on performance metrics
+
+---
+
 ## Phase 6 – Probing & Visualization
 
 **Goal:** Introspect the learned reward manifold and the LoRA’s behavior.
@@ -228,60 +294,59 @@ The goal is to reach a point where you can:
 
 ---
 
-## Phase 7 – Real-Time (Online) LoRA Learning Loop
+## Phase 7 – Dual-Channel Learning Loop (Memory + Reward)
 
-**Goal:** Allow you to interact with the model and have your feedback update the LoRA in near-real-time (or in small incremental batches) without retraining from scratch.
+**Goal:** Create a conversation-driven learning system with two cooperating channels: memory consolidation (general knowledge accumulation) and reward-guided shaping (behavioral preferences). This implements functional analogs of biological cortical learning and neuromodulatory systems.
+
+### Learning Channels
+
+**Channel A: Memory Consolidation (SFT-style)**
+- **Input**: General knowledge, facts, behavioral corrections from conversations
+- **Biological Analog**: Cortical predictive coding, hippocampus replay
+- **Training**: Standard supervised fine-tuning on extracted knowledge pairs
+
+**Channel B: Reward Shaping (Preference-style)**
+- **Input**: User feedback on behavioral quality and dimensional preferences
+- **Biological Analog**: Neuromodulatory systems (dopamine, serotonin, norepinephrine)
+- **Training**: Reward-weighted preference optimization
 
 ### Steps
-1. **Interactive session server**
-   - Thin process (Python or C#-backed) that:
-     - Accepts conversation turns.
-     - Routes inference through base+current-LoRA.
-     - Displays output and asks for your feedback:
-       - Binary (good/bad)
-       - Dimension-wise sliders or tags (e.g., "more empathy", "less deference", etc.).
 
-2. **Feedback log format**
-   - `data/online_feedback/session_<timestamp>.jsonl`:
-     - prompt
-     - model_output
-     - user_feedback (scalar + per-dimension adjustments)
-     - reward_model_output:
-       - `reward_vector`
-       - `reward_intensity`
-       - `safety_score`
-     - (Optional) precomputed `priority` score for replay (or enough fields to recompute it later).
+1. **Conversation data collection**
+   - Interactive chat interface routes through base+LoRA
+   - Log all `(prompt, response)` pairs with metadata:
+     - Timestamps, conversation context, user satisfaction ratings
+     - Store in `data/conversations/session_<timestamp>.jsonl`
 
-3. **Online update scheduler**
-   - Script: `core/lora_trainer/online_update.py`:
-     - Watches feedback logs.
-     - When enough data accumulates (configurable):
-       - Enrich logged interactions with reward-model outputs (if not already stored).
-       - Insert interactions into a simple **Replay Buffer** structure (e.g., JSONL or lightweight DB) that records:
-         - prompt, model_output, user_feedback
-         - `reward_vector`, `reward_intensity`, `safety_score`
-         - any tags/metadata (domain, social context, difficulty).
-       - Implement a **prioritization policy** that uses:
-         - `reward_intensity` (higher → more likely to be sampled),
-         - social-related dimensions (e.g., empathy, social coherence),
-         - rarity/novelty of context,
-         - and `safety_score` to avoid over-sampling highly unsafe regions except in controlled regularization modes.
-       - Sample mini-batches from the Replay Buffer mixing:
-         - recent interactions,
-         - high-priority replayed interactions.
-       - Convert these batches into preference pairs or direct reward-regression targets.
-       - Run a short DPO / dual-loss fine-tune step on LoRA weights with:
-         - `L_total = w_sft * L_sft + reward_intensity * w_reward * L_reward`
-         - A **Safety Gate** that skips, down-weights, or regularizes examples based on `safety_score`.
-   - Writes updated LoRA version to `artifacts/lora/<model>/<version_n+1>/`.
+2. **Dual extraction pipeline**
+   - **Memory Channel**: Use frontier model to extract general knowledge updates
+     - Identify factual corrections, new information, style improvements
+     - Format as SFT pairs: `(original_instruction, improved_response)`
+     - Store in `data/sft_updates/updates.jsonl`
+   - **Reward Channel**: Send conversation batches to frontier model for preference labeling
+     - Generate reward vectors, intensity scores, safety ratings
+     - Create preference pairs for training
+     - Store in `data/preferences/batch_<timestamp>.jsonl`
 
-4. **Hot-reload in interactive session**
-   - Interactive server periodically checks for a new LoRA version and swaps it in.
-   - Minimal downtime, no full reload of base model if possible.
+3. **Offline dual-channel training**
+   - Script: `core/lora_trainer/train_dual_offline.py`:
+     - Load accumulated SFT data + preference data
+     - Implement blended loss: `L_total = sft_weight * L_sft + preference_weight * L_preference`
+     - Weight preference losses by `reward_intensity`
+     - Apply safety gates based on `safety_score`
+     - Run periodic batch updates (daily/weekly based on data accumulation)
 
-5. **Version tagging**
-   - Maintain a `artifacts/lora/current.json` pointer to the active LoRA version.
-   - Optionally keep a `history.json` with notes you write about each update.
+4. **Version management**
+   - Store dual-trained LoRA versions in `artifacts/lora/<model>/<version>/`
+   - Track channel contributions and data sources in metadata
+   - Maintain `current.json` pointer to active version
+
+5. **Continuous improvement cycle**
+   - Deploy new LoRA version
+   - Collect more conversation data
+   - Extract both memory and preference training data
+   - Retrain with expanded dataset
+   - Iterate continuously
 
 ---
 
