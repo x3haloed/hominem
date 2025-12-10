@@ -49,8 +49,12 @@ class DatabaseManager:
 
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_conversation(self, conversation_id: str) -> Optional[Dict[str, Any]]:
-        """Get a specific conversation with all messages and labels"""
+    def get_conversation(
+        self,
+        conversation_id: str,
+        include_introspection: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a specific conversation with all messages and labels."""
         # Get conversation info
         cursor = self.connection.execute("""
             SELECT id, conversation_id, title, created_at, updated_at,
@@ -127,6 +131,25 @@ class DatabaseManager:
             messages.append(message_dict)
 
         conversation["messages"] = messages
+
+        if include_introspection:
+            obs_cursor = self.connection.execute("""
+                SELECT
+                    id,
+                    observation_index,
+                    observation_text,
+                    content_hash,
+                    reward_intensity,
+                    safety_score,
+                    internal_generated,
+                    created_at,
+                    json_extract(metadata, '$') as metadata
+                FROM introspection_buffer
+                WHERE conversation_id = ?
+                ORDER BY observation_index ASC
+            """, (conversation_id,))
+            conversation["introspection_observations"] = [dict(row) for row in obs_cursor.fetchall()]
+
         return conversation
 
     def create_conversation(self, conversation_id: str, title: Optional[str] = None) -> int:

@@ -1,0 +1,91 @@
+model:
+  base_model_id: "Qwen/Qwen3-1.7B"
+  max_length: 1024
+  padding_side: "left"
+  load_in_4bit: false
+  torch_dtype: "bfloat16"
+  gradient_checkpointing: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+training:
+  # Data sources (database is primary, JSONL is optional fallback)
+  use_database: true              # Use database instead of JSONL files
+  db_path: null                   # null = use default from env or TrainingDatabase default
+  sft_data_path: null             # Only used if use_database=false
+  preferences_path: null          # Only used if use_database=false
+
+  # Database query filters for SFT pairs
+  sft_filters:
+    source: null                   # null = all sources, or specific: "conversation", "manual", etc.
+    is_used: false                 # Only get unused pairs (set to null for all)
+    since: null                    # ISO date string, e.g., "2024-01-01T00:00:00Z"
+    min_instruction_length: 10     # Minimum instruction length (characters)
+    min_response_length: 10        # Minimum response length (characters)
+    min_confidence: null           # Minimum confidence if present
+
+  # SFT training enhancements (prevent verbatim repetition)
+  sft_enhancements:
+    use_recency_weighting: true    # Weight pairs by recency (newer = more important)
+    recency_decay_days: 30         # (unused when dual-tau is active; kept for compatibility)
+    recency_tau_fast_seconds: 900  # 15 minutes
+    recency_tau_slow_seconds: 5400 # 90 minutes
+    use_diversity_sampling: true   # Sample diverse pairs across conversations
+    diversity_target_size: null    # null = use all, or limit for diversity
+    diversity_k: null              # optional fixed k for k-means; null = auto sqrt(N/2)
+    diversity_per_cluster: 2       # cap selections per cluster (1–2 recommended)
+
+  # Validation split
+  validation_fraction: 0.0         # 0.0 disables; e.g., 0.05 for 5%
+  validation_max_batches: 2        # limit val batches per channel (small sanity check)
+
+  # Database query filters for preference pairs
+  preference_filters:
+    category: null                 # Filter by category if desired
+
+  # Channel weights (must sum to 1.0 for normalization)
+  # IMPORTANT: Keep preference_weight >= 0.5 to prevent verbatim repetition
+  sft_weight: 0.4                  # Memory channel weight (lower to prevent memorization)
+  preference_weight: 0.6           # Reward channel weight (higher to shape behavior)
+
+  # Batch mixing strategy: "interleaved" | "alternating" | "mixed"
+  batch_mixing: "interleaved"
+
+  # Batch sizes (can be different per channel)
+  sft_batch_size: 4
+  preference_batch_size: 2
+
+  # Learning rates (can be different per channel)
+  sft_learning_rate: 2.0e-5
+  preference_learning_rate: 5.0e-6
+
+  # Loss normalization
+  normalize_losses: true           # Scale losses to similar magnitude
+
+  # Training parameters
+  num_epochs: 3
+  warmup_steps: 100
+  max_grad_norm: 0.3
+  logging_steps: 10
+  save_every_steps: 0
+  beta: 0.05                       # DPO beta parameter
+
+  # Dynamic weighting (optional)
+  dynamic_weighting: false
+  dynamic_weight_window: 100       # Steps to average over
+
+  # Output
+  output_dir: "artifacts/lora/qwen3.1-7b-dual"
+  seed: 42

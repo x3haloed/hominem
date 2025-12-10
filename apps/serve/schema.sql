@@ -222,6 +222,48 @@ CREATE TABLE IF NOT EXISTS preference_pairs (
     metadata JSON
 );
 
+-- SFT (Supervised Fine-Tuning) pairs for memory consolidation channel
+CREATE TABLE IF NOT EXISTS sft_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Core training data
+    instruction TEXT NOT NULL,  -- The prompt/question/correction context
+    response TEXT NOT NULL,      -- The desired response
+
+    -- Source tracking
+    source TEXT NOT NULL CHECK (source IN (
+        'conversation', 'manual', 'correction', 'knowledge_update', 'synthetic'
+    )),
+    conversation_id TEXT,        -- UUID if extracted from conversation
+    message_id INTEGER,          -- References messages.id if from conversation
+    message_index INTEGER,       -- Message index in conversation if applicable
+
+    -- Extraction metadata
+    extraction_method TEXT,      -- 'frontier_model', 'user_correction', 'manual', etc.
+    confidence REAL CHECK (confidence BETWEEN 0.0 AND 1.0),
+    category TEXT,               -- 'correction', 'knowledge_update', 'style', 'clarification', 'introspection'
+
+    -- Usage tracking
+    is_used BOOLEAN DEFAULT FALSE,  -- Mark when used in training
+    used_in_training_batch TEXT,    -- Which training batch used this pair
+    training_epoch INTEGER,         -- Epoch where it was consumed
+    used_timestamp DATETIME,        -- When it was consumed
+
+    -- Timestamps
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    extracted_at DATETIME,       -- When extraction occurred (may differ from created_at)
+
+    -- Additional metadata
+    metadata JSON                -- Model version, extraction parameters, etc.
+);
+
+-- Indexes for sft_pairs performance
+CREATE INDEX IF NOT EXISTS idx_sft_pairs_source ON sft_pairs(source);
+CREATE INDEX IF NOT EXISTS idx_sft_pairs_conversation ON sft_pairs(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_sft_pairs_used ON sft_pairs(is_used);
+CREATE INDEX IF NOT EXISTS idx_sft_pairs_created ON sft_pairs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sft_pairs_confidence ON sft_pairs(confidence DESC);
+
 -- Self-training events (online feedback logs)
 CREATE TABLE IF NOT EXISTS self_train_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

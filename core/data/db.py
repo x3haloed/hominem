@@ -80,6 +80,168 @@ class TrainingDatabase:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    # SFT pair operations
+
+    _VALID_SFT_SOURCES = {
+        "conversation",
+        "manual",
+        "correction",
+        "knowledge_update",
+        "synthetic",
+    }
+
+    def _validate_sft_pair(
+        self,
+        instruction: str,
+        response: str,
+        source: str,
+        confidence: Optional[float] = None,
+    ) -> None:
+        """Validate core constraints for SFT pairs."""
+        if not instruction or len(instruction.strip()) < 10:
+            raise ValueError("instruction must be at least 10 characters")
+        if not response or len(response.strip()) < 10:
+            raise ValueError("response must be at least 10 characters")
+        if source not in self._VALID_SFT_SOURCES:
+            raise ValueError(f"source must be one of {sorted(self._VALID_SFT_SOURCES)}")
+        if confidence is not None and not (0.0 <= confidence <= 1.0):
+            raise ValueError("confidence must be between 0.0 and 1.0")
+
+    def insert_sft_pair(
+        self,
+        instruction: str,
+        response: str,
+        source: str,
+        conversation_id: Optional[str] = None,
+        message_id: Optional[int] = None,
+        message_index: Optional[int] = None,
+        extraction_method: Optional[str] = None,
+        confidence: Optional[float] = None,
+        category: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        extracted_at: Optional[str] = None,
+    ) -> int:
+        """Insert a single SFT pair after validation."""
+        self._validate_sft_pair(instruction, response, source, confidence)
+        metadata_json = json.dumps(metadata) if metadata else None
+        cursor = self.connection.execute(
+            """
+            INSERT INTO sft_pairs
+            (instruction, response, source, conversation_id, message_id, message_index,
+             extraction_method, confidence, category, metadata, extracted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                instruction,
+                response,
+                source,
+                conversation_id,
+                message_id,
+                message_index,
+                extraction_method,
+                confidence,
+                category,
+                metadata_json,
+                extracted_at,
+            ),
+        )
+        self.connection.commit()
+        return cursor.lastrowid
+
+    def insert_sft_pairs(self, pairs: List[Dict[str, Any]]) -> List[int]:
+        """Bulk insert SFT pairs with validation."""
+        inserted_ids: List[int] = []
+        for pair in pairs:
+            inserted_ids.append(
+                self.insert_sft_pair(
+                    instruction=pair["instruction"],
+                    response=pair["response"],
+                    source=pair.get("source", "conversation"),
+                    conversation_id=pair.get("conversation_id"),
+                    message_id=pair.get("message_id"),
+                    message_index=pair.get("message_index"),
+                    extraction_method=pair.get("extraction_method"),
+                    confidence=pair.get("confidence"),
+                    category=pair.get("category"),
+                    metadata=pair.get("metadata"),
+                    extracted_at=pair.get("extracted_at"),
+                )
+            )
+        return inserted_ids
+
+    def get_sft_pairs(
+        self,
+        source: Optional[str] = None,
+        is_used: Optional[bool] = None,
+        since: Optional[str] = None,
+        min_instruction_length: Optional[int] = None,
+        min_response_length: Optional[int] = None,
+        min_confidence: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get SFT pairs with optional filtering."""
+        query = "SELECT * FROM sft_pairs WHERE 1=1"
+        params: List[Any] = []
+
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+
+        if is_used is not None:
+            query += " AND is_used = ?"
+            params.append(is_used)
+
+        if since:
+            query += " AND created_at >= ?"
+            params.append(since)
+
+        if min_instruction_length is not None:
+            query += " AND length(instruction) >= ?"
+            params.append(min_instruction_length)
+
+        if min_response_length is not None:
+            query += " AND length(response) >= ?"
+            params.append(min_response_length)
+
+        if min_confidence is not None:
+            query += " AND (confidence IS NULL OR confidence >= ?)"
+            params.append(min_confidence)
+
+        query += " ORDER BY created_at DESC"
+
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cursor = self.connection.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_sft_used(
+        self,
+        pair_ids: List[int],
+        training_epoch: Optional[int] = None,
+        used_timestamp: Optional[str] = None,
+        training_batch: Optional[str] = None,
+    ) -> None:
+        """Mark SFT pairs as used in training."""
+        if not pair_ids:
+            return
+        timestamp = used_timestamp or datetime.utcnow().isoformat()
+        placeholders = ",".join(["?"] * len(pair_ids))
+        params: List[Any] = [training_batch, training_epoch, timestamp, *pair_ids]
+        self.connection.execute(
+            f"""
+            UPDATE sft_pairs
+            SET is_used = TRUE,
+                used_in_training_batch = ?,
+                training_epoch = ?,
+                used_timestamp = ?
+            WHERE id IN ({placeholders})
+            """,
+            params,
+        )
+        self.connection.commit()
+
     # Trajectories operations
 
     def insert_trajectory(
