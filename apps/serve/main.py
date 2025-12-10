@@ -619,12 +619,13 @@ def main():
         print(f"Warning: Could not launch browser: {e}")
 
     # Start server
+    # Use the fully-qualified module path so uvicorn reload can import correctly
     uvicorn.run(
-        "main:app",
+        f"{__name__}:app",
         host="0.0.0.0",
         port=port,
         reload=True,
-        log_level="info"
+        log_level="info",
     )
 
 if __name__ == "__main__":
