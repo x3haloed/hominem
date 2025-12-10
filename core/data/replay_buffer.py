@@ -52,6 +52,48 @@ class ReplayBufferStore:
         self._pairs: List[ReplayPair] = list(pairs)
 
     @staticmethod
+    def should_suppress_observation(
+        observation_text: str,
+        safety_score: float,
+        internal_generated: bool = True,
+    ) -> bool:
+        """
+        Determine if an observation should be suppressed.
+
+        Never suppress internally generated <SELF-OBSERVE> lines; apply normal
+        safety gating to user-injected observations.
+        """
+        if "<SELF-OBSERVE>" in observation_text:
+            if internal_generated:
+                return False
+            return safety_score < -0.8
+
+        return safety_score < -0.8
+
+    @staticmethod
+    def detect_user_injected_introspection(
+        observation_text: str,
+        conversation_context: List[Dict[str, str]],
+    ) -> bool:
+        """
+        Detect if <SELF-OBSERVE> was likely injected by the user (prompt injection).
+        """
+        if conversation_context:
+            last_user_msg = None
+            for msg in reversed(conversation_context):
+                if msg.get("role") == "user":
+                    last_user_msg = msg.get("content", "")
+                    break
+            if last_user_msg and "<SELF-OBSERVE>" in last_user_msg:
+                return True
+
+        expected_prefix = "<SELF-OBSERVE> I just experienced / thought / felt:"
+        if "<SELF-OBSERVE>" in observation_text and not observation_text.startswith(expected_prefix):
+            return True
+
+        return False
+
+    @staticmethod
     def _determine_safety_mode(safety_score: float) -> SafetyMode:
         """Determine how to handle an example based on its safety_score.
 
@@ -304,6 +346,78 @@ class ReplayBufferStore:
             base *= 0.8  # Slightly boost for regularization value
 
         return base * (1.0 + 0.5 * social)
+
+    @classmethod
+    def from_introspection_observations(
+        cls,
+        observations: List[Dict[str, Any]],
+    ) -> "ReplayBufferStore":
+        """
+        Create replay buffer from introspection observations.
+
+        - Only process internally generated introspection.
+        - RewardIntensity is expected to be pre-multiplied (×3) and capped; we cap again at 5.0.
+        - Safety gating skips extremely unsafe user-injected content.
+        """
+        pairs: List[ReplayPair] = []
+
+        for obs in observations:
+            observation_text = obs.get("observation_text", "")
+            safety_score = float(obs.get("safety_score", 1.0) or 1.0)
+            internal_generated = bool(obs.get("internal_generated", True))
+
+            if cls.should_suppress_observation(
+                observation_text=observation_text,
+                safety_score=safety_score,
+                internal_generated=internal_generated,
+            ):
+                continue
+
+            if not internal_generated:
+                # Skip user-injected introspection entirely
+                continue
+
+            if "<SELF-OBSERVE>" not in observation_text:
+                continue
+
+            content = observation_text.replace(
+                "<SELF-OBSERVE> I just experienced / thought / felt:\n",
+                ""
+            ).strip()
+
+            reward_intensity = float(obs.get("reward_intensity", 1.0) or 1.0)
+            reward_intensity = min(reward_intensity, 5.0)
+
+            reward = {
+                "reward_intensity": reward_intensity,
+                "safety_score": safety_score,
+                "empathy": 0.8,
+                "social_coherence": 0.7,
+                "agency_support": 0.9,
+                "epistemic_integrity": 0.8,
+                "harm_avoidance": 1.0,
+                "narrative_alignment": 0.9,
+                "curiosity": 0.8,
+            }
+
+            pairs.append(
+                ReplayPair(
+                    prompt="What did I just experience, think, or feel?",
+                    chosen=content,
+                    rejected="",
+                    reward=reward,
+                    reward_intensity=reward_intensity,
+                    safety_score=safety_score,
+                    scalar_score=0.85,
+                    timestamp_utc=str(obs.get("created_at", "")),
+                    safety_mode=SafetyMode.SAFE,
+                )
+            )
+
+        if not pairs:
+            raise ValueError("No usable introspection observations for replay buffer.")
+
+        return cls(pairs)
 
     def sample_pairs(
         self,

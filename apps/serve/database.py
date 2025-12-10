@@ -223,6 +223,137 @@ class DatabaseManager:
 
         self.connection.commit()
 
+    def add_introspection_observation(
+        self,
+        conversation_id: str,
+        observation_text: str,
+        message_id: Optional[int] = None,
+        reward_intensity: Optional[float] = None,
+        safety_score: Optional[float] = None,
+        internal_generated: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Add a self-observation to the introspection buffer."""
+        # Determine next observation_index for this conversation
+        cursor = self.connection.execute("""
+            SELECT COALESCE(MAX(observation_index), -1) + 1
+            FROM introspection_buffer
+            WHERE conversation_id = ?
+        """, (conversation_id,))
+        observation_index = cursor.fetchone()[0]
+
+        metadata_dict = metadata.copy() if metadata else {}
+        metadata_dict["internal_generated"] = internal_generated
+        metadata_json = json.dumps(metadata_dict) if metadata_dict else None
+
+        content_hash = metadata_dict.get("content_hash") if metadata_dict else None
+
+        cursor = self.connection.execute("""
+            INSERT INTO introspection_buffer
+            (conversation_id, message_id, observation_index, observation_text,
+             content_hash, reward_intensity, safety_score, internal_generated, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            conversation_id,
+            message_id,
+            observation_index,
+            observation_text,
+            content_hash,
+            reward_intensity,
+            safety_score,
+            int(bool(internal_generated)),
+            metadata_json,
+        ))
+
+        self.connection.commit()
+        return cursor.lastrowid
+
+    def get_introspection_observations(
+        self,
+        conversation_id: str,
+        limit: Optional[int] = 16,
+        min_age_days: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve introspection observations for a conversation.
+
+        Args:
+            conversation_id: Conversation identifier (conversations.conversation_id)
+            limit: Maximum number of observations to return (None = all)
+            min_age_days: Only include observations newer than this many days
+        """
+        query = """
+            SELECT observation_text, created_at, reward_intensity, safety_score,
+                   internal_generated, metadata
+            FROM introspection_buffer
+            WHERE conversation_id = ?
+        """
+        params = [conversation_id]
+
+        if min_age_days:
+            query += " AND created_at >= datetime('now', '-' || ? || ' days')"
+            params.append(min_age_days)
+
+        query += " ORDER BY observation_index DESC"
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cursor = self.connection.execute(query, params)
+
+        observations: List[Dict[str, Any]] = []
+        for row in cursor.fetchall():
+            observations.append({
+                "observation_text": row["observation_text"],
+                "created_at": row["created_at"],
+                "reward_intensity": row["reward_intensity"],
+                "safety_score": row["safety_score"],
+                "internal_generated": bool(row["internal_generated"]) if row["internal_generated"] is not None else True,
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+            })
+
+        # Return oldest-first for chronological context
+        return list(reversed(observations))
+
+    def prune_old_introspection(
+        self,
+        conversation_id: Optional[str] = None,
+        max_age_days: int = 30,
+        keep_recent: int = 100,
+    ) -> int:
+        """
+        Prune old introspection observations.
+
+        Keeps the most recent N observations and deletes older ones older than max_age_days.
+        """
+        if conversation_id:
+            cursor = self.connection.execute("""
+                DELETE FROM introspection_buffer
+                WHERE conversation_id = ?
+                AND id NOT IN (
+                    SELECT id FROM introspection_buffer
+                    WHERE conversation_id = ?
+                    ORDER BY observation_index DESC
+                    LIMIT ?
+                )
+                AND created_at < datetime('now', '-' || ? || ' days')
+            """, (conversation_id, conversation_id, keep_recent, max_age_days))
+        else:
+            cursor = self.connection.execute("""
+                DELETE FROM introspection_buffer
+                WHERE id NOT IN (
+                    SELECT id FROM introspection_buffer
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                )
+                AND created_at < datetime('now', '-' || ? || ' days')
+            """, (keep_recent, max_age_days))
+
+        deleted = cursor.rowcount
+        self.connection.commit()
+        return deleted
+
     def get_training_data(self, start_date: Optional[str] = None,
                          end_date: Optional[str] = None,
                          include_synthetic: bool = True) -> List[Dict[str, Any]]:

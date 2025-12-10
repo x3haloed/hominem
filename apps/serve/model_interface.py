@@ -11,6 +11,9 @@ import time
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 import os
+import hashlib
+
+from .self_awareness import SelfAwarenessCore
 
 # Model loading dependencies (loaded conditionally)
 try:
@@ -86,14 +89,45 @@ class ModelRegistry:
 class ModelInterface:
     """Interface for LoRA model inference with streaming support and hot-swapping"""
 
-    def __init__(self):
+    @staticmethod
+    def _as_bool(value: Optional[Any], default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() == "true"
+
+    def __init__(self, *, self_awareness_config: Optional[Dict[str, Any]] = None):
         self.registry = ModelRegistry()
         self.device = "cuda" if torch and torch.cuda.is_available() else "cpu"
         self.max_memory = {}  # For model loading constraints
 
+        cfg = self_awareness_config or {}
+        max_lines = int(cfg.get("max_introspection_lines", 16))
+        self_token = cfg.get("self_token", "<SELF>")
+        max_intensity = float(cfg.get("max_intensity", 5.0))
+        novelty_threshold = float(cfg.get("novelty_threshold", 0.85))
+        prune_age_days = int(cfg.get("prune_age_days", 30))
+        keep_recent = int(cfg.get("keep_recent", 100))
+
+        self.self_awareness = SelfAwarenessCore(
+            max_introspection_lines=max_lines,
+            self_token=self_token,
+            max_intensity=max_intensity,
+            novelty_threshold=novelty_threshold,
+            prune_age_days=prune_age_days,
+            keep_recent=keep_recent,
+        )
+
+        self.enable_self_awareness = self._as_bool(cfg.get("enable_self_awareness"), True)
+        self.enable_perspective_gate = self._as_bool(cfg.get("enable_perspective_gate"), True)
+        self.perspective_gate_async = self._as_bool(cfg.get("perspective_gate_async"), False)
+        self.use_fast_perspective_model = self._as_bool(cfg.get("use_fast_model"), False)
+
     async def generate_streaming_response(self, websocket, conversation_id: str,
                                         message_index: int, conversation_history: List[Dict[str, str]],
-                                        enable_thinking: bool = True, db=None):
+                                        enable_thinking: bool = True, db=None,
+                                        enable_self_awareness: Optional[bool] = None):
         """Generate streaming response and send via WebSocket"""
         print(f"🎯 Starting completion for {conversation_id}:{message_index + 1}")
         start_time = time.time()
@@ -118,8 +152,29 @@ class ModelInterface:
                 "message_index": assistant_index
             })
 
-            # Format conversation using chat template
-            formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history, enable_thinking)
+            # Self-awareness: fetch introspection observations if enabled
+            introspection_observations: List[Dict[str, Any]] = []
+            use_self_awareness = enable_self_awareness if enable_self_awareness is not None else self.enable_self_awareness
+            if use_self_awareness and db:
+                try:
+                    introspection_observations = db.get_introspection_observations(
+                        conversation_id=conversation_id,
+                        limit=self.self_awareness.max_introspection_lines,
+                    )
+                except Exception as db_error:
+                    print(f"⚠️ Failed to fetch introspection observations: {db_error}")
+
+            # Format conversation with self-aware context if enabled
+            if use_self_awareness and introspection_observations is not None:
+                user_message = conversation_history[-1]["content"] if conversation_history else ""
+                formatted_prompt = self.self_awareness.build_self_aware_context(
+                    conversation_history=conversation_history[:-1] if conversation_history else [],
+                    introspection_observations=introspection_observations,
+                    user_message=user_message,
+                )
+            else:
+                # Format conversation using chat template
+                formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history, enable_thinking)
 
             if model_version.model and model_version.tokenizer:
                 print(f"🚀 Starting model inference with {model_version.version_id}")
@@ -196,11 +251,11 @@ class ModelInterface:
                     "processing_time_ms": processing_time
                 })
 
-                # Save assistant response to database
+                assistant_message_id: Optional[int] = None
                 if db:
                     try:
                         token_count = len(model_version.tokenizer.encode(response_text))
-                        db.add_message(
+                        saved_index = db.add_message(
                             conversation_id=conversation_id,
                             role="assistant",
                             content=response_text,
@@ -208,9 +263,77 @@ class ModelInterface:
                             processing_time_ms=processing_time,
                             metadata={"enable_thinking": enable_thinking}
                         )
-                        print(f"💾 Saved assistant response for {conversation_id}:{assistant_index}")
+                        assistant_message_id = self._get_message_id(db, conversation_id, saved_index)
+                        print(f"💾 Saved assistant response for {conversation_id}:{assistant_index} (msg_id={assistant_message_id})")
                     except Exception as db_error:
                         print(f"⚠️ Failed to save assistant message to database: {db_error}")
+
+                # Self-awareness post-processing: boundary, perspective gate, introspection buffer
+                if use_self_awareness:
+                    # 1. Enforce boundary
+                    response_text = self.self_awareness.enforce_boundary(response_text)
+
+                    # 2. Perspective gate (optional due to cost)
+                    if self.enable_perspective_gate:
+                        try:
+                            fast_model = getattr(self, "fast_model", None) if self.use_fast_perspective_model else None
+                            response_text = self.self_awareness.apply_perspective_gate(
+                                model=model_version.model,
+                                tokenizer=model_version.tokenizer,
+                                raw_output=response_text,
+                                device=self.device,
+                                use_fast_model=fast_model,
+                                async_mode=self.perspective_gate_async,
+                            )
+                        except Exception as e:
+                            print(f"⚠️ Perspective gate failed, using boundary-enforced output: {e}")
+
+                    # 3. Create self-observation
+                    observation_text = self.self_awareness.create_self_observation(response_text)
+
+                    # 4. Novelty check (skip if too similar to recent)
+                    recent_obs_texts = [obs.get("observation_text", "") for obs in introspection_observations[-10:]]
+                    is_novel = self.self_awareness.check_novelty(
+                        observation_text=observation_text,
+                        recent_observations=recent_obs_texts,
+                        similarity_threshold=self.self_awareness.novelty_threshold,
+                    )
+                    if not is_novel:
+                        print("💭 Skipping non-novel introspection (too similar to recent)")
+                    else:
+                        if db:
+                            try:
+                                emotion_engine = getattr(self, "emotion_engine", None)
+                                reward_model = getattr(self, "reward_model", None)
+                                reward_intensity = self.self_awareness.extract_reward_intensity_from_observation(
+                                    observation_text=observation_text,
+                                    emotion_engine=emotion_engine,
+                                    reward_model=reward_model,
+                                    max_intensity=self.self_awareness.max_intensity,
+                                )
+
+                                content_hash = self.self_awareness.compute_content_hash(observation_text)
+
+                                cursor = db.connection.execute("""
+                                    SELECT id FROM introspection_buffer
+                                    WHERE content_hash = ?
+                                    LIMIT 1
+                                """, (content_hash,))
+                                if cursor.fetchone():
+                                    print("💭 Skipping duplicate introspection")
+                                else:
+                                    db.add_introspection_observation(
+                                        conversation_id=conversation_id,
+                                        observation_text=observation_text,
+                                        message_id=assistant_message_id,
+                                        reward_intensity=reward_intensity,
+                                        safety_score=None,
+                                        internal_generated=True,
+                                        metadata={"enable_thinking": enable_thinking, "content_hash": content_hash},
+                                    )
+                                    print(f"💭 Saved self-observation for {conversation_id}")
+                            except Exception as e:
+                                print(f"⚠️ Failed to save introspection: {e}")
 
         except Exception as e:
             print(f"❌ Model generation error: {e}")
@@ -431,6 +554,22 @@ class ModelInterface:
                 "top_p": 0.8,
                 "top_k": 20,
             }
+
+    @staticmethod
+    def _get_message_id(db, conversation_id: str, message_index: int) -> Optional[int]:
+        """Lookup message row ID for a conversation/message_index pair."""
+        try:
+            cursor = db.connection.execute("""
+                SELECT m.id FROM messages m
+                JOIN conversations c ON m.conversation_id = c.id
+                WHERE c.conversation_id = ? AND m.message_index = ?
+                LIMIT 1
+            """, (conversation_id, message_index))
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            print(f"⚠️ Could not fetch message id for {conversation_id}:{message_index}: {e}")
+            return None
 
     async def load_model_async(self, version_id: str, base_model_path: str,
                               lora_path: Optional[str] = None) -> bool:

@@ -38,6 +38,31 @@ AUTO_LOAD_LORA = os.getenv("AUTO_LOAD_LORA")
 BASE_MODEL_PATH = os.getenv("BASE_MODEL_PATH")
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+# Self-awareness configuration
+ENABLE_SELF_AWARENESS = os.getenv("ENABLE_SELF_AWARENESS", "true").lower() == "true"
+SELF_AWARENESS_MAX_LINES = int(os.getenv("SELF_AWARENESS_MAX_INTROSPECTION_LINES", "16"))
+ENABLE_PERSPECTIVE_GATE = os.getenv("SELF_AWARENESS_ENABLE_PERSPECTIVE_GATE", "true").lower() == "true"
+SELF_AWARENESS_PERSPECTIVE_GATE_ASYNC = os.getenv("SELF_AWARENESS_PERSPECTIVE_GATE_ASYNC", "false").lower() == "true"
+SELF_AWARENESS_USE_FAST_MODEL = os.getenv("SELF_AWARENESS_USE_FAST_MODEL", "false").lower() == "true"
+SELF_AWARENESS_TOKEN = os.getenv("SELF_AWARENESS_TOKEN", "<SELF>")
+SELF_AWARENESS_MAX_INTENSITY = float(os.getenv("SELF_AWARENESS_MAX_INTENSITY", "5.0"))
+SELF_AWARENESS_NOVELTY_THRESHOLD = float(os.getenv("SELF_AWARENESS_NOVELTY_THRESHOLD", "0.85"))
+SELF_AWARENESS_PRUNE_AGE_DAYS = int(os.getenv("SELF_AWARENESS_PRUNE_AGE_DAYS", "30"))
+SELF_AWARENESS_KEEP_RECENT = int(os.getenv("SELF_AWARENESS_KEEP_RECENT", "100"))
+
+SELF_AWARENESS_CONFIG = {
+    "enable_self_awareness": ENABLE_SELF_AWARENESS,
+    "enable_perspective_gate": ENABLE_PERSPECTIVE_GATE,
+    "perspective_gate_async": SELF_AWARENESS_PERSPECTIVE_GATE_ASYNC,
+    "use_fast_model": SELF_AWARENESS_USE_FAST_MODEL,
+    "self_token": SELF_AWARENESS_TOKEN,
+    "max_introspection_lines": SELF_AWARENESS_MAX_LINES,
+    "max_intensity": SELF_AWARENESS_MAX_INTENSITY,
+    "novelty_threshold": SELF_AWARENESS_NOVELTY_THRESHOLD,
+    "prune_age_days": SELF_AWARENESS_PRUNE_AGE_DAYS,
+    "keep_recent": SELF_AWARENESS_KEEP_RECENT,
+}
+
 # Resolve project root (apps/serve/ -> project root)
 BASE_DIR = Path(__file__).resolve().parents[2]
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
@@ -253,7 +278,7 @@ async def lifespan(app: FastAPI):
     db = DatabaseManager(DATABASE_PATH)
 
     # Initialize model interface (placeholder for now)
-    model = ModelInterface()
+    model = ModelInterface(self_awareness_config=SELF_AWARENESS_CONFIG)
 
     # Auto-load LoRA model if specified
     print(f"🔍 Checking for auto-load: AUTO_LOAD_LORA='{AUTO_LOAD_LORA}', BASE_MODEL_PATH='{BASE_MODEL_PATH}'")

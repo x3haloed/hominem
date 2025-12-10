@@ -28,6 +28,29 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(conversation_id, message_index)
 );
 
+-- Introspection buffer (self-observations for self-awareness)
+CREATE TABLE IF NOT EXISTS introspection_buffer (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,         -- Links to conversations.conversation_id
+    message_id INTEGER,                    -- Links to messages.id (if from a specific message)
+    observation_index INTEGER NOT NULL,    -- Order within conversation (0-based)
+
+    -- Self-observation content
+    observation_text TEXT NOT NULL,        -- The <SELF-OBSERVE> content
+    content_hash TEXT,                     -- Hash for deduplication
+
+    -- Metadata
+    reward_intensity REAL,                 -- For replay buffer priority (RewardIntensity × 3, capped)
+    safety_score REAL,                     -- Safety score for this observation
+    internal_generated BOOLEAN DEFAULT TRUE, -- Tag internal vs user-injected
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON,                         -- Additional context (model version, etc.)
+
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+    FOREIGN KEY (message_id) REFERENCES messages(id),
+    UNIQUE(conversation_id, observation_index)
+);
+
 -- Emotion labels (6-axis manifold + UI indicators)
 CREATE TABLE IF NOT EXISTS emotion_labels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +149,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id
 CREATE INDEX IF NOT EXISTS idx_emotion_labels_message ON emotion_labels(message_id);
 CREATE INDEX IF NOT EXISTS idx_emotion_labels_labeler ON emotion_labels(labeler);
 CREATE INDEX IF NOT EXISTS idx_reward_labels_message ON reward_labels(message_id);
+CREATE INDEX IF NOT EXISTS idx_introspection_conversation ON introspection_buffer(conversation_id, observation_index DESC);
+CREATE INDEX IF NOT EXISTS idx_introspection_created ON introspection_buffer(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_introspection_content_hash ON introspection_buffer(content_hash);
 CREATE INDEX IF NOT EXISTS idx_synthetic_data_source ON synthetic_data(source);
 CREATE INDEX IF NOT EXISTS idx_synthetic_data_used ON synthetic_data(is_used);
 

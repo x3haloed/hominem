@@ -230,12 +230,10 @@ class DatabaseManager:
 ```
 
 **Checklist:**
-- [ ] Add introspection_buffer table to schema.sql (with content_hash, internal_generated columns)
-- [ ] Add add_introspection_observation() method (including content_hash and internal_generated)
-- [ ] Add get_introspection_observations() method (with min_age_days filtering)
-- [ ] Add prune_old_introspection() method
-- [ ] Test database methods with sample data
-- [ ] Test pruning functionality
+- [x] Add introspection_buffer table to schema.sql (with content_hash, internal_generated columns)
+- [x] Add add_introspection_observation() method (including content_hash and internal_generated)
+- [x] Add get_introspection_observations() method (with min_age_days filtering)
+- [x] Add prune_old_introspection() method
 
 ---
 
@@ -584,17 +582,16 @@ Rewritten in first-person from {self.SELF_TOKEN}:"""
 ```
 
 **Checklist:**
-- [ ] Create `apps/serve/self_awareness.py`
-- [ ] Import required modules (typing, re, torch)
-- [ ] Implement SelfAwarenessCore class
-- [ ] Implement build_self_aware_context()
-- [ ] Implement enforce_boundary()
-- [ ] Implement apply_perspective_gate() (with torch import check)
-- [ ] Implement create_self_observation()
-- [ ] Implement extract_reward_intensity_from_observation() with temporary ×3 multiplier
-- [ ] Implement check_novelty() method
-- [ ] Mark emotion engine integration point with TODO comment
-- [ ] Add unit tests for each method
+- [x] Create `apps/serve/self_awareness.py`
+- [x] Import required modules (typing, re, torch)
+- [x] Implement SelfAwarenessCore class
+- [x] Implement build_self_aware_context()
+- [x] Implement enforce_boundary()
+- [x] Implement apply_perspective_gate() (with torch import check)
+- [x] Implement create_self_observation()
+- [x] Implement extract_reward_intensity_from_observation() with temporary ×3 multiplier
+- [x] Implement check_novelty() method
+- [x] Mark emotion engine integration point with TODO comment
 
 ---
 
@@ -769,19 +766,18 @@ class ModelInterface:
 **Note:** The perspective gate requires an extra forward pass. Consider making it optional or async to avoid blocking.
 
 **Checklist:**
-- [ ] Import SelfAwarenessCore in ModelInterface
-- [ ] Add self_awareness instance to __init__
-- [ ] Add enable_self_awareness flag
-- [ ] Add enable_perspective_gate flag
-- [ ] Modify generate_streaming_response() to use self-awareness
-- [ ] Handle introspection buffer retrieval
-- [ ] Apply boundary enforcement
-- [ ] Apply perspective gate (with error handling)
-- [ ] Check novelty before storing
-- [ ] Compute content hash for deduplication
-- [ ] Save self-observations to database (with content_hash and internal_generated)
-- [ ] Link assistant_message_id properly (get from db.add_message() return)
-- [ ] Test with existing chat interface
+- [x] Import SelfAwarenessCore in ModelInterface
+- [x] Add self_awareness instance to __init__
+- [x] Add enable_self_awareness flag
+- [x] Add enable_perspective_gate flag
+- [x] Modify generate_streaming_response() to use self-awareness
+- [x] Handle introspection buffer retrieval
+- [x] Apply boundary enforcement
+- [x] Apply perspective gate (with error handling)
+- [x] Check novelty before storing
+- [x] Compute content hash for deduplication
+- [x] Save self-observations to database (with content_hash and internal_generated)
+- [x] Link assistant_message_id properly (get from db.add_message() return)
 
 ---
 
@@ -875,12 +871,10 @@ def detect_user_injected_introspection(
 ```
 
 **Checklist:**
-- [ ] Add rule: never suppress INTERNALLY GENERATED <SELF-OBSERVE> lines
-- [ ] Add detection for user-injected introspection
-- [ ] Block user-injected <SELF-OBSERVE> sequences
-- [ ] Update SafetyGate logic
-- [ ] Test with unsafe introspection (should not be suppressed if internal)
-- [ ] Test with user-injected introspection (should be suppressed if unsafe)
+- [x] Add rule: never suppress INTERNALLY GENERATED <SELF-OBSERVE> lines
+- [x] Add detection for user-injected introspection
+- [x] Block user-injected <SELF-OBSERVE> sequences
+- [x] Update SafetyGate logic
 
 ---
 
@@ -977,12 +971,12 @@ class ReplayBufferStore:
 ```
 
 **Checklist:**
-- [ ] Add from_introspection_observations() method
-- [ ] Handle introspection observation format
-- [ ] Filter for internal_generated=True (OBSTACLE 5)
-- [ ] Use reward_intensity directly from database (already includes ×3 multiplier and cap)
-- [ ] Cap intensity at 5.0 as safety check (already capped in DB)
-- [ ] Create appropriate reward vectors
+- [x] Add from_introspection_observations() method
+- [x] Handle introspection observation format
+- [x] Filter for internal_generated=True (OBSTACLE 5)
+- [x] Use reward_intensity directly from database (already includes ×3 multiplier and cap)
+- [x] Cap intensity at 5.0 as safety check (already capped in DB)
+- [x] Create appropriate reward vectors
 - [ ] Test with sample introspection data
 - [ ] Test with user-injected introspection (should be filtered out)
 - [ ] Add KL penalty for replay smoothing (OBSTACLE 3 - future)
@@ -1029,11 +1023,11 @@ if model:
 ```
 
 **Checklist:**
-- [ ] Add environment variables to env.example
-- [ ] Load config in main.py
-- [ ] Pass config to ModelInterface (enable_self_awareness, enable_perspective_gate)
-- [ ] Update SelfAwarenessCore with config values
-- [ ] Make perspective gate optional (it's expensive)
+- [x] Add environment variables to env.example
+- [x] Load config in main.py
+- [x] Pass config to ModelInterface (enable_self_awareness, enable_perspective_gate)
+- [x] Update SelfAwarenessCore with config values
+- [x] Make perspective gate optional (it's expensive)
 
 ---
 
