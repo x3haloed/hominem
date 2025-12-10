@@ -51,6 +51,64 @@ body {
     border-bottom: 1px solid var(--border-color);
 }
 
+#model-status {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-color);
+    background-color: var(--bg-secondary);
+}
+
+#model-info {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.model-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: var(--danger-color);
+}
+
+.status-dot.loaded {
+    background-color: var(--success-color);
+}
+
+.status-dot.loading {
+    background-color: var(--warning-color);
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}
+
+#model-settings-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    font-size: 16px;
+    opacity: 0.7;
+    transition: opacity 0.2s;
+}
+
+#model-settings-btn:hover {
+    opacity: 1;
+    background-color: var(--bg-primary);
+}
+
 #new-conversation-btn {
     width: 100%;
     padding: 12px 16px;

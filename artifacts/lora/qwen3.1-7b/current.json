@@ -1,0 +1,5 @@
+{
+  "source": "offline_dpo",
+  "path": "artifacts/lora/qwen3.1-7b",
+  "trained_at_utc": "2025-12-09T23:40:12.195887+00:00"
+}

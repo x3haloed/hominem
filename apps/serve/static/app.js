@@ -24,13 +24,20 @@ class ChatApp {
             '🎭': { social_broadcast: 0, tooltip: 'Low social broadcast (shame/hidden)' }
         };
 
+        // Model management
+        this.currentModel = null;
+
         this.init();
     }
 
     init() {
         this.bindEvents();
         this.loadConversations();
+        this.loadModelStatus();
         this.autoResizeTextarea();
+
+        // Poll model status periodically
+        setInterval(() => this.loadModelStatus(), 5000);
     }
 
     bindEvents() {
@@ -52,6 +59,11 @@ class ChatApp {
         // New conversation
         document.getElementById('new-conversation-btn').addEventListener('click', () => {
             this.createNewConversation();
+        });
+
+        // Model management
+        document.getElementById('model-settings-btn').addEventListener('click', () => {
+            this.showModelSettings();
         });
 
         // Emotion labeling
@@ -468,6 +480,111 @@ class ChatApp {
 
     scrollToBottom() {
         this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
+    }
+
+    async loadModelStatus() {
+        try {
+            const response = await fetch('/api/models');
+            const data = await response.json();
+
+            this.updateModelStatus(data);
+        } catch (error) {
+            console.error('Failed to load model status:', error);
+        }
+    }
+
+    updateModelStatus(data) {
+        const indicator = document.getElementById('model-indicator');
+        const statusDot = document.getElementById('status-dot');
+        const modelName = document.getElementById('model-name');
+
+        if (data.active_version) {
+            const version = data.active_version;
+            const hasLora = version.metadata?.has_lora;
+            const modelSize = version.metadata?.model_size || '';
+
+            modelName.textContent = `${version.version_id}${hasLora ? ' (LoRA)' : ''} ${modelSize}`;
+            statusDot.className = 'status-dot loaded';
+
+            this.currentModel = version;
+        } else {
+            modelName.textContent = 'No Model';
+            statusDot.className = 'status-dot';
+            this.currentModel = null;
+        }
+    }
+
+    showModelSettings() {
+        // Simple model management UI
+        const versions = prompt('Enter model version details (base_path,lora_path):', 'models/base,model/lora');
+        if (versions) {
+            const [basePath, loraPath] = versions.split(',');
+            this.loadNewModel(basePath.trim(), loraPath?.trim());
+        }
+    }
+
+    async loadNewModel(basePath, loraPath) {
+        try {
+            const response = await fetch('/api/models/load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    base_model_path: basePath,
+                    lora_path: loraPath || null
+                })
+            });
+
+            const data = await response.json();
+            alert(`Loading model ${data.version_id} in background...`);
+
+            // Start polling for status updates
+            this.pollModelLoading(data.version_id);
+        } catch (error) {
+            console.error('Failed to load model:', error);
+            alert('Failed to start model loading');
+        }
+    }
+
+    async pollModelLoading(versionId) {
+        const poll = async () => {
+            try {
+                const response = await fetch('/api/models');
+                const data = await response.json();
+
+                if (data.loaded_versions.includes(versionId)) {
+                    // Model loaded, ask if user wants to switch
+                    if (confirm(`Model ${versionId} loaded. Switch to it now?`)) {
+                        await this.switchToModel(versionId);
+                    }
+                    return;
+                }
+
+                // Continue polling
+                setTimeout(poll, 2000);
+            } catch (error) {
+                console.error('Polling error:', error);
+            }
+        };
+
+        poll();
+    }
+
+    async switchToModel(versionId) {
+        try {
+            const response = await fetch(`/api/models/switch/${versionId}`, {
+                method: 'POST'
+            });
+
+            if (response.ok) {
+                await this.loadModelStatus();
+                alert(`Switched to model ${versionId}`);
+            } else {
+                alert('Failed to switch model');
+            }
+        } catch (error) {
+            console.error('Failed to switch model:', error);
+            alert('Failed to switch model');
+        }
     }
 
     escapeHtml(text) {

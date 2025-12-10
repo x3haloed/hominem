@@ -10,7 +10,8 @@ uvicorn[standard]>=0.24.0
 # Environment variables
 python-dotenv>=1.0.0
 
-# Optional: Model loading (for future LoRA integration)
-# transformers>=4.35.0
-# torch>=2.1.0
-# peft>=0.6.0
+# Model loading for LoRA integration
+transformers>=4.35.0
+torch>=2.1.0
+peft>=0.6.0
+accelerate>=0.24.0  # For device mapping

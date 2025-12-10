@@ -2,7 +2,7 @@
 -- This is the canonical source of truth for conversation history and labels
 
 -- Main conversations table (canonical conversation history)
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT UNIQUE NOT NULL,  -- UUID for conversation thread
     title TEXT,  -- Auto-generated or user-set title
@@ -13,7 +13,7 @@ CREATE TABLE conversations (
 );
 
 -- Individual messages within conversations
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id INTEGER NOT NULL,
     message_index INTEGER NOT NULL,  -- Order within conversation (0-based)
@@ -29,7 +29,7 @@ CREATE TABLE messages (
 );
 
 -- Emotion labels (6-axis manifold + UI indicators)
-CREATE TABLE emotion_labels (
+CREATE TABLE IF NOT EXISTS emotion_labels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL,
     labeler TEXT NOT NULL CHECK (labeler IN ('user', 'auto')),  -- Manual or automatic
@@ -58,7 +58,7 @@ CREATE TABLE emotion_labels (
 );
 
 -- Reward model labels (behavioral dimensions - for comparison/training)
-CREATE TABLE reward_labels (
+CREATE TABLE IF NOT EXISTS reward_labels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL,
     labeler TEXT NOT NULL CHECK (labeler IN ('auto')),  -- Currently only auto
@@ -84,7 +84,7 @@ CREATE TABLE reward_labels (
 );
 
 -- Synthetic training data (separate from conversation history)
-CREATE TABLE synthetic_data (
+CREATE TABLE IF NOT EXISTS synthetic_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,  -- 'frontier_generated', 'synthetic_augmentation', etc.
     prompt TEXT NOT NULL,
@@ -100,7 +100,7 @@ CREATE TABLE synthetic_data (
 );
 
 -- Training batches (for tracking what data went into each model version)
-CREATE TABLE training_batches (
+CREATE TABLE IF NOT EXISTS training_batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_name TEXT UNIQUE NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -120,17 +120,17 @@ CREATE TABLE training_batches (
 );
 
 -- Indexes for performance
-CREATE INDEX idx_conversations_active ON conversations(is_active);
-CREATE INDEX idx_conversations_updated ON conversations(updated_at DESC);
-CREATE INDEX idx_messages_conversation ON messages(conversation_id, message_index);
-CREATE INDEX idx_emotion_labels_message ON emotion_labels(message_id);
-CREATE INDEX idx_emotion_labels_labeler ON emotion_labels(labeler);
-CREATE INDEX idx_reward_labels_message ON reward_labels(message_id);
-CREATE INDEX idx_synthetic_data_source ON synthetic_data(source);
-CREATE INDEX idx_synthetic_data_used ON synthetic_data(is_used);
+CREATE INDEX IF NOT EXISTS idx_conversations_active ON conversations(is_active);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, message_index);
+CREATE INDEX IF NOT EXISTS idx_emotion_labels_message ON emotion_labels(message_id);
+CREATE INDEX IF NOT EXISTS idx_emotion_labels_labeler ON emotion_labels(labeler);
+CREATE INDEX IF NOT EXISTS idx_reward_labels_message ON reward_labels(message_id);
+CREATE INDEX IF NOT EXISTS idx_synthetic_data_source ON synthetic_data(source);
+CREATE INDEX IF NOT EXISTS idx_synthetic_data_used ON synthetic_data(is_used);
 
 -- Views for training data preparation
-CREATE VIEW training_data_combined AS
+CREATE VIEW IF NOT EXISTS training_data_combined AS
 SELECT
     'conversation' as data_source,
     m.conversation_id,

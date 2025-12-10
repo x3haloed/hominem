@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import uuid
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
@@ -32,9 +33,17 @@ except Exception as e:
     print(f"Warning: Could not load .env file: {e}")
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "storage/conversations.db")
+AUTO_LOAD_LORA = os.getenv("AUTO_LOAD_LORA")
+BASE_MODEL_PATH = os.getenv("BASE_MODEL_PATH")
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+# Resolve project root (apps/serve/ -> project root)
+BASE_DIR = Path(__file__).resolve().parents[2]
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+LORA_DIR = ARTIFACTS_DIR / "lora"
 
 # Ensure database directory exists
-os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+os.makedirs(Path(DATABASE_PATH).parent, exist_ok=True)
 
 # Import our modules (these will be created)
 try:
@@ -49,6 +58,128 @@ except ImportError:
 db: Optional[DatabaseManager] = None
 model: Optional[ModelInterface] = None
 
+async def auto_load_lora_model(model_interface, lora_spec: str, base_model_path: str = None):
+    """Automatically load a LoRA model on startup"""
+    try:
+        print(f"🔍 Processing LoRA spec: '{lora_spec}'")
+
+        # Determine LoRA path
+        if os.path.isabs(lora_spec):
+            # Absolute path specified
+            lora_path = Path(lora_spec)
+            version_id = lora_path.name  # Use directory name as version
+            print(f"📁 Using absolute path: {lora_path}")
+        else:
+            # Relative path from artifacts/lora/ (project root)
+            lora_path = LORA_DIR / lora_spec
+            version_id = lora_spec
+            print(f"📁 Checking relative path: {lora_path}")
+
+            # If the exact path doesn't exist, try to find the latest version
+            if not lora_path.exists():
+                print(f"⚠️  Path {lora_path} doesn't exist, looking for latest version...")
+                lora_path = find_latest_lora_version(lora_spec)
+                if lora_path:
+                    version_id = lora_path.name
+                    print(f"✅ Found latest version: {lora_path}")
+                else:
+                    print(f"❌ No versions found for '{lora_spec}'")
+                    lora_path = None  # Ensure it's None if not found
+
+        if not lora_path or not lora_path.exists():
+            exists = lora_path.exists() if isinstance(lora_path, Path) else 'N/A'
+            print(f"❌ Final check failed: lora_path={lora_path}, exists={exists}")
+            print(f"⚠️  Auto-load LoRA not found: {lora_path}")
+            return
+
+        # Auto-detect base model if not specified
+        if not base_model_path:
+            base_model_path = auto_detect_base_model(lora_path)
+
+        if not base_model_path:
+            print(f"⚠️  Could not determine base model path for {lora_spec}")
+            print("   Set BASE_MODEL_PATH in .env or ensure it's in the LoRA directory")
+            return
+
+        print(f"🔄 Auto-loading LoRA model: {version_id}")
+        print(f"   Base: {base_model_path}")
+        print(f"   LoRA: {lora_path}")
+
+        # Load the model
+        base_model_path_str = str(base_model_path) if base_model_path else None
+        success = await model_interface.load_model_async(version_id, base_model_path_str, str(lora_path))
+
+        if success:
+            # Switch to the loaded model
+            if model_interface.switch_to_version(version_id):
+                print(f"✅ Auto-loaded and activated LoRA model: {version_id}")
+            else:
+                print(f"❌ Failed to activate auto-loaded model: {version_id}")
+        else:
+            print(f"❌ Failed to auto-load LoRA model: {version_id}")
+
+    except Exception as e:
+        print(f"❌ Error during auto-loading: {e}")
+
+def find_latest_lora_version(base_name: str) -> Optional[Path]:
+    """Find the latest version of a LoRA model (e.g., qwen3.1-7b-v2)"""
+    lora_base_dir = LORA_DIR
+
+    if not lora_base_dir.exists():
+        print(f"❌ LoRA base directory not found: {lora_base_dir}")
+        return None
+
+    # Look for directories that start with the base name
+    candidates = []
+    for item in lora_base_dir.iterdir():
+        if item.is_dir() and item.name.startswith(base_name):
+            # Check if it has the required LoRA files
+            if (item / "adapter_config.json").exists():
+                candidates.append(item)
+
+    if not candidates:
+        return None
+
+    # Sort by modification time (newest first)
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+    print(f"🔍 Found {len(candidates)} versions for '{base_name}', using latest: {candidates[0].name}")
+    return candidates[0]
+
+def auto_detect_base_model(lora_path: Path) -> Optional[str]:
+    """Try to auto-detect the base model path from LoRA metadata"""
+    try:
+        # Check for adapter_config.json in LoRA directory
+        config_path = lora_path / "adapter_config.json"
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                base_model_name = config.get("base_model_name_or_path")
+                if base_model_name:
+                    # First, check if it's an absolute/local path that exists
+                    candidate = Path(base_model_name)
+                    if candidate.is_absolute() and candidate.exists():
+                        return str(candidate)
+
+                    # Try resolving relative to known locations
+                    potential_paths = [
+                        lora_path / base_model_name,
+                        BASE_DIR / base_model_name,
+                        ARTIFACTS_DIR / "models" / base_model_name,
+                        BASE_DIR / "models" / base_model_name,
+                    ]
+                    for path in potential_paths:
+                        if path.exists():
+                            return str(path)
+
+                    # If nothing exists locally, assume it's a HuggingFace model ID
+                    print(f"ℹ️  Using remote base model identifier: {base_model_name}")
+                    return base_model_name
+    except Exception as e:
+        print(f"Warning: Could not read LoRA config in {lora_path}: {e}")
+
+    return None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -59,6 +190,14 @@ async def lifespan(app: FastAPI):
 
     # Initialize model interface (placeholder for now)
     model = ModelInterface()
+
+    # Auto-load LoRA model if specified
+    print(f"🔍 Checking for auto-load: AUTO_LOAD_LORA='{AUTO_LOAD_LORA}', BASE_MODEL_PATH='{BASE_MODEL_PATH}'")
+    if AUTO_LOAD_LORA:
+        print(f"🚀 Starting auto-load for: {AUTO_LOAD_LORA}")
+        await auto_load_lora_model(model, AUTO_LOAD_LORA, BASE_MODEL_PATH)
+    else:
+        print("⚠️  No AUTO_LOAD_LORA specified in .env")
 
     yield
 
@@ -166,9 +305,71 @@ async def label_emotion(conversation_id: str, message_index: int, label: Emotion
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Model management endpoints
+@app.get("/api/models")
+async def get_models():
+    """Get information about loaded models"""
+    try:
+        versions = model.get_loaded_versions()
+        active_info = model.get_active_version_info()
+
+        return {
+            "loaded_versions": versions,
+            "active_version": active_info,
+            "device": model.device
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/models/load")
+async def load_model(request: Dict[str, Any]):
+    """Load a model version in background"""
+    try:
+        version_id = request.get("version_id", f"v{int(time.time())}")
+        base_model_path = request["base_model_path"]
+        lora_path = request.get("lora_path")
+
+        # Start background loading
+        asyncio.create_task(
+            model.load_model_async(version_id, base_model_path, lora_path)
+        )
+
+        return {
+            "status": "loading",
+            "version_id": version_id,
+            "message": f"Loading model {version_id} in background"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/models/switch/{version_id}")
+async def switch_model(version_id: str):
+    """Switch to a different model version"""
+    try:
+        success = model.switch_to_version(version_id)
+        if success:
+            return {
+                "status": "success",
+                "active_version": version_id
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Model version not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/models/{version_id}")
+async def unload_model(version_id: str):
+    """Unload a model version"""
+    try:
+        model.unload_version(version_id)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.websocket("/ws/chat/{conversation_id}")
 async def chat_websocket(websocket: WebSocket, conversation_id: str):
     """WebSocket endpoint for real-time chat with token streaming"""
+    print(f"🔌 WebSocket connection established for conversation {conversation_id}")
     await websocket.accept()
 
     try:
@@ -180,6 +381,8 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                 content = data["content"]
                 metadata = data.get("metadata", {})
 
+                print(f"📨 Received message in conversation {conversation_id}: {content[:100]}{'...' if len(content) > 100 else ''}")
+
                 # Add user message to database
                 message_index = db.add_message(
                     conversation_id=conversation_id,
@@ -188,6 +391,8 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                     metadata=metadata
                 )
 
+                print(f"💾 Saved user message {conversation_id}:{message_index}")
+
                 # Send user message confirmation
                 await websocket.send_json({
                     "type": "message_added",
@@ -195,6 +400,8 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                     "role": "user",
                     "content": content
                 })
+
+                print(f"🤖 Starting AI response generation for {conversation_id}:{message_index + 1}")
 
                 # Generate AI response with streaming
                 await model.generate_streaming_response(
@@ -209,12 +416,16 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                 label_data = data["label"]
                 message_index = data["message_index"]
 
+                print(f"🏷️  Saving emotion labels for {conversation_id}:{message_index}")
+
                 db.add_emotion_label(
                     conversation_id=conversation_id,
                     message_index=message_index,
                     labeler="user",
                     **label_data
                 )
+
+                print(f"✅ Emotion labels saved for {conversation_id}:{message_index}")
 
                 await websocket.send_json({
                     "type": "label_saved",
