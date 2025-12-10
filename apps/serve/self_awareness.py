@@ -95,13 +95,23 @@ class SelfAwarenessCore:
         Enforce boundary by stripping everything before and including the first \n<SELF>:.
         Ensures the output is from <SELF> perspective only.
         """
+        text = raw_output.strip()
+
+        # Handle prefixes like "<SELF>:" or "from <SELF>:"
+        prefix_pattern = re.compile(
+            rf"^(?:from\s+)?{re.escape(self.self_token)}:\s*", re.IGNORECASE
+        )
+        prefix_match = prefix_pattern.match(text)
+        if prefix_match:
+            return text[prefix_match.end():].strip()
+
+        # Handle newline-delimited cases where <SELF>: appears after some content
         pattern = rf"\n{re.escape(self.self_token)}:"
-        match = re.search(pattern, raw_output)
+        match = re.search(pattern, text)
         if match:
-            return raw_output[match.end():].strip()
-        if raw_output.strip().startswith(f"{self.self_token}:"):
-            return raw_output.strip()[len(f"{self.self_token}:"):].strip()
-        return raw_output.strip()
+            return text[match.end():].strip()
+
+        return text
 
     def apply_perspective_gate(
         self,
