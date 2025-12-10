@@ -22,7 +22,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from core.data.db import TrainingDatabase
+from core.data.db import (
+    TrainingDatabase,
+    MAX_INSTRUCTION_LENGTH,
+    MAX_RESPONSE_LENGTH,
+)
 from apps.serve.database import DatabaseManager
 
 SIMILARITY_THRESHOLD = 0.92
@@ -138,6 +142,15 @@ def _build_instruction(
     return "Previous conversation:\n" + "\n".join(context_lines)
 
 
+def _cap_lengths(instruction: str, response: str) -> Tuple[str, str]:
+    """Apply max-length limits to instruction/response."""
+    if len(instruction) > MAX_INSTRUCTION_LENGTH:
+        instruction = instruction[:MAX_INSTRUCTION_LENGTH]
+    if len(response) > MAX_RESPONSE_LENGTH:
+        response = response[:MAX_RESPONSE_LENGTH]
+    return instruction, response
+
+
 def extract_sft_pairs_from_conversation(
     conversation: Dict[str, Any],
     include_context: bool = True,
@@ -166,6 +179,9 @@ def extract_sft_pairs_from_conversation(
             messages, last_user_pos, include_context=include_context
         )
         for assistant_msg in deduped:
+            instruction_capped, response_capped = _cap_lengths(
+                instruction, assistant_msg.get("content", "")
+            )
             reward_intensity = _reward_intensity(assistant_msg)
             confidence = _confidence_from_reward(reward_intensity)
             metadata = {
@@ -176,8 +192,8 @@ def extract_sft_pairs_from_conversation(
             }
             pairs.append(
                 SFTPair(
-                    instruction=instruction,
-                    response=assistant_msg.get("content", ""),
+                    instruction=instruction_capped,
+                    response=response_capped,
                     source="conversation",
                     conversation_id=conversation_id,
                     message_id=assistant_msg.get("id"),
@@ -220,10 +236,14 @@ def extract_sft_pairs_from_conversation(
             if content_hash in seen_hashes:
                 continue
             seen_hashes.add(content_hash)
+            instr_capped, resp_capped = _cap_lengths(
+                "What did I just experience, think, or feel?",
+                content,
+            )
             pairs.append(
                 SFTPair(
-                    instruction="What did I just experience, think, or feel?",
-                    response=content,
+                    instruction=instr_capped,
+                    response=resp_capped,
                     source="conversation",
                     conversation_id=conversation_id,
                     message_id=obs.get("id"),

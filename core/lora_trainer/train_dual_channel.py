@@ -238,7 +238,6 @@ def _maybe_diversity_sample(
         "selected_clusters": len(selected_cluster_ids),
     }
     return selected, stats
-    return selected
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -345,6 +344,10 @@ def train(cfg_path: str) -> None:
     training_cfg = cfg["training"]
     set_seed(training_cfg.get("seed", 42))
 
+    run_id = training_cfg.get("run_id") or f"dual_channel_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+    logging_root = Path(training_cfg.get("logging_dir", "logs/train"))
+    log_dir = logging_root / run_id
+
     db = TrainingDatabase(db_path=training_cfg.get("db_path"))
 
     use_recency = training_cfg["sft_enhancements"].get("use_recency_weighting", True)
@@ -353,6 +356,8 @@ def train(cfg_path: str) -> None:
     diversity_target = training_cfg["sft_enhancements"].get("diversity_target_size")
     diversity_k = training_cfg["sft_enhancements"].get("diversity_k")
     diversity_per_cluster = int(training_cfg["sft_enhancements"].get("diversity_per_cluster", 2))
+    dynamic_weighting = bool(training_cfg.get("dynamic_weighting", False))
+    dynamic_weight_window = int(training_cfg.get("dynamic_weight_window", 100))
 
     if training_cfg.get("use_database", True):
         sft_samples = load_sft_pairs_from_database(
@@ -383,7 +388,10 @@ def train(cfg_path: str) -> None:
     if training_cfg.get("use_database", True):
         pref_filters = training_cfg.get("preference_filters", {})
         pref_limit = pref_filters.get("limit")
-        pref_rows = db.get_preference_pairs(limit=pref_limit)
+        pref_rows = db.get_preference_pairs(
+            limit=pref_limit,
+            category=pref_filters.get("category"),
+        )
         preference_path = None
         preference_samples = [
             PreferenceSample(prompt=row["prompt"], chosen=row["chosen"], rejected=row["rejected"])
@@ -442,10 +450,54 @@ def train(cfg_path: str) -> None:
     total_steps *= training_cfg["num_epochs"]
 
     optimizer, scheduler = _build_schedulers_and_opt(model, cfg, total_steps)
-    logger = TrainingJSONLogger(output_dir=training_cfg["output_dir"])
+    recency_weights = [s.recency_weight for s in sft_samples]
+    recency_stats = {
+        "recency_weight_mean": sum(recency_weights) / len(recency_weights) if recency_weights else 1.0,
+        "recency_weight_min": min(recency_weights) if recency_weights else 1.0,
+        "recency_weight_max": max(recency_weights) if recency_weights else 1.0,
+    }
+    logger = TrainingJSONLogger(
+        run_id=run_id,
+        component="dual_channel_lora",
+        output_dir=log_dir,
+        meta={
+            "config": cfg_path,
+            "output_dir": training_cfg["output_dir"],
+            "db_path": training_cfg.get("db_path"),
+            "use_recency_weighting": use_recency,
+            "tau_fast": tau_fast,
+            "tau_slow": tau_slow,
+            "diversity_target": diversity_target,
+            "diversity_k": diversity_k,
+            "diversity_per_cluster": diversity_per_cluster,
+            "dynamic_weighting": dynamic_weighting,
+            "dynamic_weight_window": dynamic_weight_window,
+            "sft_count": len(sft_samples) + (len(sft_val_samples) if sft_val_samples else 0),
+            "preference_count": len(preference_samples) + (len(pref_val_samples) if pref_val_samples else 0),
+            **recency_stats,
+            "diversity_num_clusters": diversity_stats.get("num_clusters", 0),
+            "diversity_selected_clusters": diversity_stats.get("selected_clusters", 0),
+        },
+    )
+    logger.log_step(
+        {
+            "event": "data_stats",
+            "recency_weight_mean": recency_stats["recency_weight_mean"],
+            "recency_weight_min": recency_stats["recency_weight_min"],
+            "recency_weight_max": recency_stats["recency_weight_max"],
+            "diversity_num_clusters": diversity_stats.get("num_clusters", 0),
+            "diversity_selected_clusters": diversity_stats.get("selected_clusters", 0),
+            "sft_train": len(sft_samples),
+            "sft_val": len(sft_val_samples) if sft_val_samples else 0,
+            "pref_train": len(preference_samples),
+            "pref_val": len(pref_val_samples) if pref_val_samples else 0,
+        }
+    )
 
     global_step = 0
-    used_sft_ids: List[int] = []
+    sft_loss_window: List[float] = []
+    pref_loss_window: List[float] = []
+    sft_used_total = 0
 
     model.train()
     for epoch in range(training_cfg["num_epochs"]):
@@ -456,30 +508,80 @@ def train(cfg_path: str) -> None:
         epoch_loss_pref = 0.0
         epoch_steps_sft = 0
         epoch_steps_pref = 0
+        epoch_sft_used = 0
         for batch_type, batch in mixed:
+            effective_sft_weight = training_cfg["sft_weight"]
+            effective_pref_weight = training_cfg["preference_weight"]
+            sft_used_this_batch = 0
             if batch_type == "sft":
                 batch = {k: v.to(device) for k, v in batch.items()}
                 loss_sft = _compute_sft_loss(model, batch)
                 loss_pref = torch.tensor(0.0, device=device)
-                weight = training_cfg["sft_weight"]
+                sft_loss_window.append(float(loss_sft.detach().cpu()))
+                if len(sft_loss_window) > dynamic_weight_window:
+                    sft_loss_window.pop(0)
+                if dynamic_weighting and sft_loss_window and pref_loss_window:
+                    sft_ma = sum(sft_loss_window) / len(sft_loss_window)
+                    pref_ma = sum(pref_loss_window) / len(pref_loss_window)
+                    eps = 1e-8
+                    inv_sft = 1.0 / max(sft_ma, eps)
+                    inv_pref = 1.0 / max(pref_ma, eps)
+                    norm = inv_sft + inv_pref
+                    dyn_sft = inv_sft / norm
+                    dyn_pref = inv_pref / norm
+                    # Blend with base weights, then clamp to keep preference channel dominant
+                    effective_sft_weight = (effective_sft_weight + dyn_sft) / 2.0
+                    effective_pref_weight = (effective_pref_weight + dyn_pref) / 2.0
+                    if effective_pref_weight < 0.5:
+                        effective_pref_weight = 0.5
+                        effective_sft_weight = 0.5
+                    total = effective_sft_weight + effective_pref_weight
+                    effective_sft_weight /= total
+                    effective_pref_weight /= total
                 if training_cfg.get("normalize_losses", True):
-                    loss = weight * loss_sft
+                    loss = effective_sft_weight * loss_sft
                 else:
                     loss = loss_sft
                 sample_ids = batch.get("sample_id")
                 if sample_ids is not None:
-                    for sid in sample_ids.tolist():
-                        if sid != -1:
-                            used_sft_ids.append(sid)
+                    update_ids = [sid for sid in sample_ids.tolist() if sid != -1]
+                    if update_ids:
+                        sft_used_this_batch = len(update_ids)
+                        sft_used_total += sft_used_this_batch
+                        epoch_sft_used += sft_used_this_batch
+                        db.update_sft_used(
+                            pair_ids=update_ids,
+                            training_epoch=epoch,
+                            training_batch=f"step-{global_step}",
+                        )
                 epoch_loss_sft += float(loss_sft.detach().cpu())
                 epoch_steps_sft += 1
             else:
                 batch = {side: {k: v.to(device) for k, v in tensors.items()} for side, tensors in batch.items()}
                 loss_pref = dpo_loss(model, batch, beta=training_cfg["beta"])
                 loss_sft = torch.tensor(0.0, device=device)
-                weight = training_cfg["preference_weight"]
+                pref_loss_window.append(float(loss_pref.detach().cpu()))
+                if len(pref_loss_window) > dynamic_weight_window:
+                    pref_loss_window.pop(0)
+                if dynamic_weighting and sft_loss_window and pref_loss_window:
+                    sft_ma = sum(sft_loss_window) / len(sft_loss_window)
+                    pref_ma = sum(pref_loss_window) / len(pref_loss_window)
+                    eps = 1e-8
+                    inv_sft = 1.0 / max(sft_ma, eps)
+                    inv_pref = 1.0 / max(pref_ma, eps)
+                    norm = inv_sft + inv_pref
+                    dyn_sft = inv_sft / norm
+                    dyn_pref = inv_pref / norm
+                    effective_sft_weight = (effective_sft_weight + dyn_sft) / 2.0
+                    effective_pref_weight = (effective_pref_weight + dyn_pref) / 2.0
+                    if effective_pref_weight < 0.5:
+                        effective_pref_weight = 0.5
+                        effective_sft_weight = 0.5
+                    total = effective_sft_weight + effective_pref_weight
+                    effective_sft_weight /= total
+                    effective_pref_weight /= total
                 if training_cfg.get("normalize_losses", True):
-                    loss = weight * loss_pref
+                    loss = effective_pref_weight * loss_pref
                 else:
                     loss = loss_pref
                 epoch_loss_pref += float(loss_pref.detach().cpu())
@@ -494,18 +596,23 @@ def train(cfg_path: str) -> None:
 
             if global_step % training_cfg["logging_steps"] == 0:
                 logger.log_step(
-                    global_step,
                     {
+                        "global_step": global_step,
+                        "batch_type": batch_type,
                         "loss": loss.item(),
                         "loss_sft": float(loss_sft.item()) if hasattr(loss_sft, "item") else 0.0,
                         "loss_pref": float(loss_pref.item()) if hasattr(loss_pref, "item") else 0.0,
                         "lr": scheduler.get_last_lr()[0],
+                        "effective_sft_weight": effective_sft_weight,
+                        "effective_pref_weight": effective_pref_weight,
+                        "dynamic_weighting": dynamic_weighting,
+                        "sft_used_total": sft_used_total,
+                        "sft_used_last_batch": sft_used_this_batch,
+                        "sft_loss_window_len": len(sft_loss_window),
+                        "pref_loss_window_len": len(pref_loss_window),
+                        "recency_weight_mean": recency_stats["recency_weight_mean"],
                     },
                 )
-
-        if used_sft_ids:
-            db.update_sft_used(pair_ids=used_sft_ids, training_epoch=epoch)
-            used_sft_ids = []
 
         # Validation (lightweight)
         val_metrics = {}
@@ -543,23 +650,27 @@ def train(cfg_path: str) -> None:
                     val_metrics["val_loss_pref"] = vloss / vsteps
             model.train()
 
-        logger.log_step(
-            global_step,
+        logger.log_eval(
             {
                 "epoch": epoch,
                 "epoch_loss_sft": (epoch_loss_sft / max(1, epoch_steps_sft)) if epoch_steps_sft else 0.0,
                 "epoch_loss_pref": (epoch_loss_pref / max(1, epoch_steps_pref)) if epoch_steps_pref else 0.0,
+                "epoch_steps_sft": epoch_steps_sft,
+                "epoch_steps_pref": epoch_steps_pref,
+                "epoch_sft_used": epoch_sft_used,
+                "sft_used_total": sft_used_total,
                 "diversity_num_clusters": diversity_stats.get("num_clusters", 0),
                 "diversity_selected_clusters": diversity_stats.get("selected_clusters", 0),
-                "recency_mean": float(sum(s.recency_weight for s in sft_samples) / len(sft_samples)) if sft_samples else 0.0,
+                "recency_weight_mean": recency_stats["recency_weight_mean"],
                 **val_metrics,
-            },
+            }
         )
 
     os.makedirs(training_cfg["output_dir"], exist_ok=True)
     model.save_pretrained(training_cfg["output_dir"])
     tokenizer.save_pretrained(training_cfg["output_dir"])
-    logger.finalize({"global_steps": global_step})
+    logger.log_eval({"event": "training_complete", "global_steps": global_step, "sft_used_total": sft_used_total})
+    logger.close()
 
 
 def parse_args() -> argparse.Namespace:

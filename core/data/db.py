@@ -35,6 +35,10 @@ DEFAULT_DB_PATH = os.getenv(
 )
 
 
+MAX_INSTRUCTION_LENGTH = 2048
+MAX_RESPONSE_LENGTH = 4096
+
+
 class TrainingDatabase:
     """Database manager for training data operations."""
 
@@ -96,16 +100,34 @@ class TrainingDatabase:
         response: str,
         source: str,
         confidence: Optional[float] = None,
+        conversation_id: Optional[str] = None,
     ) -> None:
         """Validate core constraints for SFT pairs."""
         if not instruction or len(instruction.strip()) < 10:
             raise ValueError("instruction must be at least 10 characters")
         if not response or len(response.strip()) < 10:
             raise ValueError("response must be at least 10 characters")
+        if len(instruction) > MAX_INSTRUCTION_LENGTH:
+            raise ValueError(f"instruction exceeds maximum length ({MAX_INSTRUCTION_LENGTH})")
+        if len(response) > MAX_RESPONSE_LENGTH:
+            raise ValueError(f"response exceeds maximum length ({MAX_RESPONSE_LENGTH})")
+        if instruction.strip() == response.strip():
+            raise ValueError("instruction and response cannot be identical")
         if source not in self._VALID_SFT_SOURCES:
             raise ValueError(f"source must be one of {sorted(self._VALID_SFT_SOURCES)}")
+        if source == "conversation" and not conversation_id:
+            raise ValueError("conversation_id is required when source='conversation'")
         if confidence is not None and not (0.0 <= confidence <= 1.0):
             raise ValueError("confidence must be between 0.0 and 1.0")
+
+    @staticmethod
+    def _truncate_sft_fields(instruction: str, response: str) -> tuple[str, str]:
+        """Apply max-length caps to instruction/response (truncate, do not discard)."""
+        if len(instruction) > MAX_INSTRUCTION_LENGTH:
+            instruction = instruction[:MAX_INSTRUCTION_LENGTH]
+        if len(response) > MAX_RESPONSE_LENGTH:
+            response = response[:MAX_RESPONSE_LENGTH]
+        return instruction, response
 
     def insert_sft_pair(
         self,
@@ -122,7 +144,14 @@ class TrainingDatabase:
         extracted_at: Optional[str] = None,
     ) -> int:
         """Insert a single SFT pair after validation."""
-        self._validate_sft_pair(instruction, response, source, confidence)
+        instruction, response = self._truncate_sft_fields(instruction, response)
+        self._validate_sft_pair(
+            instruction,
+            response,
+            source,
+            confidence,
+            conversation_id=conversation_id,
+        )
         metadata_json = json.dumps(metadata) if metadata else None
         cursor = self.connection.execute(
             """
@@ -369,10 +398,17 @@ class TrainingDatabase:
         self,
         limit: Optional[int] = None,
         offset: int = 0,
+        category: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get preference pairs for training."""
-        query = "SELECT * FROM preference_pairs ORDER BY created_at DESC"
-        params = []
+        query = "SELECT * FROM preference_pairs"
+        params: List[Any] = []
+
+        if category:
+            query += " WHERE category = ?"
+            params.append(category)
+
+        query += " ORDER BY created_at DESC"
         
         if limit:
             query += " LIMIT ? OFFSET ?"
