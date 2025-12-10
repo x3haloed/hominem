@@ -15,7 +15,7 @@ import os
 # Model loading dependencies (loaded conditionally)
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, TextIteratorStreamer
     from peft import PeftModel
     MODELS_AVAILABLE = True
 except ImportError:
@@ -121,48 +121,69 @@ class ModelInterface:
             # Format conversation using chat template
             formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history, enable_thinking)
 
-            # Use pipeline for generation
-            if model_version.pipeline:
+            if model_version.model and model_version.tokenizer:
                 print(f"🚀 Starting model inference with {model_version.version_id}")
-                # Streaming generation
                 response_text = ""
                 start_time = time.time()
 
-                # Generate with streaming - use proper EOS tokens
                 eos_tokens = self._get_eos_tokens(model_version.tokenizer)
-
                 sampling_params = self._get_sampling_params(enable_thinking)
 
-                outputs = model_version.pipeline(
+                # Tokenize prompt
+                inputs = model_version.tokenizer(
                     formatted_prompt,
-                    max_new_tokens=2048,
-                    do_sample=True,
-                    pad_token_id=model_version.tokenizer.eos_token_id,
-                    eos_token_id=eos_tokens,  # Use proper EOS tokens for chat
-                    return_full_text=False,
-                    **sampling_params
+                    return_tensors="pt"
                 )
 
-                # For now, simulate streaming since pipeline doesn't support it directly
-                # In production, you'd use a custom streaming implementation
-                full_response = outputs[0]['generated_text']
-                print(f"📄 Generated response ({len(full_response)} chars)")
+                # Move inputs to device if needed
+                if self.device == "cuda":
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                # Clean response (remove any EOS tokens that might have been generated)
-                full_response = self._clean_generated_response(full_response, model_version.tokenizer)
+                streamer = TextIteratorStreamer(
+                    model_version.tokenizer,
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
 
-                # Send in chunks to simulate streaming
+                generation_kwargs = {
+                    **inputs,
+                    "max_new_tokens": 2048,
+                    "do_sample": True,
+                    "pad_token_id": model_version.tokenizer.eos_token_id,
+                    "eos_token_id": eos_tokens,
+                    "streamer": streamer,
+                    **sampling_params,
+                }
+
+                # Run generation in background thread so we can consume tokens asynchronously
+                generation_thread = threading.Thread(
+                    target=model_version.model.generate,
+                    kwargs=generation_kwargs,
+                    daemon=True,
+                )
+                generation_thread.start()
+
                 chunk_count = 0
-                for chunk in self._chunk_text(full_response):
-                    response_text += chunk
+                loop = asyncio.get_event_loop()
+
+                while True:
+                    token_text = await loop.run_in_executor(None, self._streamer_next, streamer)
+                    if token_text is None:
+                        break
+
+                    if not token_text:
+                        continue
+
+                    response_text += token_text
                     chunk_count += 1
                     await websocket.send_json({
                         "type": "token_chunk",
                         "message_index": assistant_index,
-                        "chunk": chunk,
+                        "chunk": token_text,
                         "is_complete": False
                     })
-                    await asyncio.sleep(0.01)  # Simulate token timing
+
+                generation_thread.join(timeout=0)
 
                 processing_time = int((time.time() - start_time) * 1000)
                 print(f"📤 Sent {chunk_count} chunks, {len(response_text)} total chars, {processing_time}ms")
@@ -383,6 +404,14 @@ class ModelInterface:
             chunk = " ".join(words[i:i + chunk_size])
             if chunk:
                 yield chunk + " "
+
+    @staticmethod
+    def _streamer_next(streamer):
+        """Safely fetch next token text from streamer"""
+        try:
+            return next(streamer)
+        except StopIteration:
+            return None
 
     def _get_sampling_params(self, enable_thinking: bool) -> Dict[str, Any]:
         """
