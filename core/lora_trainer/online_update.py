@@ -24,6 +24,7 @@ from core.lora_trainer.train_dpo import (
     select_device,
     set_seed,
 )
+from core.training_logger import TrainingJSONLogger
 
 # Type alias for clarity - OnlinePreferenceSample is just a ReplayPair
 OnlinePreferenceSample = ReplayPair
@@ -275,6 +276,26 @@ def main(argv: List[str] | None = None) -> None:
     w_sft = float(args.w_sft)
     w_reward = float(args.w_reward)
 
+    run_id = train_cfg.get("run_id") or f"online_update_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    logging_root = Path(train_cfg.get("logging_dir", "logs/train"))
+    run_log_dir = logging_root / run_id
+    logger = TrainingJSONLogger(
+        run_id=run_id,
+        component="online_update",
+        output_dir=run_log_dir,
+        meta={
+            "config": str(args.config),
+            "output_dir": train_cfg["output_dir"],
+            "interaction_log_dir": str(log_dir),
+            "num_replay_pairs": len(replay_pairs),
+            "batch_size": int(train_cfg["batch_size"]),
+            "beta": beta,
+            "w_sft": w_sft,
+            "w_reward": w_reward,
+            "model_id": model_cfg["base_model_id"],
+        },
+    )
+
     for epoch in range(int(train_cfg["num_epochs"])):
         epoch_loss = 0.0
         for batch in dataloader:
@@ -301,7 +322,7 @@ def main(argv: List[str] | None = None) -> None:
             loss = w_sft * sft_loss + w_reward * reward_loss
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm))
 
             optimizer.step()
             scheduler.step()
@@ -312,12 +333,47 @@ def main(argv: List[str] | None = None) -> None:
 
             if global_step % logging_steps == 0:
                 avg_loss = epoch_loss / max(1, global_step)
+                weights_tensor = batch["weight"].detach()
+                logger.log_step(
+                    {
+                        "epoch": epoch + 1,
+                        "step": global_step,
+                        "num_training_steps": num_training_steps,
+                        "loss": loss.item(),
+                        "sft_loss": float(sft_loss.item()),
+                        "reward_loss": float(reward_loss.item()),
+                        "avg_loss": avg_loss,
+                        "grad_norm": grad_norm,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                        "batch_size": int(train_cfg["batch_size"]),
+                        "dataset_size": len(dataset),
+                        "beta": beta,
+                        "w_sft": w_sft,
+                        "w_reward": w_reward,
+                        "replay_ratio": 1.0,
+                        "priority_stats": {"high_priority_fraction": 0.7, "random_fraction": 0.3},
+                        "weights": {
+                            "mean": float(weights_tensor.mean().item()),
+                            "min": float(weights_tensor.min().item()),
+                            "max": float(weights_tensor.max().item()),
+                        },
+                        "partial_rhi": None,
+                        "kl_to_base": None,
+                    }
+                )
                 print(
                     f"Epoch {epoch + 1}, step {global_step}/{num_training_steps} "
                     f"- loss: {loss.item():.4f}, avg_loss: {avg_loss:.4f}"
                 )
 
         avg_epoch_loss = epoch_loss / max(1, len(dataloader))
+        logger.log_eval(
+            {
+                "epoch": epoch + 1,
+                "avg_epoch_loss": avg_epoch_loss,
+                "dataset_size": len(dataset),
+            }
+        )
         print(f"Epoch {epoch + 1} completed - average loss: {avg_epoch_loss:.4f}")
 
     # Save updated LoRA adapter into a timestamped online version directory.

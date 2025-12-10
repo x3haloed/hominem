@@ -5,6 +5,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -18,6 +19,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model
 import yaml
 
+from core.training_logger import TrainingJSONLogger
 
 @dataclass
 class PreferenceSample:
@@ -298,6 +300,24 @@ def train() -> None:
     save_every_steps = train_cfg.get("save_every_steps", 0)
     beta = float(train_cfg.get("beta", 0.1))
 
+    run_id = train_cfg.get("run_id") or f"offline_dpo_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    logging_root = Path(train_cfg.get("logging_dir", "logs/train"))
+    log_dir = logging_root / run_id
+    logger = TrainingJSONLogger(
+        run_id=run_id,
+        component="offline_dpo",
+        output_dir=log_dir,
+        meta={
+            "config": args.config,
+            "output_dir": train_cfg["output_dir"],
+            "preferences_path": preferences_path,
+            "num_samples": len(samples),
+            "batch_size": train_cfg["batch_size"],
+            "beta": beta,
+            "model_id": model_cfg["base_model_id"],
+        },
+    )
+
     for epoch in range(train_cfg["num_epochs"]):
         epoch_loss = 0.0
         for batch in dataloader:
@@ -309,7 +329,9 @@ def train() -> None:
             loss = dpo_loss(model, batch, beta=beta)
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.get("max_grad_norm", 1.0))
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.get("max_grad_norm", 1.0))
+            )
 
             optimizer.step()
             scheduler.step()
@@ -320,6 +342,24 @@ def train() -> None:
 
             if global_step % logging_steps == 0:
                 avg_loss = epoch_loss / global_step
+                logger.log_step(
+                    {
+                        "epoch": epoch + 1,
+                        "step": global_step,
+                        "num_training_steps": num_training_steps,
+                        "loss": loss.item(),
+                        "avg_loss": avg_loss,
+                        "grad_norm": grad_norm,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                        "batch_size": train_cfg["batch_size"],
+                        "dataset_size": len(dataset),
+                        "beta": beta,
+                        "replay_ratio": 0.0,
+                        "priority_stats": None,
+                        "kl_to_base": None,
+                        "partial_rhi": None,
+                    }
+                )
                 print(f"Epoch {epoch + 1}, step {global_step}/{num_training_steps} - loss: {loss.item():.4f}, avg_loss: {avg_loss:.4f}")
 
             if save_every_steps and global_step % save_every_steps == 0:
@@ -330,6 +370,13 @@ def train() -> None:
                 print(f"Saved intermediate LoRA adapter to {save_dir_step}")
 
         avg_epoch_loss = epoch_loss / max(1, len(dataloader))
+        logger.log_eval(
+            {
+                "epoch": epoch + 1,
+                "avg_epoch_loss": avg_epoch_loss,
+                "dataset_size": len(dataset),
+            }
+        )
         print(f"Epoch {epoch + 1} completed - average loss: {avg_epoch_loss:.4f}")
 
     # Final save
