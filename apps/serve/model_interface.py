@@ -110,10 +110,12 @@ class ModelInterface:
 
             print(f"✅ Using model: {model_version.version_id}")
 
+            assistant_index = message_index + 1
+
             # Send processing start
             await websocket.send_json({
                 "type": "response_start",
-                "message_index": message_index + 1
+                "message_index": assistant_index
             })
 
             # Format conversation using chat template
@@ -154,7 +156,7 @@ class ModelInterface:
                     chunk_count += 1
                     await websocket.send_json({
                         "type": "token_chunk",
-                        "message_index": message_index,
+                        "message_index": assistant_index,
                         "chunk": chunk,
                         "is_complete": False
                     })
@@ -165,7 +167,7 @@ class ModelInterface:
 
                 await websocket.send_json({
                     "type": "response_complete",
-                    "message_index": message_index,
+                    "message_index": assistant_index,
                     "full_response": response_text,
                     "token_count": len(model_version.tokenizer.encode(response_text)),
                     "processing_time_ms": processing_time
@@ -183,7 +185,7 @@ class ModelInterface:
                             processing_time_ms=processing_time,
                             metadata={"enable_thinking": enable_thinking}
                         )
-                        print(f"💾 Saved assistant response for {conversation_id}:{message_index + 1}")
+                        print(f"💾 Saved assistant response for {conversation_id}:{assistant_index}")
                     except Exception as db_error:
                         print(f"⚠️ Failed to save assistant message to database: {db_error}")
 
@@ -273,13 +275,14 @@ class ModelInterface:
 
     async def _placeholder_response(self, websocket, message_index: int):
         """Placeholder response when model is not available"""
+        assistant_index = message_index + 1
         response_text = "Model loading... This is a placeholder response while the LoRA model is being integrated."
         print(f"📝 Sending placeholder response for message {message_index}")
 
         for chunk in self._chunk_text(response_text):
             await websocket.send_json({
                 "type": "token_chunk",
-                "message_index": message_index,
+                "message_index": assistant_index,
                 "chunk": chunk,
                 "is_complete": False
             })
@@ -287,7 +290,7 @@ class ModelInterface:
 
         await websocket.send_json({
             "type": "response_complete",
-            "message_index": message_index,
+            "message_index": assistant_index,
             "full_response": response_text,
             "token_count": len(response_text.split()),
             "processing_time_ms": 1000

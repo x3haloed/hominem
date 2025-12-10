@@ -1,5 +1,5 @@
 endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
-api_key = ""
+api_key = "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"
 
 # Model identifier or name for reference (LM Studio or other local/remote runner)
 model_id = "x-ai/grok-4.1-fast"

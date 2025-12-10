@@ -177,10 +177,15 @@ class ChatApp {
         const avatar = message.role === 'user' ? 'U' : 'A';
         const hasLabels = message.emotion_labels?.user;
 
+        // Render content with thinking formatting for assistant messages
+        const contentHtml = message.role === 'assistant'
+            ? this.processThinkingContent(message.content || '')
+            : this.escapeHtml(message.content || '');
+
         messageEl.innerHTML = `
             <div class="message-avatar">${avatar}</div>
             <div class="message-content">
-                <div class="message-text">${this.escapeHtml(message.content)}</div>
+                <div class="message-text">${contentHtml}</div>
                 ${message.role === 'user' ? `
                     <button class="emotion-label-trigger ${hasLabels ? 'has-labels' : ''}"
                             data-message-index="${message.message_index}">
@@ -345,31 +350,34 @@ class ChatApp {
     }
 
     processThinkingContent(content) {
-        // Preserve safe HTML while still rendering thinking blocks nicely
         const thinkRegex = /<think>([\s\S]*?)<\/think>/g;
-        let lastIndex = 0;
-        let resultHtml = '';
+        const thinkingSegments = [];
         let match;
 
         while ((match = thinkRegex.exec(content)) !== null) {
-            // Add non-thinking text before this block
-            const before = content.slice(lastIndex, match.index);
-            resultHtml += this.escapeHtml(before).replace(/\n/g, '<br>');
+            const segment = match[1].trim();
+            if (segment.length > 0) {
+                thinkingSegments.push(segment);
+            }
+        }
 
-            // Render thinking block with toggling UI
-            const thinkingContent = match[1];
-            const escapedThinking = this.escapeHtml(thinkingContent).replace(/\n/g, '<br>');
+        // Remove all thinking blocks from the response text
+        const plainContent = content.replace(/<think>[\s\S]*?<\/think>/g, '');
+        const trimmedPlainContent = plainContent.replace(/^\s+/, '');
+        let resultHtml = '';
+
+        if (thinkingSegments.length > 0) {
+            const combinedThinking = thinkingSegments.join('\n\n');
+            const escapedThinking = this.escapeHtml(combinedThinking).replace(/\n/g, '<br>');
             resultHtml += `<div class="thinking-block" onclick="toggleThinkingBlock(this)">
                 <div class="thinking-header">💭 Thinking</div>
                 <div class="thinking-content">${escapedThinking}</div>
             </div>`;
-
-            lastIndex = match.index + match[0].length;
         }
 
-        // Add any trailing content after the last thinking block
-        const remaining = content.slice(lastIndex);
-        resultHtml += this.escapeHtml(remaining).replace(/\n/g, '<br>');
+        if (trimmedPlainContent.length > 0) {
+            resultHtml += this.escapeHtml(trimmedPlainContent).replace(/\n/g, '<br>');
+        }
 
         return resultHtml;
     }
