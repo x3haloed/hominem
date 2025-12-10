@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import sqlite3
 import json
+import time
 
 from dotenv import load_dotenv
 
@@ -180,6 +181,68 @@ def auto_detect_base_model(lora_path: Path) -> Optional[str]:
         print(f"Warning: Could not read LoRA config in {lora_path}: {e}")
 
     return None
+
+
+def list_available_loras() -> List[Dict[str, Any]]:
+    """Discover available LoRA adapters from artifacts/lora"""
+    options: List[Dict[str, Any]] = []
+
+    if not LORA_DIR.exists():
+        return options
+
+    for item in LORA_DIR.iterdir():
+        if not item.is_dir():
+            continue
+
+        adapter_file = item / "adapter_config.json"
+        if not adapter_file.exists():
+            continue
+
+        base_model_name = None
+        try:
+            with open(adapter_file, "r") as f:
+                config = json.load(f)
+                base_model_name = config.get("base_model_name_or_path")
+        except Exception as e:
+            print(f"⚠️  Failed to read adapter config at {adapter_file}: {e}")
+
+        detected_base = auto_detect_base_model(item)
+        options.append({
+            "id": item.name,
+            "path": str(item),
+            "base_model_name_or_path": base_model_name,
+            "detected_base_model_path": detected_base,
+            "updated_at": item.stat().st_mtime,
+        })
+
+    # Newest first
+    options.sort(key=lambda x: x["updated_at"], reverse=True)
+    return options
+
+
+def list_available_base_models(lora_options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collect unique base model identifiers/paths from env and LoRA configs"""
+    candidates: Dict[str, Dict[str, Any]] = {}
+
+    def add_candidate(identifier: str, source: str):
+        if not identifier:
+            return
+        if identifier not in candidates:
+            candidates[identifier] = {
+                "id": identifier,
+                "path": identifier,
+                "source": source,
+            }
+
+    if BASE_MODEL_PATH:
+        add_candidate(BASE_MODEL_PATH, "env")
+
+    for lora in lora_options:
+        add_candidate(lora.get("detected_base_model_path"), f"lora:{lora['id']}:detected")
+        add_candidate(lora.get("base_model_name_or_path"), f"lora:{lora['id']}:config")
+
+    # Sort for stable dropdown ordering
+    return sorted(candidates.values(), key=lambda x: x["id"])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -345,6 +408,21 @@ async def get_models():
             "loaded_versions": versions,
             "active_version": active_info,
             "device": model.device
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models/available")
+async def get_available_models():
+    """List discoverable base models and LoRA adapters for UI selection"""
+    try:
+        lora_options = list_available_loras()
+        base_models = list_available_base_models(lora_options)
+
+        return {
+            "base_models": base_models,
+            "lora_adapters": lora_options
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

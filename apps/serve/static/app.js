@@ -26,6 +26,13 @@ class ChatApp {
 
         // Model management
         this.currentModel = null;
+        this.availableModels = { base_models: [], lora_adapters: [] };
+        this.modelModal = document.getElementById('model-modal');
+        this.baseModelSelect = document.getElementById('base-model-select');
+        this.loraSelect = document.getElementById('lora-select');
+        this.modelModalLoadBtn = document.getElementById('model-modal-load');
+        this.modelModalCancelBtn = document.getElementById('model-modal-cancel');
+        this.modelModalCloseBtn = document.getElementById('model-modal-close');
 
         this.init();
     }
@@ -64,6 +71,13 @@ class ChatApp {
         // Model management
         document.getElementById('model-settings-btn').addEventListener('click', () => {
             this.showModelSettings();
+        });
+
+        this.modelModalLoadBtn.addEventListener('click', () => this.handleModelLoad());
+        this.modelModalCancelBtn.addEventListener('click', () => this.closeModelModal());
+        this.modelModalCloseBtn.addEventListener('click', () => this.closeModelModal());
+        this.baseModelSelect.addEventListener('change', () => {
+            this.updateLoraOptionsForBase(this.baseModelSelect.value);
         });
 
         // Emotion labeling
@@ -576,16 +590,112 @@ class ChatApp {
     }
 
     showModelSettings() {
-        // Simple model management UI
-        const versions = prompt('Enter model version details (base_path,lora_path):', 'models/base,model/lora');
-        if (versions) {
-            const [basePath, loraPath] = versions.split(',');
-            this.loadNewModel(basePath.trim(), loraPath?.trim());
+        this.modelModal.classList.remove('hidden');
+        this.setModelLoading(true);
+
+        this.fetchAvailableModels()
+            .then((data) => {
+                this.populateModelSelects(data);
+            })
+            .catch((error) => {
+                console.error('Failed to load available models:', error);
+                alert('Failed to load available models. Please check server logs.');
+                this.closeModelModal();
+            })
+            .finally(() => this.setModelLoading(false));
+    }
+
+    async fetchAvailableModels() {
+        const response = await fetch('/api/models/available');
+        if (!response.ok) {
+            throw new Error(`Server returned ${response.status}`);
         }
+        const data = await response.json();
+        this.availableModels = data;
+        return data;
+    }
+
+    populateModelSelects(data) {
+        const { base_models: baseModels = [], lora_adapters: loraAdapters = [] } = data;
+
+        // Base models
+        this.baseModelSelect.innerHTML = '';
+        if (baseModels.length === 0) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.textContent = 'No base models found';
+            option.disabled = true;
+            option.selected = true;
+            this.baseModelSelect.appendChild(option);
+        } else {
+            baseModels.forEach((model, idx) => {
+                const option = document.createElement('option');
+                option.value = model.path;
+                option.textContent = model.id;
+                if (idx === 0) option.selected = true;
+                this.baseModelSelect.appendChild(option);
+            });
+        }
+
+        // LoRA adapters
+        this.availableModels = { base_models: baseModels, lora_adapters: loraAdapters };
+        const initialBase = this.baseModelSelect.value;
+        this.updateLoraOptionsForBase(initialBase);
+    }
+
+    updateLoraOptionsForBase(basePath) {
+        this.loraSelect.innerHTML = '';
+
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Base model only (no LoRA)';
+        this.loraSelect.appendChild(placeholder);
+
+        if (!this.availableModels.lora_adapters || this.availableModels.lora_adapters.length === 0) {
+            const none = document.createElement('option');
+            none.value = '';
+            none.textContent = 'No LoRA adapters found';
+            none.disabled = true;
+            this.loraSelect.appendChild(none);
+            return;
+        }
+
+        const matching = this.availableModels.lora_adapters.filter((lora) => {
+            const loraBase = lora.detected_base_model_path || lora.base_model_name_or_path || '';
+            return !basePath || !loraBase || loraBase === basePath;
+        });
+
+        const toRender = matching.length > 0 ? matching : this.availableModels.lora_adapters;
+
+        toRender.forEach((lora) => {
+            const option = document.createElement('option');
+            option.value = lora.path;
+            const baseLabel = lora.detected_base_model_path || lora.base_model_name_or_path || 'Unknown base';
+            option.textContent = `${lora.id} (base: ${baseLabel})`;
+            this.loraSelect.appendChild(option);
+        });
+    }
+
+    closeModelModal() {
+        this.modelModal.classList.add('hidden');
+    }
+
+    handleModelLoad() {
+        const basePath = this.baseModelSelect.value;
+        const loraPath = this.loraSelect.value;
+
+        if (!basePath) {
+            alert('Select a base model to continue.');
+            return;
+        }
+
+        this.closeModelModal();
+        this.loadNewModel(basePath, loraPath || null);
     }
 
     async loadNewModel(basePath, loraPath) {
         try {
+            this.setModelLoading(true);
             const response = await fetch('/api/models/load', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -603,6 +713,8 @@ class ChatApp {
         } catch (error) {
             console.error('Failed to load model:', error);
             alert('Failed to start model loading');
+        } finally {
+            this.setModelLoading(false);
         }
     }
 
@@ -646,6 +758,13 @@ class ChatApp {
             console.error('Failed to switch model:', error);
             alert('Failed to switch model');
         }
+    }
+
+    setModelLoading(isLoading) {
+        const statusDot = document.getElementById('status-dot');
+        if (!statusDot) return;
+
+        statusDot.classList.toggle('loading', isLoading);
     }
 
     escapeHtml(text) {

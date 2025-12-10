@@ -90,6 +90,27 @@
         </div>
     </div>
 
+    <!-- Model selection modal -->
+    <div id="model-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="model-modal-title">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="model-modal-title">Select Model</h2>
+                <button id="model-modal-close" aria-label="Close model selection">✕</button>
+            </div>
+            <div class="modal-body">
+                <label for="base-model-select">Base model</label>
+                <select id="base-model-select"></select>
+
+                <label for="lora-select">LoRA adapter</label>
+                <select id="lora-select"></select>
+            </div>
+            <div class="modal-actions">
+                <button id="model-modal-cancel">Cancel</button>
+                <button id="model-modal-load" class="primary">Load Model</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/app.js"></script>
 </body>
 </html>
