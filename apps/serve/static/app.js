@@ -231,6 +231,10 @@ class ChatApp {
 
         const avatar = role === 'user' ? 'U' : 'A';
         const hasLabels = role === 'user'; // User messages can have labels
+        const isPendingIndex = messageIndex === null || messageIndex === undefined;
+        const labelButtonAttrs = isPendingIndex
+            ? 'disabled aria-disabled="true"'
+            : `data-message-index="${messageIndex}"`;
 
         messageEl.innerHTML = `
             <div class="message-avatar">${avatar}</div>
@@ -238,8 +242,8 @@ class ChatApp {
                 <div class="message-text">${this.escapeHtml(content)}</div>
                 ${role === 'user' ? `
                     <button class="emotion-label-trigger ${hasLabels ? 'has-labels' : ''}"
-                            data-message-index="${messageIndex}">
-                        Add Emotion Labels
+                            ${labelButtonAttrs}>
+                        ${isPendingIndex ? 'Saving…' : 'Add Emotion Labels'}
                     </button>
                 ` : ''}
             </div>
@@ -317,6 +321,9 @@ class ChatApp {
             const labelBtn = messageEl.querySelector('.emotion-label-trigger');
             if (labelBtn) {
                 labelBtn.dataset.messageIndex = newIndex;
+                labelBtn.disabled = false;
+                labelBtn.removeAttribute('aria-disabled');
+                labelBtn.textContent = labelBtn.textContent.includes('Labels Saved') ? labelBtn.textContent : 'Add Emotion Labels';
             }
         }
     }
@@ -384,6 +391,10 @@ class ChatApp {
 
     showEmotionLabeler(triggerBtn) {
         const messageIndex = parseInt(triggerBtn.dataset.messageIndex);
+        if (Number.isNaN(messageIndex)) {
+            console.warn('Emotion labeler opened without a valid message index; ignoring click.');
+            return;
+        }
         const labeler = document.getElementById('emotion-labeler');
 
         // Position labeler near the trigger button
