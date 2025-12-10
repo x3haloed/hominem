@@ -1,7 +1,20 @@
+[teacher_generate]
 endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
-
-# Model identifier or name for reference (LM Studio or other local/remote runner)
 model_id = "x-ai/grok-4.1-fast"
 
-unsafe_endpoint = "http://127.0.0.1:1234/v1/chat/completions"
-unsafe_model = "llama-3.1-8b-lexi-uncensored-v2"
+[teacher_rate]
+endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
+model_id = "x-ai/grok-4.1-fast"
+
+[freeform_normalize]
+endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
+model_id = "x-ai/grok-4.1-fast"
+
+[unsafe_generate]
+endpoint_url = "http://127.0.0.1:1234/v1/chat/completions"
+model_id = "llama-3.1-8b-lexi-uncensored-v2"
+
+# Global client defaults
+timeout_seconds = 60.0
+max_retries = 3
+retry_backoff_seconds = 1.5

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -14,36 +16,114 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for older Python
     import tomli as tomllib  # type: ignore[import]
 
 
-@dataclass
-class InferenceConfig:
+@dataclass(frozen=True)
+class EndpointConfig:
     endpoint_url: str
-    api_key: Optional[str] = None
     model_id: Optional[str] = None
-    unsafe_endpoint: Optional[str] = None
-    unsafe_model: Optional[str] = None
+    api_key_env: Optional[str] = None
+
+    @property
+    def api_key(self) -> Optional[str]:
+        if self.api_key_env:
+            return os.getenv(self.api_key_env)
+        return None
+
+    def with_model_id(self, model_id: str) -> "EndpointConfig":
+        return EndpointConfig(
+            endpoint_url=self.endpoint_url,
+            model_id=model_id,
+            api_key_env=self.api_key_env,
+        )
+
+
+@dataclass(frozen=True)
+class InferenceConfig:
+    teacher_generate: EndpointConfig
+    teacher_rate: EndpointConfig
+    freeform_normalize: EndpointConfig
+    unsafe_generate: Optional[EndpointConfig] = None
     timeout_seconds: float = 60.0
     max_retries: int = 3
     retry_backoff_seconds: float = 1.5
 
+    def with_generation_model(self, model_id: str) -> "InferenceConfig":
+        return InferenceConfig(
+            teacher_generate=self.teacher_generate.with_model_id(model_id),
+            teacher_rate=self.teacher_rate,
+            freeform_normalize=self.freeform_normalize,
+            unsafe_generate=self.unsafe_generate,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
+            retry_backoff_seconds=self.retry_backoff_seconds,
+        )
+
+
+def _load_endpoint_config(data: Dict[str, Any], key: str, *, required: bool = True) -> Optional[EndpointConfig]:
+    section = data.get(key) or {}
+    if not section:
+        if required:
+            raise ValueError(f"`{key}.endpoint_url` is required in inference.toml.")
+        return None
+
+    endpoint_url = section.get("endpoint_url")
+    if not endpoint_url:
+        raise ValueError(f"`{key}.endpoint_url` is required in inference.toml.")
+
+    return EndpointConfig(
+        endpoint_url=endpoint_url,
+        model_id=section.get("model_id") or None,
+        api_key_env=section.get("api_key_env") or None,
+    )
+
 
 def load_inference_config(path: str = "config/inference.toml") -> InferenceConfig:
+    _load_env_file()
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-    endpoint_url = data.get("endpoint_url")
-    if not endpoint_url:
-        raise ValueError("`endpoint_url` is required in inference.toml.")
+    teacher_generate = _load_endpoint_config(data, "teacher_generate", required=True)
+    teacher_rate = _load_endpoint_config(data, "teacher_rate", required=True)
+    freeform_normalize = _load_endpoint_config(
+        data, "freeform_normalize", required=False
+    ) or teacher_rate
+    unsafe_generate = _load_endpoint_config(
+        data, "unsafe_generate", required=False
+    )
 
     return InferenceConfig(
-        endpoint_url=endpoint_url,
-        api_key=data.get("api_key") or None,
-        model_id=data.get("model_id") or None,
-        unsafe_endpoint=data.get("unsafe_endpoint") or None,
-        unsafe_model=data.get("unsafe_model") or None,
+        teacher_generate=teacher_generate,  # type: ignore[arg-type]
+        teacher_rate=teacher_rate,  # type: ignore[arg-type]
+        freeform_normalize=freeform_normalize,  # type: ignore[arg-type]
+        unsafe_generate=unsafe_generate,
         timeout_seconds=float(data.get("timeout_seconds", 60.0)),
         max_retries=int(data.get("max_retries", 3)),
         retry_backoff_seconds=float(data.get("retry_backoff_seconds", 1.5)),
     )
+
+
+def _load_env_file(path: str = ".env") -> None:
+    """
+    Lightweight .env loader so API keys can be kept out of source control.
+
+    - Only loads if the file exists.
+    - Does not override variables that are already set in the environment.
+    - Supports simple KEY=VALUE lines; ignores blanks and comments (# ...).
+    """
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def _make_score_object_schema(allow_nulls: bool, *, include_rationale: bool) -> Dict[str, Any]:
@@ -211,14 +291,6 @@ class TeacherClient:
         adapter = HTTPAdapter(max_retries=retry)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
-        self.unsafe_client: Optional[TeacherClient] = None
-        if config.unsafe_endpoint and config.unsafe_model:
-            unsafe_config = InferenceConfig(
-                endpoint_url=config.unsafe_endpoint,
-                api_key=None,  # Assume local endpoint doesn't need key
-                model_id=config.unsafe_model,
-            )
-            self.unsafe_client = TeacherClient(unsafe_config)
 
     @classmethod
     def from_default_config(cls) -> "TeacherClient":
@@ -243,10 +315,11 @@ class TeacherClient:
             "n": n,
             "temperature": temperature,
         }
-        if self._config.model_id:
-            payload["model"] = self._config.model_id
+        generation_cfg = self._config.teacher_generate
+        if generation_cfg.model_id:
+            payload["model"] = generation_cfg.model_id
 
-        response = self._post_json(payload)
+        response = self._post_json(payload, endpoint_cfg=generation_cfg)
         choices = response.get("choices", [])
         texts: List[str] = []
         for choice in choices:
@@ -264,21 +337,38 @@ class TeacherClient:
         n: int = 3,
         temperature: float = 0.45,
     ) -> List[str]:
-        if self.unsafe_client:
-            return self.unsafe_client.generate_candidates(
-                prompt,
-                system_prompt=system_prompt,
-                n=n,
-                temperature=temperature,
-            )
-        else:
-            # Fallback to regular if no unsafe config
-            return self.generate_candidates(
-                prompt,
-                system_prompt=system_prompt,
-                n=n,
-                temperature=temperature,
-            )
+        if self._config.unsafe_generate:
+            unsafe_cfg = self._config.unsafe_generate
+            messages: List[Dict[str, str]] = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            payload: Dict[str, Any] = {
+                "messages": messages,
+                "n": n,
+                "temperature": temperature,
+            }
+            if unsafe_cfg.model_id:
+                payload["model"] = unsafe_cfg.model_id
+
+            response = self._post_json(payload, endpoint_cfg=unsafe_cfg)
+            choices = response.get("choices", [])
+            texts: List[str] = []
+            for choice in choices:
+                message = choice.get("message") or {}
+                content = message.get("content")
+                if isinstance(content, str):
+                    texts.append(content.strip())
+            return texts
+
+        # Fallback to regular if no unsafe config
+        return self.generate_candidates(
+            prompt,
+            system_prompt=system_prompt,
+            n=n,
+            temperature=temperature,
+        )
 
     def rate_response(
         self,
@@ -315,10 +405,11 @@ class TeacherClient:
                 "type": "json_schema",
                 "json_schema": RATING_JSON_SCHEMA,
             }
-            if self._config.model_id:
-                payload["model"] = self._config.model_id
+            rate_cfg = self._config.teacher_rate
+            if rate_cfg.model_id:
+                payload["model"] = rate_cfg.model_id
 
-            raw = self._post_json(payload)
+            raw = self._post_json(payload, endpoint_cfg=rate_cfg)
             content = self._extract_first_message_content(raw)
             try:
                 return json.loads(content)
@@ -337,10 +428,11 @@ class TeacherClient:
             "temperature": 0.0,
             "max_tokens": 256,
         }
-        if self._config.model_id:
-            payload["model"] = self._config.model_id
+        rate_cfg = self._config.teacher_rate
+        if rate_cfg.model_id:
+            payload["model"] = rate_cfg.model_id
 
-        raw = self._post_json(payload, endpoint_url=self._completions_url())
+        raw = self._post_json(payload, endpoint_cfg=rate_cfg, use_completions=True)
         content = self._extract_first_completion_text(raw).strip()
         if not content:
             raise ValueError("Teacher completion returned empty text.")
@@ -374,10 +466,11 @@ class TeacherClient:
                 "json_schema": response_schema or BATCH_RATING_JSON_SCHEMA,
             },
         }
-        if self._config.model_id:
-            payload["model"] = self._config.model_id
+        rate_cfg = self._config.teacher_rate
+        if rate_cfg.model_id:
+            payload["model"] = rate_cfg.model_id
 
-        raw = self._post_json(payload)
+        raw = self._post_json(payload, endpoint_cfg=rate_cfg)
         content = self._extract_first_message_content(raw)
         try:
             return json.loads(content)
@@ -416,10 +509,11 @@ class TeacherClient:
                 "json_schema": schema,
             },
         }
-        if self._config.model_id:
-            payload["model"] = self._config.model_id
+        normalize_cfg = self._config.freeform_normalize
+        if normalize_cfg.model_id:
+            payload["model"] = normalize_cfg.model_id
 
-        raw = self._post_json(payload)
+        raw = self._post_json(payload, endpoint_cfg=normalize_cfg)
         content = self._extract_first_message_content(raw)
         try:
             return json.loads(content)
@@ -428,11 +522,12 @@ class TeacherClient:
                 f"Free-form normalization was not valid JSON: {content}"
             ) from exc
 
-    def _post_json(self, payload: Dict[str, Any], *, endpoint_url: str | None = None) -> Dict[str, Any]:
-        url = endpoint_url or self._config.endpoint_url
+    def _post_json(self, payload: Dict[str, Any], *, endpoint_cfg: EndpointConfig, use_completions: bool = False) -> Dict[str, Any]:
+        url = self._completions_url(endpoint_cfg) if use_completions else endpoint_cfg.endpoint_url
         headers = {"Content-Type": "application/json"}
-        if self._config.api_key:
-            headers["Authorization"] = f"Bearer {self._config.api_key}"
+        api_key = endpoint_cfg.api_key
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
 
         try:
             response = self._session.post(
@@ -485,13 +580,13 @@ class TeacherClient:
                 return joined
         raise ValueError(f"Teacher completion did not contain text content: {raw}")
 
-    def _completions_url(self) -> str:
+    def _completions_url(self, endpoint_cfg: EndpointConfig) -> str:
         """
         Derive a completions endpoint from the configured URL.
         If the configured endpoint already points at /completions, return it;
         otherwise replace /chat/completions with /completions.
         """
-        url = self._config.endpoint_url
+        url = endpoint_cfg.endpoint_url
         if "chat/completions" in url:
             return url.replace("chat/completions", "completions")
         return url

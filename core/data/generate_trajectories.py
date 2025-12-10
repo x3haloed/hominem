@@ -203,13 +203,7 @@ def _build_generator_clients(
         model_id = model_id.strip()
         if not model_id:
             continue
-        cfg = InferenceConfig(
-            endpoint_url=base_config.endpoint_url,
-            api_key=base_config.api_key,
-            model_id=model_id,
-            unsafe_endpoint=base_config.unsafe_endpoint,
-            unsafe_model=base_config.unsafe_model,
-        )
+        cfg = base_config.with_generation_model(model_id)
         alias = _sanitize_model_id(model_id)
         clients[alias] = TeacherClient(cfg)
     return clients
@@ -310,12 +304,12 @@ def _emit_prompt_level_degradations(
         generator_model_id = None
         generator_model_alias = None
         if multi_model_mode:
-            generator_model_id = (
-                client._config.unsafe_model or client._config.model_id
-            )  # type: ignore[attr-defined]
-            generator_model_alias = (
-                "unsafe" if client._config.unsafe_model else record.get("generator_model_alias")
-            )
+            if client._config.unsafe_generate:
+                generator_model_id = client._config.unsafe_generate.model_id
+                generator_model_alias = "unsafe"
+            else:
+                generator_model_id = client._config.teacher_generate.model_id
+                generator_model_alias = record.get("generator_model_alias")
         elif "generator_model_id" in record:
             generator_model_id = record["generator_model_id"]
             generator_model_alias = record.get("generator_model_alias")
@@ -483,7 +477,7 @@ def generate_trajectories(
                             "candidate_index": candidate_index,
                             "response": response_text,
                             "source": "generator_model",
-                            "generator_model_id": client._config.model_id,  # type: ignore[attr-defined]
+                            "generator_model_id": client._config.teacher_generate.model_id,
                             "generator_model_alias": model_alias,
                         }
                         if db:
@@ -496,7 +490,7 @@ def generate_trajectories(
                                 persona=persona.name,
                                 candidate_index=candidate_index,
                                 source="generator_model",
-                                generator_model_id=client._config.model_id,  # type: ignore[attr-defined]
+                                generator_model_id=client._config.teacher_generate.model_id,
                                 generator_model_alias=model_alias,
                             )
                         else:
