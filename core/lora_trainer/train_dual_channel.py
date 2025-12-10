@@ -460,6 +460,7 @@ def train(cfg_path: str) -> None:
         run_id=run_id,
         component="dual_channel_lora",
         output_dir=log_dir,
+        db_path=training_cfg.get("db_path"),
         meta={
             "config": cfg_path,
             "output_dir": training_cfg["output_dir"],

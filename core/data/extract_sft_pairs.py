@@ -380,16 +380,19 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable conversation context in the instruction",
     )
+    # Default to None so we can distinguish "not specified" from an explicit choice.
     parser.add_argument(
         "--include-introspection",
         dest="include_introspection",
         action="store_true",
+        default=None,
         help="Include internal introspection observations (overrides admin flag)",
     )
     parser.add_argument(
         "--exclude-introspection",
         dest="include_introspection",
         action="store_false",
+        default=None,
         help="Exclude introspection (overrides admin flag)",
     )
     parser.add_argument(
@@ -421,8 +424,15 @@ def main() -> None:
     args = _parse_args()
     db = TrainingDatabase(db_path=args.db_path)
     include_introspection = args.include_introspection
-    if args.use_admin_introspection_flag and include_introspection is None:
-        include_introspection = None  # triggers admin flag lookup
+    if args.use_admin_introspection_flag:
+        # Only consult the admin flag when the user opts in to it.
+        if include_introspection is None:
+            include_introspection = None  # triggers admin flag lookup
+    else:
+        # If the user did not opt into admin flags and provided no override,
+        # default to excluding introspection for safety.
+        if include_introspection is None:
+            include_introspection = False
     count = extract_and_store_sft_pairs(
         db=db,
         conversation_id=args.conversation_id,
