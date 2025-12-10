@@ -224,14 +224,20 @@ def main(argv: List[str] | None = None) -> None:
 
     set_seed(train_cfg.get("seed", 42))
 
-    log_dir = Path(args.log_dir)
+    log_dir = Path(args.log_dir) if args.log_dir else None
     max_records = args.max_records if args.max_records and args.max_records > 0 else None
+    
+    # Default to database, but allow JSONL fallback
+    use_database = os.getenv("USE_DATABASE", "true").lower() == "true"
+    db_path = os.getenv("HOMINEM_DB_PATH", None)
 
     buffer = ReplayBufferStore.from_self_train_logs(
-        log_dir,
+        log_dir=log_dir,
         safety_threshold=float(args.safety_threshold),
         min_reward_intensity=float(args.min_reward_intensity),
         max_records=max_records,
+        use_database=use_database,
+        db_path=db_path,
     )
 
     if args.num_samples and args.num_samples > 0:

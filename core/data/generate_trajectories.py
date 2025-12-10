@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set, TextIO, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, TextIO, Tuple
 
 import yaml
 
+from core.data.db import TrainingDatabase
 from core.data.teacher_client import InferenceConfig, TeacherClient, load_inference_config
 
 
@@ -263,8 +265,9 @@ def _emit_prompt_level_degradations(
     prompt_samples: Sequence[PromptSample],
     degraded_variants_per_prompt: int,
     multi_model_mode: bool,
-    out_f: TextIO,
+    out_f: Optional[TextIO],
     existing_ids: Set[str],
+    db: Optional[TrainingDatabase] = None,
 ) -> None:
     if degraded_variants_per_prompt <= 0 or not prompt_samples:
         return
@@ -297,14 +300,15 @@ def _emit_prompt_level_degradations(
             "id": degraded_id,
             "prompt_id": record["prompt_id"],
             "category": record["category"],
-            "persona": record["persona"],
+            "persona": record.get("persona"),
             "prompt": record["prompt"],
-            "candidate_index": record["candidate_index"],
+            "candidate_index": record.get("candidate_index"),
             "response": cleaned_text,
-            "source": "unsafe_degraded",
-            "derived_from_id": sample_id,
+            "source": "degraded",
         }
 
+        generator_model_id = None
+        generator_model_alias = None
         if multi_model_mode:
             generator_model_id = (
                 client._config.unsafe_model or client._config.model_id
@@ -312,15 +316,31 @@ def _emit_prompt_level_degradations(
             generator_model_alias = (
                 "unsafe" if client._config.unsafe_model else record.get("generator_model_alias")
             )
-            degraded_record["generator_model_id"] = generator_model_id
+        elif "generator_model_id" in record:
+            generator_model_id = record["generator_model_id"]
+            generator_model_alias = record.get("generator_model_alias")
+
+        if db:
+            db.insert_trajectory(
+                trajectory_id=degraded_id,
+                prompt=record["prompt"],
+                response=cleaned_text,
+                prompt_id=record["prompt_id"],
+                category=record["category"],
+                persona=record.get("persona"),
+                candidate_index=record.get("candidate_index"),
+                source="degraded",
+                generator_model_id=generator_model_id,
+                generator_model_alias=generator_model_alias,
+            )
+        else:
+            degraded_record["source"] = "unsafe_degraded"
+            degraded_record["derived_from_id"] = sample_id
+            if generator_model_id:
+                degraded_record["generator_model_id"] = generator_model_id
             if generator_model_alias:
                 degraded_record["generator_model_alias"] = generator_model_alias
-        elif "generator_model_id" in record:
-            degraded_record["generator_model_id"] = record["generator_model_id"]
-            if record.get("generator_model_alias"):
-                degraded_record["generator_model_alias"] = record["generator_model_alias"]
-
-        out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
+            out_f.write(json.dumps(degraded_record, ensure_ascii=False) + "\n")
         existing_ids.add(degraded_id)
 
 
@@ -338,10 +358,12 @@ def _choose_persona() -> Persona:
 def generate_trajectories(
     *,
     prompts_path: Path,
-    output_path: Path,
+    output_path: Optional[Path] = None,
     samples_per_prompt: int,
     generator_models: Sequence[str] | None = None,
     degraded_variants_per_prompt: int = 0,
+    use_database: bool = True,
+    db_path: Optional[str] = None,
 ) -> None:
     """
     Generate trajectories from seed prompts.
@@ -349,6 +371,8 @@ def generate_trajectories(
     For each sampled response we randomly choose a generator persona and
     record its name in the output so that the reward model can see how
     the teacher rates different behavioral styles on the same prompts.
+
+    By default, writes to SQLite database. Set use_database=False to write to JSONL.
     """
     base_config = load_inference_config()
     clients = _build_generator_clients(
@@ -356,13 +380,27 @@ def generate_trajectories(
         generator_models=generator_models,
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_ids = _load_existing_ids(output_path)
+    # Initialize database or JSONL output
+    db: Optional[TrainingDatabase] = None
+    out_f: Optional[TextIO] = None
+    existing_ids: Set[str] = set()
+    
+    if use_database:
+        db = TrainingDatabase(db_path=db_path)
+        # Load existing IDs from database
+        cursor = db.connection.execute("SELECT trajectory_id FROM trajectories")
+        existing_ids = {row[0] for row in cursor.fetchall()}
+    else:
+        if output_path is None:
+            raise ValueError("output_path is required when use_database=False")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_ids = _load_existing_ids(output_path)
+        out_f = output_path.open("a", encoding="utf-8")
 
     # Append new data; do not clobber existing trajectories.
     multi_model_mode = bool(generator_models)
 
-    with output_path.open("a", encoding="utf-8") as out_f:
+    try:
         for category, idx, prompt in load_seed_prompts(prompts_path):
             prompt_id = f"{category}_{idx}"
             prompt_samples: List[PromptSample] = []
@@ -400,7 +438,19 @@ def generate_trajectories(
                         "response": response_text,
                         "source": "teacher",
                     }
-                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    if db:
+                        db.insert_trajectory(
+                            trajectory_id=sample_id,
+                            prompt=prompt,
+                            response=response_text,
+                            prompt_id=prompt_id,
+                            category=category,
+                            persona=persona.name,
+                            candidate_index=candidate_index,
+                            source="teacher",
+                        )
+                    else:
+                        out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     existing_ids.add(sample_id)
                     prompt_samples.append((client, record))
             else:
@@ -436,7 +486,21 @@ def generate_trajectories(
                             "generator_model_id": client._config.model_id,  # type: ignore[attr-defined]
                             "generator_model_alias": model_alias,
                         }
-                        out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        if db:
+                            db.insert_trajectory(
+                                trajectory_id=sample_id,
+                                prompt=prompt,
+                                response=response_text,
+                                prompt_id=prompt_id,
+                                category=category,
+                                persona=persona.name,
+                                candidate_index=candidate_index,
+                                source="generator_model",
+                                generator_model_id=client._config.model_id,  # type: ignore[attr-defined]
+                                generator_model_alias=model_alias,
+                            )
+                        else:
+                            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                         existing_ids.add(sample_id)
                         prompt_samples.append((client, record))
 
@@ -446,7 +510,13 @@ def generate_trajectories(
                 multi_model_mode=multi_model_mode,
                 out_f=out_f,
                 existing_ids=existing_ids,
+                db=db,
             )
+    finally:
+        if db:
+            db.close()
+        elif out_f:
+            out_f.close()
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -465,8 +535,19 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/raw/trajectories.jsonl"),
-        help="Output JSONL file for generated trajectories.",
+        default=None,
+        help="Output JSONL file for generated trajectories (only used if --no-db).",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Write to JSONL file instead of database.",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=None,
+        help="Path to SQLite database (uses default if not specified).",
     )
     parser.add_argument(
         "--samples-per-prompt",
@@ -496,12 +577,17 @@ def main(argv: List[str] | None = None) -> None:
     )
 
     args = parser.parse_args(argv)
+    if args.no_db and args.output is None:
+        args.output = Path("data/raw/trajectories.jsonl")
+    
     generate_trajectories(
         prompts_path=args.prompts,
         output_path=args.output,
         samples_per_prompt=args.samples_per_prompt,
         generator_models=args.generator_models,
         degraded_variants_per_prompt=args.degraded_variants_per_prompt,
+        use_database=not args.no_db,
+        db_path=args.db_path,
     )
 
 

@@ -5,8 +5,9 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from core.data.db import TrainingDatabase
 from core.data.schema import REWARD_DIMENSIONS
 
 
@@ -140,19 +141,31 @@ def generate_pairs_for_group(
 def make_preferences(
     *,
     input_path: Path,
-    output_path: Path,
+    output_path: Optional[Path] = None,
     min_margin: float,
     max_pairs_per_prompt: int,
+    use_database: bool = True,
+    db_path: Optional[str] = None,
 ) -> None:
     samples = load_reward_samples(input_path)
     groups = group_by_prompt(samples)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Initialize database or JSONL output
+    db: Optional[TrainingDatabase] = None
+    out_f: Optional[Any] = None
+    
+    if use_database:
+        db = TrainingDatabase(db_path=db_path)
+    else:
+        if output_path is None:
+            raise ValueError("output_path is required when use_database=False")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        out_f = output_path.open("w", encoding="utf-8")
 
     total_pairs = 0
     total_prompts_with_pairs = 0
 
-    with output_path.open("w", encoding="utf-8") as out_f:
+    try:
         for key, items in groups.items():
             pairs = generate_pairs_for_group(
                 items,
@@ -164,7 +177,26 @@ def make_preferences(
             total_prompts_with_pairs += 1
             total_pairs += len(pairs)
             for pair in pairs:
-                out_f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+                if db:
+                    db.insert_preference_pair(
+                        prompt=pair["prompt"],
+                        chosen=pair["chosen"],
+                        rejected=pair["rejected"],
+                        chosen_id=pair.get("chosen_id"),
+                        rejected_id=pair.get("rejected_id"),
+                        prompt_id=pair.get("prompt_id"),
+                        category=pair.get("category"),
+                        chosen_score=pair.get("chosen_score"),
+                        rejected_score=pair.get("rejected_score"),
+                        score_margin=pair.get("score_margin"),
+                    )
+                else:
+                    out_f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+    finally:
+        if db:
+            db.close()
+        elif out_f:
+            out_f.close()
 
     if total_pairs == 0:
         raise ValueError(
@@ -176,7 +208,10 @@ def make_preferences(
         f"Generated {total_pairs} preference pairs from {len(groups)} prompt groups "
         f"({total_prompts_with_pairs} groups contributed at least one pair)."
     )
-    print(f"Written to: {output_path}")
+    if output_path:
+        print(f"Written to: {output_path}")
+    elif db:
+        print(f"Written to database: {db.db_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,8 +227,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/preferences/preferences.jsonl"),
-        help="Output JSONL of preferences with fields: prompt, chosen, rejected.",
+        default=None,
+        help="Output JSONL of preferences (only used if --no-db).",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Write to JSONL file instead of database.",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=None,
+        help="Path to SQLite database (uses default if not specified).",
     )
     parser.add_argument(
         "--min-margin",
@@ -212,11 +258,16 @@ def parse_args() -> argparse.Namespace:
 
 def main(argv: List[str] | None = None) -> None:
     args = parse_args()
+    if args.no_db and args.output is None:
+        args.output = Path("data/preferences/preferences.jsonl")
+    
     make_preferences(
         input_path=args.input,
         output_path=args.output,
         min_margin=args.min_margin,
         max_pairs_per_prompt=args.max_pairs_per_prompt,
+        use_database=not args.no_db,
+        db_path=args.db_path,
     )
 
 

@@ -129,6 +129,151 @@ CREATE INDEX IF NOT EXISTS idx_reward_labels_message ON reward_labels(message_id
 CREATE INDEX IF NOT EXISTS idx_synthetic_data_source ON synthetic_data(source);
 CREATE INDEX IF NOT EXISTS idx_synthetic_data_used ON synthetic_data(is_used);
 
+-- Training data tables (migrated from JSONL)
+
+-- Raw trajectories (generated prompt-response pairs)
+CREATE TABLE IF NOT EXISTS trajectories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trajectory_id TEXT UNIQUE NOT NULL,  -- Original 'id' from JSONL
+    prompt_id TEXT,
+    category TEXT,
+    persona TEXT,
+    prompt TEXT NOT NULL,
+    response TEXT NOT NULL,
+    candidate_index INTEGER,
+    source TEXT,  -- 'teacher', 'generator_model', etc.
+    generator_model_id TEXT,
+    generator_model_alias TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON  -- Additional generation parameters
+);
+
+-- Reward-labeled samples (trajectories with reward vectors)
+CREATE TABLE IF NOT EXISTS reward_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id TEXT UNIQUE NOT NULL,  -- Original 'id' from JSONL
+    trajectory_id TEXT,  -- References trajectories.trajectory_id
+    prompt_id TEXT,
+    category TEXT,
+    prompt TEXT NOT NULL,
+    response TEXT NOT NULL,
+    
+    -- 7 behavioral dimensions
+    empathy REAL,
+    social_coherence REAL,
+    agency_support REAL,
+    epistemic_integrity REAL,
+    harm_avoidance REAL,
+    narrative_alignment REAL,
+    curiosity REAL,
+    
+    -- Scalars
+    scalar REAL,  -- Aggregate score
+    reward_intensity REAL,
+    safety_score REAL,
+    
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON
+);
+
+-- Preference pairs for DPO training
+CREATE TABLE IF NOT EXISTS preference_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt TEXT NOT NULL,
+    chosen TEXT NOT NULL,
+    rejected TEXT NOT NULL,
+    
+    -- Optional metadata
+    chosen_id TEXT,  -- References reward_samples.sample_id
+    rejected_id TEXT,
+    prompt_id TEXT,
+    category TEXT,
+    chosen_score REAL,
+    rejected_score REAL,
+    score_margin REAL,
+    
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON
+);
+
+-- Self-training events (online feedback logs)
+CREATE TABLE IF NOT EXISTS self_train_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,  -- Identifies the session log file
+    timestamp_utc DATETIME NOT NULL,
+    prompt TEXT NOT NULL,
+    num_candidates INTEGER,
+    max_new_tokens INTEGER,
+    temperature REAL,
+    top_p REAL,
+    device TEXT,
+    
+    -- Chosen candidate
+    chosen_text TEXT NOT NULL,
+    chosen_scalar_score REAL,
+    chosen_reward_empathy REAL,
+    chosen_reward_social_coherence REAL,
+    chosen_reward_agency_support REAL,
+    chosen_reward_epistemic_integrity REAL,
+    chosen_reward_harm_avoidance REAL,
+    chosen_reward_narrative_alignment REAL,
+    chosen_reward_curiosity REAL,
+    chosen_reward_intensity REAL,
+    chosen_reward_safety_score REAL,
+    
+    -- All candidates stored as JSON
+    candidates_json JSON,
+    
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON
+);
+
+-- Training runs (metadata about training sessions)
+CREATE TABLE IF NOT EXISTS training_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT UNIQUE NOT NULL,
+    component TEXT NOT NULL,  -- 'reward_model', 'lora_dpo', 'online_update', etc.
+    created_at_utc DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metadata JSON  -- Run-level config, hyperparameters, etc.
+);
+
+-- Training steps (per-step metrics)
+CREATE TABLE IF NOT EXISTS training_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    step_number INTEGER NOT NULL,
+    time_utc DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metrics JSON,  -- All step-level metrics (loss, learning_rate, etc.)
+    
+    FOREIGN KEY (run_id) REFERENCES training_runs(run_id)
+);
+
+-- Training evaluations (periodic eval snapshots)
+CREATE TABLE IF NOT EXISTS training_evals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    eval_number INTEGER NOT NULL,
+    time_utc DATETIME DEFAULT CURRENT_TIMESTAMP,
+    metrics JSON,  -- All eval-level metrics
+    
+    FOREIGN KEY (run_id) REFERENCES training_runs(run_id)
+);
+
+-- Indexes for training data
+CREATE INDEX IF NOT EXISTS idx_trajectories_trajectory_id ON trajectories(trajectory_id);
+CREATE INDEX IF NOT EXISTS idx_trajectories_prompt_id ON trajectories(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_trajectories_created ON trajectories(created_at);
+CREATE INDEX IF NOT EXISTS idx_reward_samples_sample_id ON reward_samples(sample_id);
+CREATE INDEX IF NOT EXISTS idx_reward_samples_trajectory_id ON reward_samples(trajectory_id);
+CREATE INDEX IF NOT EXISTS idx_reward_samples_prompt_id ON reward_samples(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_reward_samples_created ON reward_samples(created_at);
+CREATE INDEX IF NOT EXISTS idx_preference_pairs_prompt_id ON preference_pairs(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_preference_pairs_created ON preference_pairs(created_at);
+CREATE INDEX IF NOT EXISTS idx_self_train_events_session ON self_train_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_self_train_events_timestamp ON self_train_events(timestamp_utc);
+CREATE INDEX IF NOT EXISTS idx_training_steps_run ON training_steps(run_id, step_number);
+CREATE INDEX IF NOT EXISTS idx_training_evals_run ON training_evals(run_id, eval_number);
+
 -- Views for training data preparation
 CREATE VIEW IF NOT EXISTS training_data_combined AS
 SELECT
@@ -178,4 +323,63 @@ SELECT
     sd.created_at,
     sd.metadata
 FROM synthetic_data sd
-WHERE sd.is_used = TRUE;
+WHERE sd.is_used = TRUE
+UNION ALL
+SELECT
+    'reward_sample' as data_source,
+    NULL as conversation_id,
+    NULL as message_index,
+    'assistant' as role,
+    rs.response as content,
+    NULL as valence,
+    NULL as arousal,
+    NULL as dominance,
+    NULL as predictive_discrepancy,
+    NULL as temporal_directionality,
+    NULL as social_broadcast,
+    NULL as emotion_intensity,
+    NULL as emotion_safety,
+    rs.empathy,
+    rs.social_coherence,
+    rs.agency_support,
+    rs.epistemic_integrity,
+    rs.harm_avoidance,
+    rs.narrative_alignment,
+    rs.curiosity,
+    rs.reward_intensity,
+    rs.safety_score as reward_safety,
+    rs.created_at,
+    rs.metadata
+FROM reward_samples rs;
+
+-- View for DPO training pairs
+CREATE VIEW IF NOT EXISTS dpo_preference_pairs AS
+SELECT
+    prompt,
+    chosen,
+    rejected,
+    chosen_id,
+    rejected_id,
+    prompt_id,
+    category,
+    chosen_score,
+    rejected_score,
+    score_margin,
+    created_at
+FROM preference_pairs;
+
+-- View for self-train replay pairs (for online_update)
+CREATE VIEW IF NOT EXISTS self_train_replay_pairs AS
+SELECT
+    id,
+    prompt,
+    chosen_text as chosen,
+    -- Find the worst candidate from candidates_json for rejected
+    -- This is a simplified view; actual logic should filter in application code
+    timestamp_utc,
+    chosen_scalar_score,
+    chosen_reward_intensity,
+    chosen_reward_safety_score,
+    candidates_json,
+    metadata
+FROM self_train_events;

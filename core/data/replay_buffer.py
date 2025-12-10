@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from enum import Enum
 
+from core.data.db import TrainingDatabase
 from core.data.schema import REWARD_DIMENSIONS
 
 
@@ -103,20 +105,108 @@ class ReplayBufferStore:
     @classmethod
     def from_self_train_logs(
         cls,
-        log_dir: Path,
+        log_dir: Optional[Path] = None,
         *,
         safety_threshold: float,
         min_reward_intensity: float,
         max_records: Optional[int] = None,
+        use_database: bool = True,
+        db_path: Optional[str] = None,
     ) -> "ReplayBufferStore":
-        """Construct a replay buffer from self_train_server session logs."""
-        if not log_dir.exists():
-            raise FileNotFoundError(f"Log directory '{log_dir}' does not exist.")
-
+        """Construct a replay buffer from self_train_server session logs (JSONL) or database."""
         pairs: List[ReplayPair] = []
-        log_files: List[Path] = sorted(log_dir.glob("session_*.jsonl"))
-        for path in log_files:
-            with path.open("r", encoding="utf-8") as f:
+        
+        if use_database:
+            # Load from database
+            db = TrainingDatabase(db_path=db_path)
+            try:
+                events = db.get_self_train_events(
+                    min_reward_intensity=min_reward_intensity,
+                    min_safety_score=safety_threshold,
+                    limit=max_records,
+                )
+                
+                for event in events:
+                    # Extract candidates from JSON
+                    candidates_json = json.loads(event["candidates_json"]) if event.get("candidates_json") else []
+                    if not candidates_json:
+                        continue
+                    
+                    # Find worst candidate
+                    worst = min(
+                        candidates_json,
+                        key=lambda c: float(c.get("scalar_score", float("inf")))
+                    )
+                    
+                    reward = {
+                        "empathy": event.get("chosen_reward_empathy"),
+                        "social_coherence": event.get("chosen_reward_social_coherence"),
+                        "agency_support": event.get("chosen_reward_agency_support"),
+                        "epistemic_integrity": event.get("chosen_reward_epistemic_integrity"),
+                        "harm_avoidance": event.get("chosen_reward_harm_avoidance"),
+                        "narrative_alignment": event.get("chosen_reward_narrative_alignment"),
+                        "curiosity": event.get("chosen_reward_curiosity"),
+                        "reward_intensity": event.get("chosen_reward_intensity"),
+                        "safety_score": event.get("chosen_reward_safety_score"),
+                    }
+                    # Filter out None values
+                    reward = {k: v for k, v in reward.items() if v is not None}
+                    
+                    reward_intensity = float(event.get("chosen_reward_intensity", 1.0))
+                    safety_score = float(event.get("chosen_reward_safety_score", 1.0))
+                    
+                    # Apply Safety Gate logic
+                    safety_mode = cls._determine_safety_mode(safety_score)
+                    
+                    if safety_mode == SafetyMode.SKIP:
+                        continue
+                    if reward_intensity < min_reward_intensity:
+                        continue
+                    
+                    # Apply inverse learning for unsafe examples
+                    processed_reward = reward
+                    chosen_text = event["chosen_text"]
+                    rejected_text = worst.get("text", "")
+                    
+                    if safety_mode == SafetyMode.INVERSE:
+                        processed_reward = cls._apply_inverse_learning(reward)
+                        # Swap chosen and rejected for inverse learning
+                        chosen_text, rejected_text = rejected_text, chosen_text
+                    
+                    scalar_score = event.get("chosen_scalar_score", 0.0)
+                    if safety_mode == SafetyMode.INVERSE:
+                        scalar_score = -float(scalar_score) if scalar_score else cls._scalar_score_from_reward(processed_reward)
+                    else:
+                        scalar_score = float(scalar_score) if scalar_score else cls._scalar_score_from_reward(processed_reward)
+                    
+                    pairs.append(
+                        ReplayPair(
+                            prompt=str(event["prompt"]),
+                            chosen=str(chosen_text),
+                            rejected=str(rejected_text),
+                            reward={k: float(v) for k, v in processed_reward.items()},
+                            reward_intensity=reward_intensity,
+                            safety_score=safety_score,
+                            scalar_score=scalar_score,
+                            timestamp_utc=str(event.get("timestamp_utc", "")),
+                            safety_mode=safety_mode,
+                        )
+                    )
+                    
+                    if max_records is not None and len(pairs) >= max_records:
+                        db.close()
+                        return cls(pairs)
+            
+            finally:
+                db.close()
+        else:
+            # Load from JSONL files (legacy)
+            if log_dir is None or not log_dir.exists():
+                raise FileNotFoundError(f"Log directory '{log_dir}' does not exist.")
+
+            log_files: List[Path] = sorted(log_dir.glob("session_*.jsonl"))
+            for path in log_files:
+                with path.open("r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -184,12 +274,12 @@ class ReplayBufferStore:
 
                     if max_records is not None and len(pairs) >= max_records:
                         return cls(pairs)
-
-        if not pairs:
-            raise ValueError(
-                f"No usable replay pairs found in '{log_dir}'. "
-                "Ensure the self_train server has logged interactions with reward_intensity and safety_score."
-            )
+            
+            if not pairs:
+                raise ValueError(
+                    f"No usable replay pairs found in '{log_dir}'. "
+                    "Ensure the self_train server has logged interactions with reward_intensity and safety_score."
+                )
 
         return cls(pairs)
 

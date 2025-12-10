@@ -7,8 +7,9 @@ import os
 import textwrap
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
+from core.data.db import TrainingDatabase
 from core.data.schema import RewardVector
 from core.data.teacher_client import (
     BATCH_RATING_JSON_SCHEMA,
@@ -212,25 +213,37 @@ def _load_labeled_ids(output_path: Path) -> Set[str]:
 
 def _write_labeled_sample(
     *,
-    out_f,
+    out_f: Optional[Any],
     sample_id: str,
     record: Dict[str, Any],
     reward_vector: RewardVector,
+    db: Optional[TrainingDatabase] = None,
 ) -> None:
-    labeled: Dict[str, Any] = {
-        "id": sample_id,
-        "prompt_id": record.get("prompt_id"),
-        "category": record.get("category"),
-        "prompt": record.get("prompt", ""),
-        "response": record.get("response", ""),
-        "reward": reward_vector.to_dict(),
-    }
-    out_f.write(json.dumps(labeled, ensure_ascii=False) + "\n")
-    out_f.flush()
-    try:
-        os.fsync(out_f.fileno())
-    except OSError:
-        pass
+    if db:
+        db.insert_reward_sample(
+            sample_id=sample_id,
+            prompt=record.get("prompt", ""),
+            response=record.get("response", ""),
+            reward=reward_vector.to_dict(),
+            trajectory_id=sample_id,
+            prompt_id=record.get("prompt_id"),
+            category=record.get("category"),
+        )
+    else:
+        labeled: Dict[str, Any] = {
+            "id": sample_id,
+            "prompt_id": record.get("prompt_id"),
+            "category": record.get("category"),
+            "prompt": record.get("prompt", ""),
+            "response": record.get("response", ""),
+            "reward": reward_vector.to_dict(),
+        }
+        out_f.write(json.dumps(labeled, ensure_ascii=False) + "\n")
+        out_f.flush()
+        try:
+            os.fsync(out_f.fileno())
+        except OSError:
+            pass
 
 
 def _label_batch(
@@ -276,21 +289,23 @@ def _label_batch(
 def label_trajectories(
     *,
     input_path: Path,
-    output_path: Path,
+    output_path: Optional[Path] = None,
     require_json: bool,
     max_request_attempts: int,
     request_retry_delay: float,
     batch_mode: bool = False,
     batch_size: int = 8,
+    use_database: bool = True,
+    db_path: Optional[str] = None,
 ) -> None:
     """
     Label trajectories with reward vectors from the teacher model.
 
     This function is **resumable** and **idempotent**:
 
-    - If `output_path` already exists, previously labeled examples are loaded
-      (by their `id` field) and **skipped**.
-    - New labels are **appended** to the existing JSONL file.
+    - If using database, previously labeled examples are loaded (by their `id` field) and **skipped**.
+    - If using JSONL, previously labeled examples are loaded from `output_path` and **skipped**.
+    - New labels are **appended** to the database or existing JSONL file.
     - If a previous run crashed partway through, re-running will only label
       the remaining trajectories, avoiding duplicate spend.
     """
@@ -303,14 +318,25 @@ def label_trajectories(
     else:
         rating_prompt = build_nojson_rubric()
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Initialize database or JSONL output
+    db: Optional[TrainingDatabase] = None
+    out_f: Optional[Any] = None
+    labeled_ids: Set[str] = set()
+    
+    if use_database:
+        db = TrainingDatabase(db_path=db_path)
+        # Load existing IDs from database
+        cursor = db.connection.execute("SELECT sample_id FROM reward_samples")
+        labeled_ids = {row[0] for row in cursor.fetchall()}
+    else:
+        if output_path is None:
+            raise ValueError("output_path is required when use_database=False")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        labeled_ids = _load_labeled_ids(output_path)
+        out_f = output_path.open("a", encoding="utf-8")
 
-    # Collect IDs that have already been labeled so we can skip them.
-    labeled_ids = _load_labeled_ids(output_path)
-
-    with input_path.open("r", encoding="utf-8") as in_f, output_path.open(
-        "a", encoding="utf-8"
-    ) as out_f:
+    try:
+        with input_path.open("r", encoding="utf-8") as in_f:
         if batch_mode:
             batch: List[Dict[str, Any]] = []
         else:
@@ -370,7 +396,7 @@ def label_trajectories(
                         except Exception:
                             continue
                         _write_labeled_sample(
-                            out_f=out_f, sample_id=rec_id, record=rec, reward_vector=reward_vector
+                            out_f=out_f, sample_id=rec_id, record=rec, reward_vector=reward_vector, db=db
                         )
                         labeled_ids.add(rec_id)
                     batch = []
@@ -465,9 +491,14 @@ def label_trajectories(
                 except Exception:
                     continue
                 _write_labeled_sample(
-                    out_f=out_f, sample_id=rec_id, record=rec, reward_vector=reward_vector
+                    out_f=out_f, sample_id=rec_id, record=rec, reward_vector=reward_vector, db=db
                 )
                 labeled_ids.add(rec_id)
+    finally:
+        if db:
+            db.close()
+        elif out_f:
+            out_f.close()
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -483,8 +514,19 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/labeled/reward_samples.jsonl"),
-        help="Output JSONL file for labeled reward samples.",
+        default=None,
+        help="Output JSONL file for labeled reward samples (only used if --no-db).",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Write to JSONL file instead of database.",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=None,
+        help="Path to SQLite database (uses default if not specified).",
     )
     parser.add_argument(
         "--no-json",
@@ -518,6 +560,8 @@ def main(argv: List[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.batch_mode and args.no_json:
         parser.error("--batch-mode requires structured JSON output; remove --no-json.")
+    if args.no_db and args.output is None:
+        args.output = Path("data/labeled/reward_samples.jsonl")
 
     label_trajectories(
         input_path=args.input,
@@ -527,6 +571,8 @@ def main(argv: List[str] | None = None) -> None:
         request_retry_delay=args.request_retry_delay,
         batch_mode=args.batch_mode,
         batch_size=max(1, args.batch_size),
+        use_database=not args.no_db,
+        db_path=args.db_path,
     )
 
 

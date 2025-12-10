@@ -79,27 +79,46 @@ class PreferenceDataset(Dataset):
 
 
 def load_preferences(path: str) -> List[PreferenceSample]:
+    """Load preference pairs from JSONL or Parquet file."""
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Preferences file not found at '{path}'. "
-            "Create data/preferences/preferences.jsonl with fields: "
-            "{'prompt', 'chosen', 'rejected'} per line."
+            "Expected JSONL file with fields: {'prompt', 'chosen', 'rejected'} per line, "
+            "or Parquet file with columns: prompt, chosen, rejected."
         )
 
     samples: List[PreferenceSample] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            try:
-                prompt = obj["prompt"]
-                chosen = obj["chosen"]
-                rejected = obj["rejected"]
-            except KeyError as exc:
-                raise ValueError(f"Missing field in preference record: {exc}; got: {obj}") from exc
-            samples.append(PreferenceSample(prompt=prompt, chosen=chosen, rejected=rejected))
+    
+    # Check if it's a Parquet file
+    if path.endswith('.parquet'):
+        try:
+            import pandas as pd
+            df = pd.read_parquet(path)
+            for _, row in df.iterrows():
+                prompt = str(row.get("prompt", ""))
+                chosen = str(row.get("chosen", ""))
+                rejected = str(row.get("rejected", ""))
+                if prompt and chosen and rejected:
+                    samples.append(PreferenceSample(prompt=prompt, chosen=chosen, rejected=rejected))
+        except ImportError:
+            raise ImportError("pandas and pyarrow are required for Parquet support. Install with: pip install pandas pyarrow")
+        except Exception as e:
+            raise ValueError(f"Error reading Parquet file '{path}': {e}")
+    else:
+        # Assume JSONL
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                try:
+                    prompt = obj["prompt"]
+                    chosen = obj["chosen"]
+                    rejected = obj["rejected"]
+                except KeyError as exc:
+                    raise ValueError(f"Missing field in preference record: {exc}; got: {obj}") from exc
+                samples.append(PreferenceSample(prompt=prompt, chosen=chosen, rejected=rejected))
 
     if not samples:
         raise ValueError(f"No preference samples found in '{path}'.")

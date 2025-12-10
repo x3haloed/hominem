@@ -21,28 +21,76 @@ class RewardSample:
 
 
 def load_reward_samples(path: Path) -> List[RewardSample]:
+    """Load reward samples from JSONL or Parquet file."""
     samples: List[RewardSample] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            record: Dict[str, Any] = json.loads(line)
-            reward_data = record.get("reward") or {}
-            reward = RewardVector.from_mapping(reward_data)
-            samples.append(
-                RewardSample(
-                    prompt=record.get("prompt", ""),
-                    response=record.get("response", ""),
-                    reward=reward,
-                    metadata={
-                        "id": record.get("id"),
-                        "prompt_id": record.get("prompt_id"),
-                        "category": record.get("category"),
-                        "rationale": record.get("rationale", ""),
-                    },
+    
+    # Check if it's a Parquet file
+    if str(path).endswith('.parquet'):
+        try:
+            import pandas as pd
+            df = pd.read_parquet(path)
+            
+            # Map Parquet columns to reward dict
+            for _, row in df.iterrows():
+                reward_data = {
+                    "empathy": row.get("empathy"),
+                    "social_coherence": row.get("social_coherence"),
+                    "agency_support": row.get("agency_support"),
+                    "epistemic_integrity": row.get("epistemic_integrity"),
+                    "harm_avoidance": row.get("harm_avoidance"),
+                    "narrative_alignment": row.get("narrative_alignment"),
+                    "curiosity": row.get("curiosity"),
+                    "scalar": row.get("scalar"),
+                    "reward_intensity": row.get("reward_intensity"),
+                    "safety_score": row.get("safety_score"),
+                }
+                # Filter out None values
+                reward_data = {k: v for k, v in reward_data.items() if v is not None}
+                
+                try:
+                    reward = RewardVector.from_mapping(reward_data)
+                    samples.append(
+                        RewardSample(
+                            prompt=str(row.get("prompt", "")),
+                            response=str(row.get("response", "")),
+                            reward=reward,
+                            metadata={
+                                "id": row.get("sample_id"),
+                                "prompt_id": row.get("prompt_id"),
+                                "category": row.get("category"),
+                            },
+                        )
+                    )
+                except (ValueError, KeyError):
+                    # Skip samples with invalid reward data
+                    continue
+        except ImportError:
+            raise ImportError("pandas and pyarrow are required for Parquet support. Install with: pip install pandas pyarrow")
+        except Exception as e:
+            raise ValueError(f"Error reading Parquet file '{path}': {e}")
+    else:
+        # Assume JSONL
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record: Dict[str, Any] = json.loads(line)
+                reward_data = record.get("reward") or {}
+                reward = RewardVector.from_mapping(reward_data)
+                samples.append(
+                    RewardSample(
+                        prompt=record.get("prompt", ""),
+                        response=record.get("response", ""),
+                        reward=reward,
+                        metadata={
+                            "id": record.get("id"),
+                            "prompt_id": record.get("prompt_id"),
+                            "category": record.get("category"),
+                            "rationale": record.get("rationale", ""),
+                        },
+                    )
                 )
-            )
     return samples
 
 

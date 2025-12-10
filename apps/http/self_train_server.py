@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -126,7 +127,17 @@ class SelfTrainContext:
         # Logging.
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.log_path = log_dir / f"session_{timestamp}.jsonl"
+        self.session_id = f"session_{timestamp}"
+        self.log_path = log_dir / f"{self.session_id}.jsonl"
+        
+        # Database logging (optional, defaults to True)
+        use_db = os.getenv("SELF_TRAIN_USE_DB", "true").lower() == "true"
+        if use_db:
+            from core.data.db import TrainingDatabase
+            db_path = os.getenv("HOMINEM_DB_PATH", None)
+            self.db = TrainingDatabase(db_path=db_path)
+        else:
+            self.db = None
 
 
 def generate_one(
@@ -227,8 +238,9 @@ def self_train(req: GenerateRequest) -> GenerateResponse:
     chosen = max(candidates, key=lambda c: c.scalar_score)
 
     # Log advanced stats.
+    timestamp_utc = datetime.now(timezone.utc).isoformat()
     log_record = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": timestamp_utc,
         "prompt": req.prompt,
         "num_candidates": req.num_candidates,
         "max_new_tokens": req.max_new_tokens,
@@ -238,6 +250,25 @@ def self_train(req: GenerateRequest) -> GenerateResponse:
         "chosen": chosen.dict(),
         "candidates": [c.dict() for c in candidates],
     }
+    
+    # Write to database if enabled
+    if ctx.db:
+        ctx.db.insert_self_train_event(
+            session_id=ctx.session_id,
+            timestamp_utc=timestamp_utc,
+            prompt=req.prompt,
+            chosen_text=chosen.text,
+            chosen_reward=chosen.reward,
+            chosen_scalar_score=chosen.scalar_score,
+            candidates_json=[c.dict() for c in candidates],
+            num_candidates=req.num_candidates,
+            max_new_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            device=str(ctx.device),
+        )
+    
+    # Also write to JSONL for backwards compatibility and debugging
     with ctx.log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
 

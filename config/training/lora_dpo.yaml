@@ -22,7 +22,9 @@ lora:
     - "down_proj"
 
 training:
-  preferences_path: "data/preferences/preferences.jsonl"
+  # Preferences can be JSONL or Parquet file
+  # For Parquet: export from database using scripts/export/export_preferences.py
+  preferences_path: "data/preferences/preferences.jsonl"  # or "data/exports/preferences.parquet"
   output_dir: "artifacts/lora/qwen3.1-7b-v2"
   batch_size: 2         # Increased from 1 - more stable gradients
   # Improved hyperparameters based on training analysis
