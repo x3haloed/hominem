@@ -57,6 +57,7 @@ except ImportError:
 # Global instances
 db: Optional[DatabaseManager] = None
 model: Optional[ModelInterface] = None
+background_tasks: set = set()  # Track background tasks for cleanup
 
 async def auto_load_lora_model(model_interface, lora_spec: str, base_model_path: str = None):
     """Automatically load a LoRA model on startup"""
@@ -201,9 +202,36 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Cleanup
+    # Cleanup - comprehensive shutdown
+    print("🧹 Starting application cleanup...")
+
+    # Cancel any running background tasks
+    if background_tasks:
+        print(f"🛑 Cancelling {len(background_tasks)} background tasks...")
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        # Wait for tasks to cancel
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        background_tasks.clear()
+
+    # Close database
     if db:
+        print("💾 Closing database connection...")
         db.close()
+
+    # Cleanup model resources
+    if model:
+        print("🧠 Cleaning up model resources...")
+        try:
+            # Unload all models to free GPU memory
+            for version_id in model.get_loaded_versions():
+                print(f"🗑️ Unloading model: {version_id}")
+                model.unload_version(version_id)
+        except Exception as e:
+            print(f"⚠️ Error during model cleanup: {e}")
+
+    print("✅ Application cleanup complete")
 
 app = FastAPI(
     title="Hominem LoRA Serving System",
@@ -329,9 +357,15 @@ async def load_model(request: Dict[str, Any]):
         base_model_path = request["base_model_path"]
         lora_path = request.get("lora_path")
 
-        # Start background loading
-        asyncio.create_task(
+        # Start background loading and track the task
+        task = asyncio.create_task(
             model.load_model_async(version_id, base_model_path, lora_path)
+        )
+        background_tasks.add(task)
+
+        # Clean up completed tasks
+        background_tasks.difference_update(
+            {t for t in background_tasks if t.done()}
         )
 
         return {
@@ -403,12 +437,24 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
 
                 print(f"🤖 Starting AI response generation for {conversation_id}:{message_index + 1}")
 
+                # Get conversation history for chat formatting
+                conversation_data = db.get_conversation(conversation_id)
+                conversation_history = []
+                if conversation_data and "messages" in conversation_data:
+                    # Convert to format expected by chat template
+                    conversation_history = [
+                        {"role": msg["role"], "content": msg["content"]}
+                        for msg in conversation_data["messages"]
+                    ]
+
+                print(f"📚 Using conversation history: {len(conversation_history)} messages")
+
                 # Generate AI response with streaming
                 await model.generate_streaming_response(
                     websocket=websocket,
                     conversation_id=conversation_id,
                     message_index=message_index,
-                    prompt=content
+                    conversation_history=conversation_history
                 )
 
             elif data["type"] == "label_emotion":

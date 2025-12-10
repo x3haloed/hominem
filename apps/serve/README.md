@@ -73,6 +73,23 @@ PORT=8000
 DEBUG=true
 ```
 
+### Chat Template Support ✅
+
+The serving system now properly implements chat templates for conversation formatting:
+
+#### Automatic Chat Formatting
+- **Template Detection**: Automatically loads `chat_template.jinja` from LoRA directory
+- **Conversation History**: Formats full conversation context using proper chat templates
+- **Role Formatting**: Correctly formats `system`, `user`, and `assistant` messages
+- **EOS Tokens**: Uses appropriate stopping criteria (`<|im_end|>` for Qwen models)
+
+#### Template Examples
+- **Qwen Models**: Uses `<|im_start|>role\ncontent<|im_end|>` format
+- **Fallback Support**: Manual formatting if template loading fails
+- **Token Streaming**: Proper stopping when EOS tokens are generated
+
+This fixes the infinite generation issue by providing proper conversational structure.
+
 ### Model Loading
 
 #### Auto-Loading on Startup

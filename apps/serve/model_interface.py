@@ -92,7 +92,7 @@ class ModelInterface:
         self.max_memory = {}  # For model loading constraints
 
     async def generate_streaming_response(self, websocket, conversation_id: str,
-                                        message_index: int, prompt: str):
+                                        message_index: int, conversation_history: List[Dict[str, str]]):
         """Generate streaming response and send via WebSocket"""
         print(f"🎯 Starting completion for {conversation_id}:{message_index + 1}")
         start_time = time.time()
@@ -117,7 +117,7 @@ class ModelInterface:
 
             # Generate streaming response
             await self._generate_with_model(
-                websocket, model_version, prompt, message_index + 1
+                websocket, model_version, conversation_history, message_index + 1
             )
 
             elapsed = time.time() - start_time
@@ -130,8 +130,8 @@ class ModelInterface:
             })
 
     async def _generate_with_model(self, websocket, model_version: ModelVersion,
-                                 prompt: str, message_index: int):
-        """Generate response using the specified model"""
+                                 conversation_history: List[Dict[str, str]], message_index: int):
+        """Generate response using the specified model with proper chat formatting"""
         if not MODELS_AVAILABLE:
             # Fallback placeholder response
             print("📝 Using placeholder response (transformers not available)")
@@ -139,9 +139,9 @@ class ModelInterface:
             return
 
         try:
-            print(f"🔄 Formatting prompt for model")
-            # Format prompt for chat
-            formatted_prompt = self._format_chat_prompt(prompt)
+            print(f"🔄 Formatting conversation with chat template")
+            # Format conversation using chat template
+            formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history)
 
             # Use pipeline for generation
             if model_version.pipeline:
@@ -150,13 +150,16 @@ class ModelInterface:
                 response_text = ""
                 start_time = time.time()
 
-                # Generate with streaming
+                # Generate with streaming - use proper EOS tokens
+                eos_tokens = self._get_eos_tokens(model_version.tokenizer)
+
                 outputs = model_version.pipeline(
                     formatted_prompt,
                     max_new_tokens=512,
                     temperature=0.7,
                     do_sample=True,
                     pad_token_id=model_version.tokenizer.eos_token_id,
+                    eos_token_id=eos_tokens,  # Use proper EOS tokens for chat
                     return_full_text=False
                 )
 
@@ -164,6 +167,9 @@ class ModelInterface:
                 # In production, you'd use a custom streaming implementation
                 full_response = outputs[0]['generated_text']
                 print(f"📄 Generated response ({len(full_response)} chars)")
+
+                # Clean response (remove any EOS tokens that might have been generated)
+                full_response = self._clean_generated_response(full_response, model_version.tokenizer)
 
                 # Send in chunks to simulate streaming
                 chunk_count = 0
@@ -215,8 +221,79 @@ class ModelInterface:
             "processing_time_ms": 1000
         })
 
+    def _format_chat_conversation(self, tokenizer, conversation_history: List[Dict[str, str]]) -> str:
+        """Format conversation history using chat template"""
+        try:
+            # Use tokenizer's apply_chat_template if available (transformers >= 4.34)
+            if hasattr(tokenizer, 'apply_chat_template'):
+                print(f"📝 Using chat template with {len(conversation_history)} messages")
+                return tokenizer.apply_chat_template(
+                    conversation_history,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            else:
+                # Fallback to manual formatting for older transformers
+                print("⚠️ Chat template not available, using fallback formatting")
+                return self._format_chat_fallback(conversation_history)
+        except Exception as e:
+            print(f"❌ Chat template formatting failed: {e}, using fallback")
+            return self._format_chat_fallback(conversation_history)
+
+    def _format_chat_fallback(self, conversation_history: List[Dict[str, str]]) -> str:
+        """Fallback chat formatting when template is not available"""
+        formatted = ""
+        for message in conversation_history:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "system":
+                formatted += f"<|im_start|>system\n{content}<|im_end|>\n"
+            elif role == "user":
+                formatted += f"<|im_start|>user\n{content}<|im_end|>\n"
+            elif role == "assistant":
+                formatted += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+
+        # Add generation prompt
+        formatted += "<|im_start|>assistant\n"
+        return formatted
+
+    def _get_eos_tokens(self, tokenizer) -> List[int]:
+        """Get EOS token IDs for stopping generation"""
+        eos_tokens = []
+
+        # Primary EOS token
+        if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+            if isinstance(tokenizer.eos_token_id, list):
+                eos_tokens.extend(tokenizer.eos_token_id)
+            else:
+                eos_tokens.append(tokenizer.eos_token_id)
+
+        # Chat-specific EOS tokens (like <|im_end|> for Qwen)
+        eos_token_strings = ["<|im_end|>", "<|endoftext|>"]
+        for token_str in eos_token_strings:
+            try:
+                token_id = tokenizer.encode(token_str, add_special_tokens=False)
+                if token_id:
+                    eos_tokens.extend(token_id)
+            except:
+                continue
+
+        # Remove duplicates and return
+        return list(set(eos_tokens))
+
+    def _clean_generated_response(self, response: str, tokenizer) -> str:
+        """Clean generated response by removing EOS tokens"""
+        # Remove common EOS tokens
+        eos_tokens = ["<|im_end|>", "<|endoftext|>", tokenizer.eos_token or "</s>"]
+
+        cleaned = response
+        for token in eos_tokens:
+            cleaned = cleaned.replace(token, "")
+
+        return cleaned.strip()
+
     def _format_chat_prompt(self, user_message: str) -> str:
-        """Format user message into chat prompt"""
+        """Legacy method - kept for compatibility"""
         return f"Human: {user_message}\n\nAssistant:"
 
     def _chunk_text(self, text: str, chunk_size: int = 5):
