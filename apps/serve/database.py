@@ -28,12 +28,8 @@ class DatabaseManager:
             with open(schema_path, "r") as f:
                 schema = f.read()
 
-            # Execute schema (split on semicolons and execute each statement)
-            statements = [stmt.strip() for stmt in schema.split(";") if stmt.strip()]
-            for statement in statements:
-                if statement:
-                    self.connection.execute(statement)
-
+            # Execute schema using executescript (handles multiple statements properly)
+            self.connection.executescript(schema)
             self.connection.commit()
 
     def close(self):
