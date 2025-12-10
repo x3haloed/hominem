@@ -131,14 +131,16 @@ class ModelInterface:
                 # Generate with streaming - use proper EOS tokens
                 eos_tokens = self._get_eos_tokens(model_version.tokenizer)
 
+                sampling_params = self._get_sampling_params(enable_thinking)
+
                 outputs = model_version.pipeline(
                     formatted_prompt,
-                    max_new_tokens=512,
-                    temperature=0.7,
+                    max_new_tokens=2048,
                     do_sample=True,
                     pad_token_id=model_version.tokenizer.eos_token_id,
                     eos_token_id=eos_tokens,  # Use proper EOS tokens for chat
-                    return_full_text=False
+                    return_full_text=False,
+                    **sampling_params
                 )
 
                 # For now, simulate streaming since pipeline doesn't support it directly
@@ -227,14 +229,16 @@ class ModelInterface:
                 # Generate with streaming - use proper EOS tokens
                 eos_tokens = self._get_eos_tokens(model_version.tokenizer)
 
+                sampling_params = self._get_sampling_params(enable_thinking)
+
                 outputs = model_version.pipeline(
                     formatted_prompt,
-                    max_new_tokens=512,
-                    temperature=0.7,
+                    max_new_tokens=2048,
                     do_sample=True,
                     pad_token_id=model_version.tokenizer.eos_token_id,
                     eos_token_id=eos_tokens,  # Use proper EOS tokens for chat
-                    return_full_text=False
+                    return_full_text=False,
+                    **sampling_params
                 )
 
                 # For now, simulate streaming since pipeline doesn't support it directly
@@ -379,6 +383,25 @@ class ModelInterface:
             chunk = " ".join(words[i:i + chunk_size])
             if chunk:
                 yield chunk + " "
+
+    def _get_sampling_params(self, enable_thinking: bool) -> Dict[str, Any]:
+        """
+        Return sampling parameters per documentation:
+        - Thinking mode: temperature=0.6, top_p=0.95, top_k=20, min_p=0 (default)
+        - Non-thinking:  temperature=0.7, top_p=0.8,  top_k=20, min_p=0 (default)
+        """
+        if enable_thinking:
+            return {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+            }
+        else:
+            return {
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+            }
 
     async def load_model_async(self, version_id: str, base_model_path: str,
                               lora_path: Optional[str] = None) -> bool:
