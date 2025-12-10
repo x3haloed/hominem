@@ -197,6 +197,7 @@ class ChatApp {
         if (!this.currentConversationId || !this.messageInput.value.trim()) return;
 
         const content = this.messageInput.value.trim();
+        const enableThinking = document.getElementById('thinking-toggle').checked;
         this.messageInput.value = '';
         this.updateSendButton();
 
@@ -207,7 +208,8 @@ class ChatApp {
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
             this.websocket.send(JSON.stringify({
                 type: 'send_message',
-                content: content
+                content: content,
+                enable_thinking: enableThinking
             }));
 
             this.setStatus('Processing...', true);
@@ -318,7 +320,10 @@ class ChatApp {
         const messageEl = this.messagesContainer.querySelector(`[data-message-index="${messageIndex}"]`);
         if (messageEl) {
             const textEl = messageEl.querySelector('.message-text');
-            textEl.textContent += chunk;
+            // For streaming chunks, we need to handle HTML entities properly
+            // But avoid using innerHTML for security. Process thinking content specially.
+            const processedChunk = this.processChunk(chunk);
+            textEl.innerHTML += processedChunk;
             this.scrollToBottom();
         }
     }
@@ -327,9 +332,46 @@ class ChatApp {
         const messageEl = this.messagesContainer.querySelector(`[data-message-index="${messageIndex}"]`);
         if (messageEl) {
             const textEl = messageEl.querySelector('.message-text');
-            textEl.textContent = this.escapeHtml(fullResponse);
+            // Process the full response to handle thinking content
+            const processedResponse = this.processThinkingContent(fullResponse);
+            textEl.innerHTML = processedResponse;
             messageEl.classList.remove('processing');
         }
+    }
+
+    processChunk(chunk) {
+        // For streaming chunks, just escape HTML entities but preserve basic formatting
+        return this.escapeHtml(chunk).replace(/\n/g, '<br>');
+    }
+
+    processThinkingContent(content) {
+        // Preserve safe HTML while still rendering thinking blocks nicely
+        const thinkRegex = /<think>([\s\S]*?)<\/think>/g;
+        let lastIndex = 0;
+        let resultHtml = '';
+        let match;
+
+        while ((match = thinkRegex.exec(content)) !== null) {
+            // Add non-thinking text before this block
+            const before = content.slice(lastIndex, match.index);
+            resultHtml += this.escapeHtml(before).replace(/\n/g, '<br>');
+
+            // Render thinking block with toggling UI
+            const thinkingContent = match[1];
+            const escapedThinking = this.escapeHtml(thinkingContent).replace(/\n/g, '<br>');
+            resultHtml += `<div class="thinking-block" onclick="toggleThinkingBlock(this)">
+                <div class="thinking-header">💭 Thinking</div>
+                <div class="thinking-content">${escapedThinking}</div>
+            </div>`;
+
+            lastIndex = match.index + match[0].length;
+        }
+
+        // Add any trailing content after the last thinking block
+        const remaining = content.slice(lastIndex);
+        resultHtml += this.escapeHtml(remaining).replace(/\n/g, '<br>');
+
+        return resultHtml;
     }
 
     showEmotionLabeler(triggerBtn) {
@@ -592,9 +634,18 @@ class ChatApp {
         div.textContent = text;
         return div.innerHTML;
     }
+
+    toggleThinkingBlock(blockElement) {
+        blockElement.classList.toggle('collapsed');
+    }
+}
+
+// Global function for thinking block toggling
+function toggleThinkingBlock(blockElement) {
+    blockElement.classList.toggle('collapsed');
 }
 
 // Initialize app when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    new ChatApp();
+    window.chatApp = new ChatApp();
 });

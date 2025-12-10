@@ -188,6 +188,56 @@ body {
     color: var(--text-primary);
 }
 
+#chat-controls {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+
+.control-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+    cursor: pointer;
+    user-select: none;
+}
+
+.control-toggle input[type="checkbox"] {
+    display: none;
+}
+
+.toggle-slider {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    background-color: var(--border-color);
+    border-radius: 10px;
+    transition: background-color 0.2s;
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    background-color: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+}
+
+.control-toggle input[type="checkbox"]:checked + .toggle-slider {
+    background-color: var(--accent-color);
+}
+
+.control-toggle input[type="checkbox"]:checked + .toggle-slider::before {
+    transform: translateX(16px);
+}
+
 /* Messages */
 #messages-container {
     flex: 1;
@@ -269,6 +319,50 @@ body {
 @keyframes blink {
     0%, 80%, 100% { opacity: 0; }
     40% { opacity: 1; }
+}
+
+.thinking-block {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    margin: 8px 0;
+    overflow: hidden;
+}
+
+.thinking-header {
+    background-color: var(--bg-tertiary);
+    padding: 8px 12px;
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.thinking-header::after {
+    content: '▼';
+    font-size: 12px;
+    transition: transform 0.2s;
+}
+
+.thinking-block.collapsed .thinking-header::after {
+    transform: rotate(-90deg);
+}
+
+.thinking-content {
+    padding: 12px;
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.thinking-block.collapsed .thinking-content {
+    display: none;
 }
 
 /* Emotion labeling UI */

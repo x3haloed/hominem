@@ -83,12 +83,19 @@ The serving system now properly implements chat templates for conversation forma
 - **Role Formatting**: Correctly formats `system`, `user`, and `assistant` messages
 - **EOS Tokens**: Uses appropriate stopping criteria (`<|im_end|>` for Qwen models)
 
+#### Thinking Mode Control 🎭
+- **Toggle Control**: Enable/disable thinking mode via UI toggle in chat header
+- **Template Integration**: Passes `enable_thinking` parameter to chat template
+- **Thinking Display**: Thinking content shown in collapsible, styled blocks
+- **Visual Formatting**: `<think>` tags converted to user-friendly thinking blocks
+
 #### Template Examples
 - **Qwen Models**: Uses `<|im_start|>role\ncontent<|im_end|>` format
+- **Thinking Format**: `<think>content</think>` blocks when enabled
 - **Fallback Support**: Manual formatting if template loading fails
 - **Token Streaming**: Proper stopping when EOS tokens are generated
 
-This fixes the infinite generation issue by providing proper conversational structure.
+This fixes both the infinite generation issue and provides proper thinking content display.
 
 ### Model Loading
 

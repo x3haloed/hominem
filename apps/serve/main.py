@@ -413,16 +413,18 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
 
             if data["type"] == "send_message":
                 content = data["content"]
+                enable_thinking = data.get("enable_thinking", True)  # Default to thinking enabled
                 metadata = data.get("metadata", {})
 
                 print(f"📨 Received message in conversation {conversation_id}: {content[:100]}{'...' if len(content) > 100 else ''}")
+                print(f"🧠 Thinking mode: {enable_thinking}")
 
                 # Add user message to database
                 message_index = db.add_message(
                     conversation_id=conversation_id,
                     role="user",
                     content=content,
-                    metadata=metadata
+                    metadata={**metadata, "enable_thinking": enable_thinking}
                 )
 
                 print(f"💾 Saved user message {conversation_id}:{message_index}")
@@ -435,7 +437,7 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                     "content": content
                 })
 
-                print(f"🤖 Starting AI response generation for {conversation_id}:{message_index + 1}")
+                print(f"🤖 Starting AI response generation for {conversation_id}:{message_index + 1} (thinking: {enable_thinking})")
 
                 # Get conversation history for chat formatting
                 conversation_data = db.get_conversation(conversation_id)
@@ -443,7 +445,7 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                 if conversation_data and "messages" in conversation_data:
                     # Convert to format expected by chat template
                     conversation_history = [
-                        {"role": msg["role"], "content": msg["content"]}
+                        {"role": msg["role"], "content": msg["content"], "enable_thinking": enable_thinking}
                         for msg in conversation_data["messages"]
                     ]
 
@@ -454,7 +456,9 @@ async def chat_websocket(websocket: WebSocket, conversation_id: str):
                     websocket=websocket,
                     conversation_id=conversation_id,
                     message_index=message_index,
-                    conversation_history=conversation_history
+                    conversation_history=conversation_history,
+                    enable_thinking=enable_thinking,
+                    db=db
                 )
 
             elif data["type"] == "label_emotion":

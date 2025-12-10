@@ -92,7 +92,8 @@ class ModelInterface:
         self.max_memory = {}  # For model loading constraints
 
     async def generate_streaming_response(self, websocket, conversation_id: str,
-                                        message_index: int, conversation_history: List[Dict[str, str]]):
+                                        message_index: int, conversation_history: List[Dict[str, str]],
+                                        enable_thinking: bool = True, db=None):
         """Generate streaming response and send via WebSocket"""
         print(f"🎯 Starting completion for {conversation_id}:{message_index + 1}")
         start_time = time.time()
@@ -115,10 +116,80 @@ class ModelInterface:
                 "message_index": message_index + 1
             })
 
-            # Generate streaming response
-            await self._generate_with_model(
-                websocket, model_version, conversation_history, message_index + 1
-            )
+            # Format conversation using chat template
+            formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history, enable_thinking)
+
+            # Use pipeline for generation
+            if model_version.pipeline:
+                print(f"🚀 Starting model inference with {model_version.version_id}")
+                # Streaming generation
+                response_text = ""
+                start_time = time.time()
+
+                # Generate with streaming - use proper EOS tokens
+                eos_tokens = self._get_eos_tokens(model_version.tokenizer)
+
+                outputs = model_version.pipeline(
+                    formatted_prompt,
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=model_version.tokenizer.eos_token_id,
+                    eos_token_id=eos_tokens,  # Use proper EOS tokens for chat
+                    return_full_text=False
+                )
+
+                # For now, simulate streaming since pipeline doesn't support it directly
+                # In production, you'd use a custom streaming implementation
+                full_response = outputs[0]['generated_text']
+                print(f"📄 Generated response ({len(full_response)} chars)")
+
+                # Clean response (remove any EOS tokens that might have been generated)
+                full_response = self._clean_generated_response(full_response, model_version.tokenizer)
+
+                # Send in chunks to simulate streaming
+                chunk_count = 0
+                for chunk in self._chunk_text(full_response):
+                    response_text += chunk
+                    chunk_count += 1
+                    await websocket.send_json({
+                        "type": "token_chunk",
+                        "message_index": message_index,
+                        "chunk": chunk,
+                        "is_complete": False
+                    })
+                    await asyncio.sleep(0.01)  # Simulate token timing
+
+                processing_time = int((time.time() - start_time) * 1000)
+                print(f"📤 Sent {chunk_count} chunks, {len(response_text)} total chars, {processing_time}ms")
+
+                await websocket.send_json({
+                    "type": "response_complete",
+                    "message_index": message_index,
+                    "full_response": response_text,
+                    "token_count": len(model_version.tokenizer.encode(response_text)),
+                    "processing_time_ms": processing_time
+                })
+
+                # Save assistant response to database
+                if db:
+                    try:
+                        token_count = len(model_version.tokenizer.encode(response_text))
+                        db.add_message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content=response_text,
+                            token_count=token_count,
+                            processing_time_ms=processing_time,
+                            metadata={"enable_thinking": enable_thinking}
+                        )
+                        print(f"💾 Saved assistant response for {conversation_id}:{message_index + 1}")
+                    except Exception as db_error:
+                        print(f"⚠️ Failed to save assistant message to database: {db_error}")
+
+        except Exception as e:
+            print(f"❌ Model generation error: {e}")
+            await self._placeholder_response(websocket, message_index)
 
             elapsed = time.time() - start_time
             print(f"🏁 Completion finished for {conversation_id}:{message_index + 1} in {elapsed:.2f}s")
@@ -130,7 +201,8 @@ class ModelInterface:
             })
 
     async def _generate_with_model(self, websocket, model_version: ModelVersion,
-                                 conversation_history: List[Dict[str, str]], message_index: int):
+                                 conversation_history: List[Dict[str, str]], message_index: int,
+                                 enable_thinking: bool = True):
         """Generate response using the specified model with proper chat formatting"""
         if not MODELS_AVAILABLE:
             # Fallback placeholder response
@@ -139,9 +211,9 @@ class ModelInterface:
             return
 
         try:
-            print(f"🔄 Formatting conversation with chat template")
+            print(f"🔄 Formatting conversation with chat template (thinking: {enable_thinking})")
             # Format conversation using chat template
-            formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history)
+            formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history, enable_thinking)
 
             # Use pipeline for generation
             if model_version.pipeline:
@@ -221,16 +293,17 @@ class ModelInterface:
             "processing_time_ms": 1000
         })
 
-    def _format_chat_conversation(self, tokenizer, conversation_history: List[Dict[str, str]]) -> str:
+    def _format_chat_conversation(self, tokenizer, conversation_history: List[Dict[str, str]], enable_thinking: bool = True) -> str:
         """Format conversation history using chat template"""
         try:
             # Use tokenizer's apply_chat_template if available (transformers >= 4.34)
             if hasattr(tokenizer, 'apply_chat_template'):
-                print(f"📝 Using chat template with {len(conversation_history)} messages")
+                print(f"📝 Using chat template with {len(conversation_history)} messages (thinking: {enable_thinking})")
                 return tokenizer.apply_chat_template(
                     conversation_history,
                     tokenize=False,
-                    add_generation_prompt=True
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking  # Pass thinking parameter to template
                 )
             else:
                 # Fallback to manual formatting for older transformers
