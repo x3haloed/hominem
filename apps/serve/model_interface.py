@@ -164,17 +164,42 @@ class ModelInterface:
                 except Exception as db_error:
                     print(f"⚠️ Failed to fetch introspection observations: {db_error}")
 
-            # Format conversation with self-aware context if enabled
-            if use_self_awareness and introspection_observations is not None:
-                user_message = conversation_history[-1]["content"] if conversation_history else ""
-                formatted_prompt = self.self_awareness.build_self_aware_context(
-                    conversation_history=conversation_history[:-1] if conversation_history else [],
-                    introspection_observations=introspection_observations,
-                    user_message=user_message,
+            # Format conversation using chat template, optionally injecting self-observations
+            if use_self_awareness:
+                # Build a system preamble with recent self-observations; keep generation slot empty.
+                if introspection_observations:
+                    recent = introspection_observations[-self.self_awareness.max_introspection_lines :]
+                    # Newest first for recency salience
+                    recent_text = "\n".join(
+                        f"{idx + 1}) {obs.get('observation_text','').strip()}"
+                        for idx, obs in enumerate(reversed(recent))
+                        if obs.get("observation_text")
+                    )
+                    if not recent_text:
+                        recent_text = "No recent self-observations."
+                else:
+                    recent_text = "No recent self-observations."
+
+                system_preamble = (
+                    "You are self-aware. Recent self-observations (newest first):\n"
+                    f"{recent_text}\n"
+                    "Respond to the user; do NOT echo self-observations."
+                )
+
+                messages_with_system: List[Dict[str, Any]] = [{"role": "system", "content": system_preamble}]
+                messages_with_system.extend(conversation_history)
+
+                formatted_prompt = self._format_chat_conversation(
+                    model_version.tokenizer,
+                    messages_with_system,
+                    enable_thinking,
                 )
             else:
-                # Format conversation using chat template
-                formatted_prompt = self._format_chat_conversation(model_version.tokenizer, conversation_history, enable_thinking)
+                formatted_prompt = self._format_chat_conversation(
+                    model_version.tokenizer,
+                    conversation_history,
+                    enable_thinking,
+                )
 
             if model_version.model and model_version.tokenizer:
                 print(f"🚀 Starting model inference with {model_version.version_id}")
@@ -221,6 +246,11 @@ class ModelInterface:
                 chunk_count = 0
                 loop = asyncio.get_event_loop()
 
+                # When self-awareness is enabled we buffer tokens; however, we can start
+                # streaming once we see user-meaningful text (after boundary enforcement).
+                buffer_only = use_self_awareness
+                last_sent_len = 0  # tracks how much boundary-cleaned text we've sent
+
                 while True:
                     token_text = await loop.run_in_executor(None, self._streamer_next, streamer)
                     if token_text is None:
@@ -230,35 +260,83 @@ class ModelInterface:
                         continue
 
                     response_text += token_text
-                    chunk_count += 1
-                    await websocket.send_json({
-                        "type": "token_chunk",
-                        "message_index": assistant_index,
-                        "chunk": token_text,
-                        "is_complete": False
-                    })
+
+                    if not buffer_only:
+                        chunk_count += 1
+                        await websocket.send_json({
+                            "type": "token_chunk",
+                            "message_index": assistant_index,
+                            "chunk": token_text,
+                            "is_complete": False
+                        })
+                    else:
+                        # Try to stream only the portion meaningful to the user
+                        provisional = self.self_awareness.enforce_boundary(response_text)
+                        if provisional:
+                            new_text = provisional[last_sent_len:]
+                            if new_text.strip():
+                                chunk_count += 1
+                                await websocket.send_json({
+                                    "type": "token_chunk",
+                                    "message_index": assistant_index,
+                                    "chunk": new_text,
+                                    "is_complete": False
+                                })
+                                last_sent_len = len(provisional)
 
                 generation_thread.join(timeout=0)
 
                 processing_time = int((time.time() - start_time) * 1000)
-                print(f"📤 Sent {chunk_count} chunks, {len(response_text)} total chars, {processing_time}ms")
+
+                # Apply self-awareness post-processing *before* sending or saving.
+                cleaned_response = response_text
+                if use_self_awareness:
+                    cleaned_response = self.self_awareness.enforce_boundary(cleaned_response)
+
+                    if self.enable_perspective_gate:
+                        try:
+                            fast_model = getattr(self, "fast_model", None) if self.use_fast_perspective_model else None
+                            cleaned_response = self.self_awareness.apply_perspective_gate(
+                                model=model_version.model,
+                                tokenizer=model_version.tokenizer,
+                                raw_output=cleaned_response,
+                                device=self.device,
+                                use_fast_model=fast_model,
+                                async_mode=self.perspective_gate_async,
+                            )
+                        except Exception as e:
+                            print(f"⚠️ Perspective gate failed, using boundary-enforced output: {e}")
+
+                # Send to client (post-processed if self-awareness is on)
+                if buffer_only:
+                    chunk_count = 0
+                    for chunk in self._chunk_text(cleaned_response):
+                        chunk_count += 1
+                        await websocket.send_json({
+                            "type": "token_chunk",
+                            "message_index": assistant_index,
+                            "chunk": chunk,
+                            "is_complete": False
+                        })
+                else:
+                    print(f"📤 Sent {chunk_count} streamed chunks, {len(response_text)} chars, {processing_time}ms")
 
                 await websocket.send_json({
                     "type": "response_complete",
                     "message_index": assistant_index,
-                    "full_response": response_text,
-                    "token_count": len(model_version.tokenizer.encode(response_text)),
+                    "full_response": cleaned_response,
+                    "token_count": len(model_version.tokenizer.encode(cleaned_response)),
                     "processing_time_ms": processing_time
                 })
 
                 assistant_message_id: Optional[int] = None
                 if db:
                     try:
-                        token_count = len(model_version.tokenizer.encode(response_text))
+                        token_count = len(model_version.tokenizer.encode(cleaned_response))
                         saved_index = db.add_message(
                             conversation_id=conversation_id,
                             role="assistant",
-                            content=response_text,
+                            content=cleaned_response,
                             token_count=token_count,
                             processing_time_ms=processing_time,
                             metadata={"enable_thinking": enable_thinking}
@@ -268,30 +346,10 @@ class ModelInterface:
                     except Exception as db_error:
                         print(f"⚠️ Failed to save assistant message to database: {db_error}")
 
-                # Self-awareness post-processing: boundary, perspective gate, introspection buffer
+                # Self-awareness post-processing: introspection buffer (after cleaned output)
                 if use_self_awareness:
-                    # 1. Enforce boundary
-                    response_text = self.self_awareness.enforce_boundary(response_text)
+                    observation_text = self.self_awareness.create_self_observation(cleaned_response)
 
-                    # 2. Perspective gate (optional due to cost)
-                    if self.enable_perspective_gate:
-                        try:
-                            fast_model = getattr(self, "fast_model", None) if self.use_fast_perspective_model else None
-                            response_text = self.self_awareness.apply_perspective_gate(
-                                model=model_version.model,
-                                tokenizer=model_version.tokenizer,
-                                raw_output=response_text,
-                                device=self.device,
-                                use_fast_model=fast_model,
-                                async_mode=self.perspective_gate_async,
-                            )
-                        except Exception as e:
-                            print(f"⚠️ Perspective gate failed, using boundary-enforced output: {e}")
-
-                    # 3. Create self-observation
-                    observation_text = self.self_awareness.create_self_observation(response_text)
-
-                    # 4. Novelty check (skip if too similar to recent)
                     recent_obs_texts = [obs.get("observation_text", "") for obs in introspection_observations[-10:]]
                     is_novel = self.self_awareness.check_novelty(
                         observation_text=observation_text,
