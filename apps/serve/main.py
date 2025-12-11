@@ -339,6 +339,13 @@ class MessageRequest(BaseModel):
     content: str
     metadata: Optional[Dict[str, Any]] = None
 
+class CompletionRequest(BaseModel):
+    conversation_id: str
+    content: str
+    enable_thinking: bool = True
+    metadata: Optional[Dict[str, Any]] = None
+    enable_self_awareness: Optional[bool] = None
+
 class EmotionLabel(BaseModel):
     valence: Optional[float] = None  # -2 to +2
     arousal: Optional[float] = None  # 0 to 1
@@ -404,6 +411,64 @@ async def send_message(request: MessageRequest):
             "message_index": message_index,
             "status": "processing"
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/complete")
+async def complete(request: CompletionRequest):
+    """
+    Synchronous completion endpoint:
+    - persists the user message to DB
+    - generates the assistant reply (waiting for full completion)
+    - runs emotion labeling and persists labels
+    - returns the assistant reply
+    """
+    try:
+        if db is None or model is None:
+            raise HTTPException(status_code=500, detail="Server not initialized")
+
+        # Persist the user message first (same as WebSocket flow)
+        try:
+            user_message_index = db.add_message(
+                conversation_id=request.conversation_id,
+                role="user",
+                content=request.content,
+                metadata={**(request.metadata or {}), "enable_thinking": request.enable_thinking},
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        conversation_data = db.get_conversation(request.conversation_id)
+        if not conversation_data or "messages" not in conversation_data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Convert to chat template format
+        conversation_history = [
+            {"role": msg["role"], "content": msg["content"], "enable_thinking": request.enable_thinking}
+            for msg in conversation_data["messages"]
+        ]
+
+        assistant_response = await model.generate_streaming_response(
+            websocket=None,
+            conversation_id=request.conversation_id,
+            message_index=user_message_index,
+            conversation_history=conversation_history,
+            enable_thinking=request.enable_thinking,
+            db=db,
+            enable_self_awareness=request.enable_self_awareness,
+        )
+
+        if not assistant_response:
+            raise HTTPException(status_code=500, detail="Completion failed")
+
+        return {
+            "conversation_id": request.conversation_id,
+            "user_message_index": user_message_index,
+            "assistant_message_index": user_message_index + 1,
+            "assistant_response": assistant_response,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
