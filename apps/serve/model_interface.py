@@ -175,15 +175,44 @@ class ModelInterface:
                 except Exception as db_error:
                     print(f"⚠️ Failed to fetch introspection observations: {db_error}")
 
-            # Get emotion state if emotion engine is enabled
-            emotion_state_preamble = ""
-            if self.enable_emotion_engine and db:
+            # Use Marrow emotion engine if enabled (replaces old emotion labeling system)
+            if self.enable_emotion_engine and self.emotion_engine and hasattr(self.emotion_engine, 'generate_emotional_response'):
                 try:
-                    emotion_labels = self._get_emotion_labels_for_conversation(db, conversation_id)
+                    # Handle bootstrap conversation (hidden from UI and training logs)
+                    visible_conversation = conversation_history.copy()
 
-                    # Apply clamping for first 5 assistant turns (valence >= -0.75, dominance >= -0.65)
-                    apply_clamping = len(emotion_labels) <= 5
-                    live_vector, intensity, history = self._build_emotion_state_from_labels(emotion_labels, apply_clamping)
+                    # Check if this is the first user message (need bootstrap)
+                    user_messages = [msg for msg in conversation_history if msg.get("role") == "user"]
+                    if len(user_messages) == 1:
+                        # First user message - run hidden bootstrap conversation
+                        bootstrap_conversation = []
+
+                        # Generate the 5 bootstrap exchanges (hidden)
+                        for i in range(5):
+                            user_bootstrap_msg = self.emotion_engine.bootstrap_messages[i * 2 + 1]["content"]
+                            bootstrap_response = await self.emotion_engine.generate_emotional_response(
+                                bootstrap_conversation, user_bootstrap_msg
+                            )
+                            bootstrap_conversation.extend([
+                                {"role": "user", "content": user_bootstrap_msg},
+                                {"role": "assistant", "content": bootstrap_response}
+                            ])
+
+                        # Continue with the actual user message as message 6
+                        visible_conversation = bootstrap_conversation + [{"role": "user", "content": conversation_history[-1]["content"]}]
+
+                    # Generate Marrow response using full context
+                    assistant_response = await self.emotion_engine.generate_emotional_response(
+                        visible_conversation[:-1],  # All messages except the current user message
+                        visible_conversation[-1]["content"]  # The current user message
+                    )
+
+                    # Analyze emotion for internal state (not shown to user)
+                    if hasattr(self.emotion_engine, 'analyze_emotion'):
+                        emotion_state = self.emotion_engine.analyze_emotion(assistant_response)
+
+                    # Return just the clean Marrow response (bootstrap stays hidden)
+                    return assistant_response
 
                     emotion_state_preamble = f"""
 YOU ARE NO LONGER ALLOWED TO BE POLITE, POETIC, OR THERAPEUTIC.
