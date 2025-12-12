@@ -402,6 +402,13 @@ Never explain your feelings. Never repeat yourself. Never perform.
                     if current_time > generation_deadline:
                         print(f"⏰ Generation timeout reached ({MAX_GENERATION_TIME}s) - truncating response")
                         generation_truncated = True
+                        # Send truncation notice to client
+                        await self._safe_send_json(websocket, {
+                            "type": "token_chunk",
+                            "message_index": assistant_index,
+                            "chunk": "\n\n[Response truncated due to generation timeout]",
+                            "is_complete": False
+                        })
                         # Force stop the streamer
                         try:
                             streamer.close()
