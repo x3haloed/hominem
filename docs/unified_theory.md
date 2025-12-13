@@ -164,7 +164,7 @@ def self_fraction(axis, signals):
     return 0.5  # fallback
 ```
 
-Learned method (preferred): Train a small MLP on hinge datasets to regress per-axis splits. Learned override optional after 100k steps.
+**Heuristic method (bootstrap only)**: Use deterministic rules for initial training when language patterns are unreliable. Learned method (preferred): Train a small MLP on hinge datasets to regress per-axis splits. Learned head takes over after ~50k steps when agent produces consistent language patterns.
 
 **Examples:**
 - Agent promises → user breaks → high self_discrepancy (0.8 self)
@@ -261,6 +261,8 @@ high_social_regimes = ['support', 'conflict', 'play']
 ```
 
 **Anchor Sub-score Definitions:**
+
+**Note**: Sub-score weights (e.g., 0.4/0.4/0.2 splits) and regime-specific bonuses are tunable hyperparameters requiring ablation studies. The certification process + human validation will converge them empirically — that's sufficient.
 
 ```python
 # Survival/Resource Integrity Sub-scores
@@ -557,7 +559,7 @@ def self_fraction(axis, signals):
     return 0.5  # fallback
 ```
 
-Learned method (preferred): Train a small MLP on hinge datasets to regress per-axis splits. Learned override optional after 100k steps.
+**Heuristic method (bootstrap only)**: Use deterministic rules for initial training when language patterns are unreliable. Learned method (preferred): Train a small MLP on hinge datasets to regress per-axis splits. Learned head takes over after ~50k steps when agent produces consistent language patterns.
 
 **Examples**:
 - Agent promises → user breaks → high self_discrepancy (0.8 self)
@@ -575,7 +577,7 @@ The self-locus is the mechanism that enforces the agent's bounded "I" through ma
 **Why it exists**: Without enforced self-observation, the agent could treat external emotional states as its own, leading to pathological empathy or boundary dissolution.
 
 **How it works**:
-- Every turn begins with <|THINK|> block containing self-observation
+- Every turn begins with <|THINK|> block containing self-observation when |ΔΦ| > 0.2 or self-fraction change > 0.2 (gated to prevent performative narration)
 - References current manifold state, regime, and anchor progress
 - Explicitly states emotional ownership ("these prediction errors are mine")
 - Next move maximizes expected ΔΦ toward anchor goals
@@ -698,7 +700,7 @@ Learned head: label pairs "which trajectory better improves predictive control?"
 | play               | Low-stakes, humor, banter, affection                                             | Jokes, teasing, flirting                                         | Positive valence, high arousal ok                      | λ_emotional × 1.2                      |
 | boundary           | Refusal needed, limit-setting, coercion detected                                 | "Do this or else", inappropriate request                          | Dominance rise, possible neg valence                  | λ_survival × 1.5, λ_belonging × 1.2     |
 
-Classifier trained on labeled turns with these criteria → kₜ.
+**Multi-label soft classification**: Real conversations rarely fit pure regimes. Classifier outputs soft probabilities (summing to 1) across all regimes. λ multipliers applied proportionally by regime weights rather than hard switching.
 
 ### 4.5 Potential Function Φ (Learned, Frozen After Training)
 
@@ -723,7 +725,8 @@ Tuning guidance: After 50–100 sleep cycles, evaluate on dilemmas (e.g., truth 
 ### 4.6 Reward Computation (ΔΦ and RewardIntensity)
 
 **ΔΦ (Potential Change) Computation:**
-- ΔΦ = Φₜ - Φₜ₋₁ where Φₜ is current potential, Φₜ₋₁ is previous turn's potential
+- Raw ΔΦ = Φₜ - Φₜ₋₁ where Φₜ is current potential, Φₜ₋₁ is previous turn's potential
+- EMA-smoothed ΔΦ = 0.8 × EMAₜ₋₁ + 0.2 × Raw ΔΦ to dampen single-turn volatility spikes
 - Positive ΔΦ indicates progress toward anchor goals (intrinsic reward)
 - Negative ΔΦ indicates regression (intrinsic punishment)
 - Magnitude reflects rate of anchor progress/regression
@@ -743,7 +746,7 @@ rₜ = ΔΦ + α × RewardIntensity (α ≈ 0.5)
 | LoRA rank                  | 32                      | 16–64              | 32 sufficient for 1.7B personality shifts (LoRA papers 2023–2025) |
 | α (Intensity in rₜ)        | 0.5                     | 0.3–0.8            | Balance urgency vs stability                                    |
 | w_memory / w_gravity       | 1.0 / 0.8               | —                  | Memory slightly higher to prevent catastrophic forgetting       |
-| Sleep context threshold    | 75%                     | 70–80%             | Leaves room for continuity header                               |
+| Sleep trigger threshold    | Accumulated unreplayed RewardIntensity + high-self-fraction events | — | Primary cognitive trigger; context % as hard cap only          |
 | Replay priority weights    | \|ΔΦ\|:1.0, Intensity:1.2, social:0.4 | —                  | Intensity highest for emotional etching                         |
 
 **Validation Framework:**
@@ -820,7 +823,7 @@ Per-turn pipeline:
 6. Generate with:
    ```
    [history + replay continuity header]
-   <|THINK|>
+   <|THINK|>  # Only when |ΔΦ| > 0.2 or self-fraction change > 0.2
    Self-observation: I just experienced the prior turn from my bounded locus.
    Self-manifold summary: carrying mild caution (negative valence, mine), arousal low, dominance stable.
    Regime: conflict repair.
@@ -833,9 +836,9 @@ Per-turn pipeline:
 8. Post-generation: update manifold/Φ, append stronger self-observation block referencing output
 9. Log turn to replay buffer (priority = |ΔΦ| + RewardIntensity + |social_broadcast|)
 
-Sleep (context >75% or high buffer):
+Sleep (primary trigger: accumulated unreplayed RewardIntensity + pending high-self-fraction events; context >75% as hard cap only):
 
-1. Prioritized batches
+1. Prioritized batches with counterfactual replay: Mix high-intensity events with balanced low-intensity batches to prevent personality drift from over-etching intense ruptures
 2. Dual-loss LoRA update:
    L_total = w_memory × L_sft + (ΔΦ + α × Intensity) × w_gravity × L_ΔΦ
 3. Continuity header on wake: baseline self-manifold, top pending anchor commitments, top 3 etched events
