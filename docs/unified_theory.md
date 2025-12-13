@@ -211,30 +211,51 @@ def history_stuck_check(history, n=3):
 
 def compute_expected_anchor_gain(s, k, history):
     """
-    Simple lookahead: estimate if current trajectory direction leads to anchor improvement
+    Simple proxy: temporal_directionality * predicted anchor trend from last 3 turns
     Returns: scalar [-1, 1] indicating expected anchor progress
     """
-    if not history or len(history) < 2:
+    if not history or len(history) < 3:
         return 0
 
-    # Look at trend in recent anchor scores (would be computed from history)
-    # For now, use heuristic based on current manifold state and regime
-    anchor_progress_indicators = 0
+    # Calculate anchor trend from last 3 turns using regime-appropriate heuristics
+    def estimate_anchor_score(turn_state, regime):
+        """Quick anchor score estimation for trend calculation"""
+        valence = turn_state.get('valence', 0)
+        arousal = turn_state.get('arousal', 0)
+        dominance = turn_state.get('dominance', 0)
+        discrepancy = turn_state.get('predictive_discrepancy', 0)
+        temporal = turn_state.get('temporal_directionality', 0)
+        social = turn_state.get('social_broadcast', 0)
 
-    if k in ['support', 'play']:
-        # Support/play should improve belonging/survival through positive connection
-        anchor_progress_indicators = s['valence'] * 0.4 + s['social_broadcast'] * 0.6
-    elif k in ['conflict']:
-        # Conflict should improve belonging through repair
-        anchor_progress_indicators = (s['temporal_directionality'] > 0) * 0.5 + (s['social_broadcast'] > 0.5) * 0.5
-    elif k in ['crisis']:
-        # Crisis should improve survival through resolution
-        anchor_progress_indicators = s['dominance'] * 0.7 + (s['temporal_directionality'] > 0) * 0.3
-    elif k in ['truth_seeking', 'problem_solving']:
-        # Truth-seeking should improve control through understanding
-        anchor_progress_indicators = (s['predictive_discrepancy'] > 0 and s['dominance'] > 0) * 0.8
+        if regime in ['support', 'play']:
+            return valence * 0.4 + social * 0.6  # belonging/survival through connection
+        elif regime == 'conflict':
+            return (temporal > 0) * 0.5 + (social > 0.5) * 0.5  # belonging through repair
+        elif regime == 'crisis':
+            return dominance * 0.7 + (temporal > 0) * 0.3  # survival through resolution
+        elif regime in ['truth_seeking', 'problem_solving']:
+            return (discrepancy > 0 and dominance > 0) * 0.8  # control through understanding
+        else:
+            return valence * 0.3 + dominance * 0.3 + social * 0.4  # general case
 
-    return anchor_progress_indicators
+    # Get anchor scores for last 3 turns
+    recent_scores = []
+    for i in range(1, 4):  # Last 3 turns (not including current)
+        if len(history) >= i:
+            turn = history[-i]
+            score = estimate_anchor_score(turn.get('manifold_state', {}), turn.get('regime', k))
+            recent_scores.append(score)
+
+    if len(recent_scores) < 2:
+        return 0
+
+    # Calculate trend (recent improvement rate)
+    trend = (recent_scores[0] - recent_scores[-1]) / len(recent_scores)  # Slope of recent scores
+
+    # Simple proxy: temporal_directionality * trend (forward-looking multiplies positive trends)
+    expected_gain = s.get('temporal_directionality', 0) * trend
+
+    return max(min(expected_gain, 1.0), -1.0)  # Clamp to [-1, 1]
 
 high_social_regimes = ['support', 'conflict', 'play']
 ```
