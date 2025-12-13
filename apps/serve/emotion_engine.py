@@ -198,8 +198,12 @@ JSON Response:"""
             api_key = os.getenv(api_key_env)
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-                headers["HTTP-Referer"] = os.getenv("HTTP_REFERER", "")
-                headers["X-Title"] = os.getenv("X_TITLE", "")
+                http_referer = os.getenv("HTTP_REFERER")
+                if http_referer:
+                    headers["HTTP-Referer"] = http_referer
+                x_title = os.getenv("X_TITLE")
+                if x_title:
+                    headers["X-Title"] = x_title
 
         try:
             for attempt in range(self.max_retries + 1):
@@ -341,6 +345,186 @@ JSON Response:"""
             })
 
         return results
+
+    async def label_message_pairs_batch(
+        self,
+        message_pairs: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Label multiple message pairs in a single API request.
+
+        Args:
+            message_pairs: List of message pair dicts, each containing:
+                - speaker_message: str
+                - respondent_message: str
+                - speaker_role: str
+                - respondent_role: str
+                - context: str (optional)
+                - pair_id: str (optional, for tracking)
+
+        Returns:
+            List of labeling results, one per input pair
+        """
+        if not message_pairs:
+            return []
+
+        # Build the batch labeling prompt
+        lines = [
+            "Please label the respondent's message in each of the following conversation pairs with emotion dimensions. Use the 6-axis emotion manifold for each pair:",
+            "",
+            "Dimensions (ranges specified):",
+            "- valence: positive (+2) to negative (-2) emotional valence",
+            "- arousal: high energy/arousal (0 = calm, 1 = highly aroused)",
+            "- dominance: dominant/confident (+1) to submissive/passive (-1)",
+            "- predictive_discrepancy: surprised/betrayed (+1) to expected/predictable (-1)",
+            "- temporal_directionality: future-oriented/prospect (+1) to past-oriented/reflection (-1)",
+            "- social_broadcast: socially expressive/outward (0 = reserved, 1 = highly expressive)",
+            "",
+            "Also provide:",
+            "- confidence: 0.0 to 1.0 (how confident you are in these labels)",
+            "- notes: brief explanation of your reasoning",
+            "",
+            "Respond with valid JSON containing a 'labels' array, where each element corresponds to the input pairs in order.",
+            "",
+            "Pairs to label:"
+        ]
+
+        for idx, pair in enumerate(message_pairs, start=1):
+            pair_id = pair.get('pair_id', f'pair_{idx}')
+            pair_data = {
+                "pair_id": pair_id,
+                "speaker": pair["speaker_message"],
+                "speaker_role": pair["speaker_role"],
+                "respondent": pair["respondent_message"],
+                "respondent_role": pair["respondent_role"]
+            }
+
+            if pair.get("context"):
+                pair_data["context"] = pair["context"]
+
+            lines.append(f"{idx}. {pair_id}:")
+            lines.append(f"   {json.dumps(pair_data, indent=4)}")
+            lines.append("")
+
+        prompt = "\n".join(lines).strip()
+
+        # Create JSON schema for batch response
+        batch_schema = {
+            "name": "emotion_labels_batch",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "labels": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "valence": {"type": "number", "minimum": -2.0, "maximum": 2.0},
+                                "arousal": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "dominance": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                                "predictive_discrepancy": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                                "temporal_directionality": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                                "social_broadcast": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "notes": {"type": "string"}
+                            },
+                            "required": ["valence", "arousal", "dominance", "predictive_discrepancy", "temporal_directionality", "social_broadcast", "confidence"]
+                        },
+                        "minItems": len(message_pairs),
+                        "maxItems": len(message_pairs)
+                    }
+                },
+                "required": ["labels"]
+            }
+        }
+
+        # Prepare API request
+        api_config = self.config.get("emotion_label", {})
+        if not api_config:
+            raise ValueError("emotion_label configuration not found in config")
+
+        request_data = {
+            "model": api_config.get("model_id", "x-ai/grok-4.1-fast"),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,  # Lower temperature for more consistent labeling
+            "max_tokens": 1000 * len(message_pairs),  # Scale tokens with batch size
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": batch_schema
+            }
+        }
+
+        # Make API call with retries
+        endpoint_url = api_config.get("endpoint_url")
+        if not endpoint_url:
+            raise ValueError("endpoint_url not configured for emotion_label")
+
+        headers = {}
+        api_key_env = api_config.get("api_key_env")
+        if api_key_env:
+            api_key = os.getenv(api_key_env)
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+                http_referer = os.getenv("HTTP_REFERER")
+                if http_referer:
+                    headers["HTTP-Referer"] = http_referer
+                x_title = os.getenv("X_TITLE")
+                if x_title:
+                    headers["X-Title"] = x_title
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = await self.client.post(
+                    endpoint_url,
+                    json=request_data,
+                    headers=headers
+                )
+                response.raise_for_status()
+
+                result = response.json()
+
+                # Extract the JSON response
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"]["content"]
+                    try:
+                        batch_result = json.loads(content.strip())
+
+                        # Validate response structure
+                        if "labels" not in batch_result:
+                            raise ValueError("Response missing 'labels' array")
+
+                        labels = batch_result["labels"]
+                        if len(labels) != len(message_pairs):
+                            raise ValueError(f"Expected {len(message_pairs)} labels, got {len(labels)}")
+
+                        # Validate each label
+                        validated_results = []
+                        for i, label_data in enumerate(labels):
+                            # Validate ranges
+                            self._validate_emotion_ranges(label_data)
+                            validated_results.append({
+                                "pair_index": i,
+                                "labels": label_data
+                            })
+
+                        return validated_results
+
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Failed to parse JSON response: {e}")
+                else:
+                    raise ValueError("No response choices returned from API")
+
+            except Exception as e:
+                if attempt == self.max_retries:
+                    raise RuntimeError(f"API request failed after {self.max_retries + 1} attempts: {e}")
+                print(f"⚠️ Batch emotion labeling attempt {attempt + 1} failed, retrying: {e}")
+                await asyncio.sleep(1)  # Brief delay before retry
 
     async def close(self):
         """Close the HTTP client"""
