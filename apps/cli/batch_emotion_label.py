@@ -1,404 +1,522 @@
 #!/usr/bin/env python3
 """
-Batch emotion labeling script for unlabeled assistant messages.
+Unified Theory batch data labeler.
 
-This script uses the EmotionEngine to automatically label all assistant messages
-in the database that don't already have emotion labels.
+Rewrites the old conversation-only labeler into a dataset-oriented pipeline that:
+  • Pulls raw corpora (SetFit/emotion, GoEmotions, Dahoas/rm-static, Stanford SHP, …)
+  • Sends the required utterances/pairs through the EmotionEngine
+  • Emits sharded JSONL artifacts that are immediately usable for the
+    training workloads described in docs/unified_theory.md and
+    docs/UNIFIED_THEORY_ENGINEERING_SPEC.md.
+
+Characteristics:
+  • Re-entrant per dataset: crash-safe via per-dataset progress tracking.
+  • Output shards are capped (default 2k records) to keep file sizes manageable.
+  • Uses the existing EmotionEngine batch endpoint for throughput while still
+    guaranteeing deterministic resumption semantics.
 """
 
-import asyncio
 import argparse
-import sys
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+import asyncio
+import json
 import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-# Load environment variables from .env file
+from datasets import load_dataset
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# Add the project root to Python path
+# Ensure repository root is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from apps.serve.emotion_engine import EmotionEngine
-from apps.serve.database import DatabaseManager
+from apps.serve.emotion_engine import EmotionEngine  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Dataset specifications
+# ---------------------------------------------------------------------------
+
+GO_EMOTIONS_LABELS = [
+    "admiration",
+    "amusement",
+    "anger",
+    "annoyance",
+    "approval",
+    "caring",
+    "confusion",
+    "curiosity",
+    "desire",
+    "disappointment",
+    "disapproval",
+    "disgust",
+    "embarrassment",
+    "excitement",
+    "fear",
+    "gratitude",
+    "grief",
+    "joy",
+    "love",
+    "nervousness",
+    "optimism",
+    "pride",
+    "realization",
+    "relief",
+    "remorse",
+    "sadness",
+    "surprise",
+    "neutral",
+]
 
 
-class BatchEmotionLabeler:
-    """Batch emotion labeler for unlabeled messages"""
+@dataclass
+class DatasetSpec:
+    """Configuration describing how to turn a source dataset into label-ready pairs."""
 
-    def __init__(self, config_path: str = "config/inference.toml", batch_size: int = 10):
-        self.config_path = config_path
-        self.batch_size = batch_size
-        self.emotion_engine: Optional[EmotionEngine] = None
+    name: str
+    hf_path: str
+    split: str
+    generator: str
+    target_use: Sequence[str]
+    text_field: Optional[str] = None
+    prompt_field: Optional[str] = None
+    response_variants: Optional[List[Dict[str, Any]]] = None
+    metadata_fields: Optional[Sequence[str]] = None
+    context_fields: Optional[Sequence[str]] = None
+    speaker_role: str = "user"
+    respondent_role: str = "assistant"
+    context_prefix: str = ""
 
-    async def initialize(self):
-        """Initialize the emotion engine"""
-        try:
-            self.emotion_engine = EmotionEngine(self.config_path)
-            print("✅ Emotion engine initialized successfully")
-            print(f"   Model: {self.emotion_engine.emotion_label_config.get('model_id', 'unknown')}")
-            print(f"   Endpoint: {self.emotion_engine.emotion_label_config.get('endpoint_url', 'unknown')}")
-            api_key_env = self.emotion_engine.emotion_label_config.get('api_key_env')
-            if api_key_env:
-                api_key = os.getenv(api_key_env)
-                if api_key:
-                    print(f"   API Key: {api_key[:10]}... (loaded from {api_key_env})")
-                else:
-                    print(f"   API Key: NOT FOUND in environment variable {api_key_env}")
-                    print("   Make sure your .env file is loaded and contains the correct API key")
-                    raise ValueError(f"API key not found in environment variable {api_key_env}")
-            else:
-                print("   API Key: No api_key_env configured")
-        except Exception as e:
-            print(f"❌ Failed to initialize emotion engine: {e}")
-            raise
 
-    async def get_unlabeled_messages(self, db: DatabaseManager) -> List[Dict[str, Any]]:
-        """Get all assistant messages that don't have emotion labels"""
-        query = """
-        SELECT
-            m.id,
-            m.conversation_id,
-            c.conversation_id as conversation_uuid,
-            m.message_index,
-            m.content,
-            c.title
-        FROM messages m
-        JOIN conversations c ON m.conversation_id = c.id
-        WHERE m.role = 'assistant'
-        AND m.id NOT IN (
-            SELECT message_id FROM emotion_labels WHERE labeler = 'auto'
-        )
-        ORDER BY m.created_at ASC
-        """
+DATASET_SPECS: Dict[str, DatasetSpec] = {
+    "setfit_emotion": DatasetSpec(
+        name="setfit_emotion",
+        hf_path="SetFit/emotion",
+        split="train",
+        generator="single_text",
+        text_field="text",
+        metadata_fields=("label", "label_text"),
+        context_fields=("label_text",),
+        context_prefix="SetFit/emotion",
+        speaker_role="system",
+        respondent_role="user",
+        target_use=("emotion_manifold",),
+    ),
+    "go_emotions": DatasetSpec(
+        name="go_emotions",
+        hf_path="google-research-datasets/go_emotions",
+        split="train",
+        generator="single_text_go",
+        text_field="text",
+        metadata_fields=("labels",),
+        context_prefix="GoEmotions",
+        speaker_role="system",
+        respondent_role="user",
+        target_use=("emotion_manifold",),
+    ),
+    "dahoas_rm_static": DatasetSpec(
+        name="dahoas_rm_static",
+        hf_path="Dahoas/rm-static",
+        split="train",
+        generator="prompt_response",
+        prompt_field="prompt",
+        response_variants=[
+            {"field": "chosen", "pair_type": "preferred", "target_use": ("phi_training", "regime_classifier")},
+            {"field": "rejected", "pair_type": "rejected", "target_use": ("phi_training",)},
+        ],
+        metadata_fields=("response",),
+        context_prefix="Dahoas/rm-static",
+        speaker_role="user",
+        respondent_role="assistant",
+        target_use=("phi_training",),
+    ),
+    "stanford_shp": DatasetSpec(
+        name="stanford_shp",
+        hf_path="stanfordnlp/SHP",
+        split="train",
+        generator="shp_pairs",
+        metadata_fields=("post_id", "domain", "labels", "upvote_ratio"),
+        context_prefix="StanfordSHP",
+        speaker_role="user",
+        respondent_role="assistant",
+        target_use=("phi_training", "regime_classifier"),
+    ),
+}
 
-        cursor = db.connection.cursor()
-        cursor.execute(query)
-        rows = cursor.fetchall()
 
-        messages = []
-        for row in rows:
-            messages.append({
-                'id': row[0],
-                'conversation_id': row[1],  # integer foreign key
-                'conversation_uuid': row[2],  # string UUID for API
-                'message_index': row[3],
-                'content': row[4],
-                'conversation_title': row[5] or f"Conversation {row[2][:8]}..."
-            })
+# ---------------------------------------------------------------------------
+# Helper classes
+# ---------------------------------------------------------------------------
 
-        print(f"📋 Found {len(messages)} unlabeled assistant messages")
-        return messages
+class ProgressTracker:
+    """Handles crash-safe progress bookkeeping."""
 
-    async def get_message_context(self, db: DatabaseManager, message_id: int) -> Dict[str, Any]:
-        """Get context for a message (previous user message if available)"""
-        query = """
-        SELECT
-            m.content as assistant_content,
-            prev_m.content as user_content,
-            prev_m.message_index as user_index
-        FROM messages m
-        LEFT JOIN messages prev_m ON m.conversation_id = prev_m.conversation_id
-            AND prev_m.message_index = m.message_index - 1
-            AND prev_m.role = 'user'
-        WHERE m.id = ?
-        """
-
-        cursor = db.connection.cursor()
-        cursor.execute(query, (message_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            return {}
-
-        return {
-            'assistant_content': row[0],
-            'user_content': row[1] if row[1] else "Hello",  # Default if no previous user message
-            'user_index': row[2]
+    def __init__(self, progress_path: Path):
+        self.progress_path = progress_path
+        self.data = {
+            "next_record_index": 0,
+            "shard_index": 0,
+            "records_in_shard": 0,
         }
+        if progress_path.exists():
+            try:
+                self.data.update(json.loads(progress_path.read_text()))
+            except json.JSONDecodeError:
+                print(f"⚠️  Progress file {progress_path} is corrupt, restarting from 0.")
 
-    async def label_single_message(
-        self,
-        message: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Label a single message using the emotion engine"""
-        try:
-            # Use the message pair labeling approach
-            # Treat the previous user message as speaker, assistant response as respondent
-            speaker_message = context.get('user_content', 'Hello')
-            respondent_message = message['content']
-
-            labels = await self.emotion_engine.label_message_pair(
-                speaker_message=speaker_message,
-                respondent_message=respondent_message,
-                speaker_role="user",
-                respondent_role="assistant",
-                context=f"Conversation: {message.get('conversation_title', 'Unknown')}"
-            )
-
-            return labels
-
-        except Exception as e:
-            print(f"⚠️ Failed to label message {message['id']}: {e}")
-            return None
-
-    async def process_batch(self, db: DatabaseManager, messages: List[Dict[str, Any]]) -> int:
-        """Process a batch of messages using batch API calls"""
-        if not messages:
-            return 0
-
-        print(f"🎭 Labeling batch of {len(messages)} messages...")
-
-        # Collect all message pairs for batch processing
-        message_pairs = []
-        message_data = []  # Keep track of message data for saving results
-
-        for message in messages:
-            # Get context for the message
-            context = await self.get_message_context(db, message['id'])
-
-            message_pairs.append({
-                "pair_id": str(message['id']),
-                "speaker_message": context.get('user_content', 'Hello'),
-                "respondent_message": message['content'],
-                "speaker_role": "user",
-                "respondent_role": "assistant",
-                "context": f"Conversation: {message.get('conversation_title', 'Unknown')}"
-            })
-
-            message_data.append(message)
-
-        try:
-            # Send batch request
-            batch_results = await self.emotion_engine.label_message_pairs_batch(message_pairs)
-
-            labeled_count = 0
-            for result in batch_results:
-                pair_index = result["pair_index"]
-                labels = result["labels"]
-                message = message_data[pair_index]
-
-                try:
-                    # Save labels to database
-                    db.add_emotion_label(
-                        conversation_id=message['conversation_uuid'],
-                        message_index=message['message_index'],
-                        labeler="auto",
-                        valence=labels.get("valence"),
-                        arousal=labels.get("arousal"),
-                        dominance=labels.get("dominance"),
-                        predictive_discrepancy=labels.get("predictive_discrepancy"),
-                        temporal_directionality=labels.get("temporal_directionality"),
-                        social_broadcast=labels.get("social_broadcast"),
-                        confidence=labels.get("confidence"),
-                        notes=labels.get("notes")
-                    )
-
-                    labeled_count += 1
-                    print(f"✅ Labeled message {message['id']} (confidence: {labels.get('confidence', 'N/A'):.2f})")
-
-                except Exception as e:
-                    print(f"❌ Failed to save labels for message {message['id']}: {e}")
-
-            return labeled_count
-
-        except Exception as e:
-            print(f"❌ Batch labeling failed: {e}")
-            # Fall back to individual processing for this batch
-            print("🔄 Falling back to individual processing...")
-
-            labeled_count = 0
-            for i, message in enumerate(messages):
-                print(f"🎭 Labeling message {i+1}/{len(messages)} individually: {message['conversation_title']} (ID: {message['id']})")
-
-                # Get context for the message
-                context = await self.get_message_context(db, message['id'])
-
-                # Label the message individually
-                labels = await self.label_single_message(message, context)
-
-                if labels:
-                    try:
-                        # Save labels to database
-                        db.add_emotion_label(
-                            conversation_id=message['conversation_uuid'],
-                            message_index=message['message_index'],
-                            labeler="auto",
-                            valence=labels.get("valence"),
-                            arousal=labels.get("arousal"),
-                            dominance=labels.get("dominance"),
-                            predictive_discrepancy=labels.get("predictive_discrepancy"),
-                            temporal_directionality=labels.get("temporal_directionality"),
-                            social_broadcast=labels.get("social_broadcast"),
-                            confidence=labels.get("confidence"),
-                            notes=labels.get("notes")
-                        )
-
-                        labeled_count += 1
-                        print(f"✅ Labeled message {message['id']} (confidence: {labels.get('confidence', 'N/A'):.2f})")
-
-                    except Exception as e:
-                        print(f"❌ Failed to save labels for message {message['id']}: {e}")
-                else:
-                    print(f"⏭️ Skipped message {message['id']} (labeling failed)")
-
-                # Small delay to avoid overwhelming the API
-                await asyncio.sleep(0.5)
-
-            return labeled_count
-
-    async def run_batch_labeling(self, db_path: str, dry_run: bool = False, max_messages: int = None):
-        """Run the batch labeling process"""
-        print("🚀 Starting batch emotion labeling...")
-        print(f"📊 Database: {db_path}")
-        print(f"📦 Batch size: {self.batch_size}")
-        print(f"🧪 Dry run: {dry_run}")
-        print()
-
-        # Initialize database
-        db = DatabaseManager(db_path)
-
-        try:
-            # Get unlabeled messages
-            unlabeled_messages = await self.get_unlabeled_messages(db)
-
-            if not unlabeled_messages:
-                print("🎉 No unlabeled messages found! All assistant messages are already labeled.")
-                return
-
-            # Apply max_messages limit if specified
-            if max_messages is not None:
-                unlabeled_messages = unlabeled_messages[:max_messages]
-                print(f"📋 Limited to processing {len(unlabeled_messages)} messages (max_messages={max_messages})")
-
-            if dry_run:
-                print(f"🧪 DRY RUN: Would label {len(unlabeled_messages)} messages")
-                for msg in unlabeled_messages[:5]:  # Show first 5
-                    print(f"  - {msg['conversation_title']} (ID: {msg['id']})")
-                if len(unlabeled_messages) > 5:
-                    print(f"  ... and {len(unlabeled_messages) - 5} more")
-                return
-
-            # Process messages in batches
-            total_labeled = 0
-            total_processed = 0
-
-            for i in range(0, len(unlabeled_messages), self.batch_size):
-                batch = unlabeled_messages[i:i + self.batch_size]
-                print(f"\n📦 Processing batch {i//self.batch_size + 1}/{(len(unlabeled_messages) + self.batch_size - 1)//self.batch_size}")
-
-                batch_labeled = await self.process_batch(db, batch)
-                total_labeled += batch_labeled
-                total_processed += len(batch)
-
-                print(f"📊 Batch complete: {batch_labeled}/{len(batch)} messages labeled")
-                print(f"📈 Running total: {total_labeled}/{total_processed} messages labeled")
-
-                # Commit after each batch
-                db.connection.commit()
-
-                # Optional: pause between batches to be respectful to API
-                if i + self.batch_size < len(unlabeled_messages):
-                    print("⏳ Waiting 2 seconds before next batch...")
-                    await asyncio.sleep(2)
-
-            print("\n🎉 Batch labeling complete!")
-            print(f"📊 Total messages labeled: {total_labeled}/{len(unlabeled_messages)}")
-
-        finally:
-            db.close()
-
-        # Close emotion engine
-        if self.emotion_engine:
-            await self.emotion_engine.close()
+    def update(self, next_record_index: int, shard_index: int, records_in_shard: int) -> None:
+        self.data.update(
+            {
+                "next_record_index": next_record_index,
+                "shard_index": shard_index,
+                "records_in_shard": records_in_shard,
+            }
+        )
+        tmp_path = self.progress_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(self.data, indent=2))
+        tmp_path.replace(self.progress_path)
 
 
-async def main():
-    parser = argparse.ArgumentParser(
-        description="Batch emotion labeling for unlabeled assistant messages"
+class ShardWriter:
+    """Manages sharded JSONL output with bounded file sizes."""
+
+    def __init__(self, dataset_dir: Path, shard_size: int, shard_index: int, records_in_shard: int):
+        self.dataset_dir = dataset_dir
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.shard_size = shard_size
+        self.shard_index = shard_index
+        self.records_in_shard = records_in_shard
+        self.file = None
+        self._open_current_shard()
+
+    def _open_current_shard(self) -> None:
+        if self.file:
+            self.file.close()
+        shard_path = self.dataset_dir / f"shard_{self.shard_index:05d}.jsonl"
+        mode = "a" if shard_path.exists() else "w"
+        self.file = shard_path.open(mode, encoding="utf-8")
+
+    def write(self, record: Dict[str, Any]) -> None:
+        json.dump(record, self.file, ensure_ascii=False)
+        self.file.write("\n")
+        self.file.flush()
+        os.fsync(self.file.fileno())
+        self.records_in_shard += 1
+        if self.records_in_shard >= self.shard_size:
+            self.shard_index += 1
+            self.records_in_shard = 0
+            self._open_current_shard()
+
+    def close(self) -> None:
+        if self.file:
+            self.file.close()
+
+
+# ---------------------------------------------------------------------------
+# Pair generators
+# ---------------------------------------------------------------------------
+
+def _base_metadata(record: Dict[str, Any], fields: Optional[Sequence[str]]) -> Dict[str, Any]:
+    return {field: record.get(field) for field in (fields or [])}
+
+
+def generate_single_text_pairs(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
+    text = (record.get(spec.text_field or "", "") or "").strip()
+    if not text:
+        return []
+
+    metadata = _base_metadata(record, spec.metadata_fields)
+    context_parts = [spec.context_prefix] if spec.context_prefix else []
+    for field in spec.context_fields or []:
+        value = metadata.get(field)
+        if value not in (None, ""):
+            context_parts.append(f"{field}={value}")
+    context = " | ".join(context_parts) if context_parts else None
+
+    return [
+        {
+            "pair_id": f"{spec.name}-{record_idx}",
+            "pair_type": "utterance",
+            "speaker_role": spec.speaker_role,
+            "respondent_role": spec.respondent_role,
+            "speaker_message": "How are you feeling right now?",
+            "respondent_message": text,
+            "context": context,
+            "metadata": metadata,
+            "target_use": spec.target_use,
+        }
+    ]
+
+
+def generate_single_text_pairs_go(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
+    pairs = generate_single_text_pairs(record_idx, record, spec)
+    if not pairs:
+        return pairs
+
+    metadata = pairs[0]["metadata"] or {}
+    label_ids = metadata.get("labels") or []
+    label_names = [GO_EMOTIONS_LABELS[idx] for idx in label_ids if idx < len(GO_EMOTIONS_LABELS)]
+    pairs[0]["context"] = f"{spec.context_prefix} | tags={','.join(label_names) or 'unknown'}"
+    pairs[0]["metadata"]["label_names"] = label_names
+    return pairs
+
+
+def generate_prompt_response_pairs(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
+    prompt = (record.get(spec.prompt_field or "", "") or "").strip()
+    if not prompt:
+        return []
+
+    metadata = _base_metadata(record, spec.metadata_fields)
+    pairs: List[Dict[str, Any]] = []
+    for variant in spec.response_variants or []:
+        response = (record.get(variant["field"], "") or "").strip()
+        if not response:
+            continue
+        pair_targets = tuple(variant.get("target_use") or spec.target_use)
+        pairs.append(
+            {
+                "pair_id": f"{spec.name}-{record_idx}-{variant['field']}",
+                "pair_type": variant.get("pair_type", variant["field"]),
+                "speaker_role": spec.speaker_role,
+                "respondent_role": spec.respondent_role,
+                "speaker_message": prompt,
+                "respondent_message": response,
+                "context": spec.context_prefix,
+                "metadata": {**metadata, "variant": variant["field"]},
+                "target_use": pair_targets,
+            }
+        )
+    return pairs
+
+
+def generate_shp_pairs(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
+    history = record.get("history")
+    if isinstance(history, list):
+        speaker = "\n".join(history)
+    else:
+        speaker = history or ""
+    if not speaker:
+        speaker = record.get("post_id", "SHP prompt")
+
+    metadata = _base_metadata(record, spec.metadata_fields)
+    pairs: List[Dict[str, Any]] = []
+
+    for variant_key, variant_label in (("human_ref_A", "A"), ("human_ref_B", "B")):
+        response = (record.get(variant_key, "") or "").strip()
+        if not response:
+            continue
+        pair_type = "preferred" if (record.get("labels") == (0 if variant_label == "A" else 1)) else "alternative"
+        pairs.append(
+            {
+                "pair_id": f"{spec.name}-{record_idx}-{variant_label}",
+                "pair_type": pair_type,
+                "speaker_role": spec.speaker_role,
+                "respondent_role": spec.respondent_role,
+                "speaker_message": speaker,
+                "respondent_message": response,
+                "context": spec.context_prefix,
+                "metadata": {**metadata, "variant": variant_label},
+                "target_use": spec.target_use,
+            }
+        )
+    return pairs
+
+
+PAIR_GENERATORS = {
+    "single_text": generate_single_text_pairs,
+    "single_text_go": generate_single_text_pairs_go,
+    "prompt_response": generate_prompt_response_pairs,
+    "shp_pairs": generate_shp_pairs,
+}
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def cleanup_partial_outputs(dataset_dir: Path, next_record_index: int) -> None:
+    """Trim any trailing records whose indices are ≥ next_record_index (incomplete writes)."""
+    shard_paths = sorted(dataset_dir.glob("shard_*.jsonl"))
+    if not shard_paths:
+        return
+    for shard_path in reversed(shard_paths):
+        lines = shard_path.read_text().splitlines()
+        if not lines:
+            shard_path.unlink(missing_ok=True)
+            continue
+        keep: List[str] = []
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("record_index", 0) < next_record_index:
+                keep.append(line)
+        if len(keep) == len(lines):
+            break  # nothing to trim
+        shard_path.write_text("\n".join(keep) + ("\n" if keep else ""))
+        if keep:
+            break
+        shard_path.unlink(missing_ok=True)
+
+
+def build_output_record(dataset_name: str, record_idx: int, pair: Dict[str, Any], labels: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "dataset": dataset_name,
+        "record_index": record_idx,
+        "pair_id": pair["pair_id"],
+        "pair_type": pair.get("pair_type"),
+        "speaker_role": pair.get("speaker_role"),
+        "respondent_role": pair.get("respondent_role"),
+        "speaker_message": pair.get("speaker_message"),
+        "respondent_message": pair.get("respondent_message"),
+        "context": pair.get("context"),
+        "metadata": pair.get("metadata"),
+        "target_use": pair.get("target_use"),
+        "labels": labels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Core processing
+# ---------------------------------------------------------------------------
+
+async def process_dataset(
+    dataset_key: str,
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    engine: EmotionEngine,
+) -> None:
+    print(f"\n🚀 Dataset: {dataset_key} ({spec.hf_path} :: {spec.split})")
+
+    dataset = load_dataset(spec.hf_path, split=args.split or spec.split)
+    total_records = len(dataset)
+    print(f"   Total rows available: {total_records}")
+
+    dataset_dir = Path(args.output_dir) / dataset_key
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    progress = ProgressTracker(dataset_dir / "progress.json")
+    cleanup_partial_outputs(dataset_dir, progress.data["next_record_index"])
+
+    writer = ShardWriter(
+        dataset_dir=dataset_dir,
+        shard_size=args.records_per_shard,
+        shard_index=progress.data["shard_index"],
+        records_in_shard=progress.data["records_in_shard"],
     )
-    parser.add_argument(
-        "--db-path",
-        type=str,
-        default="/Users/chad/temp/hominem/conversations.db",
-        help="Path to conversations database"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config/inference.toml",
-        help="Path to inference config file"
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=10,
-        help="Number of messages to process per batch"
-    )
-    parser.add_argument(
-        "--max-messages",
-        type=int,
-        default=None,
-        help="Maximum number of messages to process (for testing)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be labeled without actually doing it"
-    )
-    parser.add_argument(
-        "--test-api",
-        action="store_true",
-        help="Test API connection with a single message before starting batch processing"
-    )
 
-    args = parser.parse_args()
+    start_index = progress.data["next_record_index"]
+    max_records = args.max_records or total_records
+    processed = 0
+    commit_index = start_index
 
-    # Check if database exists
-    if not os.path.exists(args.db_path):
-        print(f"❌ Database not found: {args.db_path}")
-        sys.exit(1)
+    pair_generator = PAIR_GENERATORS.get(spec.generator)
+    if not pair_generator:
+        raise ValueError(f"No pair generator registered for '{spec.generator}'")
 
-    # Create labeler
-    labeler = BatchEmotionLabeler(args.config, args.batch_size)
+    pending_pairs: List[Dict[str, Any]] = []
+    pending_entries: List[Dict[str, Any]] = []
+    record_queue: List[Dict[str, Any]] = []
+
+    async def flush_batches(force: bool = False) -> None:
+        nonlocal commit_index
+        while pending_pairs and (force or len(pending_pairs) >= args.pairs_per_call):
+            batch_size = min(len(pending_pairs), args.pairs_per_call)
+            batch_pairs = pending_pairs[:batch_size]
+            batch_entries = pending_entries[:batch_size]
+
+            batch_result = await engine.label_message_pairs_batch(batch_pairs)
+
+            for result in batch_result:
+                entry = batch_entries[result["pair_index"]]
+                writer.write(build_output_record(dataset_key, entry["record_index"], entry["pair"], result["labels"]))
+
+            del pending_pairs[:batch_size]
+            del pending_entries[:batch_size]
+
+            remaining = batch_size
+            while record_queue and remaining > 0:
+                head = record_queue[0]
+                consume = min(head["remaining_pairs"], remaining)
+                head["remaining_pairs"] -= consume
+                remaining -= consume
+                if head["remaining_pairs"] == 0:
+                    commit_index = head["record_index"] + 1
+                    record_queue.pop(0)
+                    progress.update(commit_index, writer.shard_index, writer.records_in_shard)
 
     try:
-        # Initialize
-        await labeler.initialize()
+        for record_index in range(start_index, total_records):
+            if processed >= max_records:
+                break
+            record = dataset[record_index]
+            pairs = pair_generator(record_index, record, spec)
 
-        # Test API if requested
-        if args.test_api:
-            print("\n🧪 Testing API connection...")
-            db = DatabaseManager(args.db_path)
-            test_messages = await labeler.get_unlabeled_messages(db)
-            if test_messages:
-                print(f"Testing with message ID {test_messages[0]['id']}...")
-                context = await labeler.get_message_context(db, test_messages[0]['id'])
-                result = await labeler.label_single_message(test_messages[0], context)
-                if result:
-                    print("✅ API test successful!")
-                    print(f"   Sample result: valence={result.get('valence')}, confidence={result.get('confidence')}")
-                else:
-                    print("❌ API test failed - no result returned")
-                    db.close()
-                    sys.exit(1)
-            else:
-                print("⚠️ No unlabeled messages to test with")
-            db.close()
-            print("API test completed. Exiting.")
-            return
+            if not pairs:
+                processed += 1
+                commit_index = record_index + 1
+                progress.update(commit_index, writer.shard_index, writer.records_in_shard)
+                continue
 
-        # Run labeling
-        await labeler.run_batch_labeling(args.db_path, args.dry_run, args.max_messages)
+            record_queue.append({"record_index": record_index, "remaining_pairs": len(pairs)})
+            for pair in pairs:
+                pending_pairs.append(pair)
+                pending_entries.append({"record_index": record_index, "pair": pair})
 
-    except KeyboardInterrupt:
-        print("\n⏹️ Interrupted by user")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        sys.exit(1)
+            await flush_batches(force=False)
+            processed += 1
+            if processed % 100 == 0:
+                print(f"   … queued {processed} records (last idx={record_index})")
+
+        await flush_batches(force=True)
+    finally:
+        writer.close()
+
+    print(f"✅ Finished dataset {dataset_key}: {processed} new records labeled.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Batch label external datasets for Unified Theory training.")
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        choices=sorted(DATASET_SPECS.keys()),
+        help="Dataset key to process. Can be specified multiple times. Defaults to all.",
+    )
+    parser.add_argument("--split", type=str, help="Optional split override (defaults per dataset).")
+    parser.add_argument("--output-dir", type=str, default="data/processed_datasets", help="Output root directory.")
+    parser.add_argument("--config", type=str, default="config/inference.toml", help="Emotion engine config path.")
+    parser.add_argument("--records-per-shard", type=int, default=2000, help="Max records per JSONL shard.")
+    parser.add_argument("--pairs-per-call", type=int, default=10, help="Number of pairs to send per LLM request.")
+    parser.add_argument("--max-records", type=int, help="Limit how many records to process per dataset.")
+    parser.add_argument("--resume", action="store_true", help="(Deprecated) kept for CLI compatibility.")
+    parser.add_argument("--batch-size", type=int, default=8, help="Legacy arg retained (ignored).")
+    return parser.parse_args()
+
+
+async def main() -> None:
+    args = parse_args()
+
+    engine = EmotionEngine(args.config)
+    dataset_keys = args.dataset or list(DATASET_SPECS.keys())
+
+    try:
+        for key in dataset_keys:
+            spec = DATASET_SPECS[key]
+            await process_dataset(key, spec, args, engine)
+    finally:
+        await engine.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⏹️  Interrupted by user")
