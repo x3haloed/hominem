@@ -21,6 +21,7 @@ from peft import LoraConfig, get_peft_model
 import yaml
 
 from core.data.db import TrainingDatabase
+from core.data.anchor_dataset import iter_anchor_records
 from core.training_logger import TrainingJSONLogger
 from core.lora_trainer.train_dpo import PreferenceSample, load_preferences, collate_fn, dpo_loss, set_seed
 
@@ -163,6 +164,38 @@ def load_sft_pairs_from_jsonl(
             )
     if not samples:
         raise ValueError(f"No SFT samples found in '{path}'.")
+    return samples
+
+
+def load_sft_pairs_from_shards(
+    root: str,
+    *,
+    datasets: Optional[List[str]] = None,
+    target_use: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[SFTSample]:
+    root_path = Path(root)
+    if not root_path.exists():
+        raise ValueError(f"SFT shard root does not exist: {root}")
+
+    samples: List[SFTSample] = []
+    for record in iter_anchor_records(root_path, datasets=datasets, target_use_filter=target_use):
+        instruction = record.speaker_message or record.metadata.get("context") or "System directive"
+        response = record.respondent_message or ""
+        if not response:
+            continue
+        samples.append(
+            SFTSample(
+                instruction=instruction,
+                response=response,
+                id=None,
+                created_at=None,
+                recency_weight=1.0,
+                reward_intensity=record.labels.get("reward_intensity"),
+            )
+        )
+        if limit is not None and len(samples) >= limit:
+            break
     return samples
 
 
@@ -377,6 +410,22 @@ def train(cfg_path: str) -> None:
             tau_fast=tau_fast,
             tau_slow=tau_slow,
         )
+
+    shard_cfg = training_cfg.get("sft_shards", {})
+    if shard_cfg.get("enabled"):
+        shard_root = shard_cfg.get("root")
+        if not shard_root:
+            raise ValueError("sft_shards.root is required when enabled=true")
+        shard_datasets = shard_cfg.get("datasets")
+        shard_target = shard_cfg.get("target_use")
+        shard_limit = shard_cfg.get("limit")
+        shard_samples = load_sft_pairs_from_shards(
+            shard_root,
+            datasets=shard_datasets,
+            target_use=shard_target,
+            limit=shard_limit,
+        )
+        sft_samples.extend(shard_samples)
 
     sft_samples, diversity_stats = _maybe_diversity_sample(
         sft_samples,

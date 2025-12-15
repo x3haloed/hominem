@@ -27,6 +27,18 @@ training:
   sft_data_path: null             # Only used if use_database=false
   preferences_path: null          # Only used if use_database=false
 
+  # Optional additional SFT data from enriched shards
+  sft_shards:
+    enabled: true
+    root: "data/processed_datasets_enriched"
+    datasets:
+      - setfit_emotion
+      - go_emotions
+      - dahoas_rm_static
+      - stanford_shp
+    target_use: null              # filter by tag if desired (e.g., "emotion_manifold")
+    limit: null                   # optional cap per launch
+
   # Database query filters for SFT pairs
   sft_filters:
     source: null                   # null = all sources, or specific: "conversation", "manual", etc.
