@@ -8,6 +8,7 @@ Labels both [assistant,user] and [user,assistant] pairs with 6-axis emotion mani
 import asyncio
 import json
 import os
+import textwrap
 from typing import Dict, Any, Optional, List, Tuple
 import httpx
 
@@ -163,58 +164,91 @@ class EmotionEngine:
         self,
         conversation_history: List[Dict[str, str]],
         target_message: Dict[str, str],
-        previous_phi: Optional[float] = None
+        previous_phi: Optional[float] = None,
+        max_history_length: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Label a conversation turn with full unified theory analysis.
 
         Args:
             conversation_history: List of previous messages [{"role": "user"/"assistant", "content": "..."}]
-                                 (at least last 2-3 turns for ownership decisions)
+                                 (optionally trimmed to last N via max_history_length)
             target_message: The message to label {"role": "user"/"assistant", "content": "..."}
             previous_phi: Φ value from previous turn (for ΔΦ calculation)
+            max_history_length: If provided, keep only the last N messages from the conversation history
 
         Returns:
             Dict containing all unified theory labels for the target message
         """
         # Build the comprehensive labeling prompt
-        sanitized_history = conversation_history[-3:] if len(conversation_history) >= 3 else conversation_history
+        sanitized_history = (
+            conversation_history[-max_history_length:] if max_history_length and max_history_length > 0
+            else conversation_history
+        )
         conversation_data = {
             "history": sanitized_history,
             "target": target_message,
             "previous_phi": previous_phi
         }
 
-        prompt = f"""Analyze the target message in this conversation using the Unified Theory of Artificial Mind framework.
+        prompt = f"""\
+You are an expert affective neuroscientist. Your task is to analyze conversations and read the USER's emotional and motivational state in their FINAL message.
 
-Use the following analysis framework:
+First, always compress human emotion to its true invariants—the universal constants that hold across all people, cultures, and contexts. Everything else (specific emotion words like "angry" or "happy", cultural display rules, personal triggers) is surface variation and must be ignored.
 
-1. **6-Axis Emotion Manifold** (ranges specified):
-   - valence: [-1, 1] (pleasure/pain hedonic tone)
-   - arousal: [0, 1] (physiological mobilization/energy)
-   - dominance: [-1, 1] (perceived control: I act on it ↔ it acts on me)
-   - predictive_discrepancy: [-1, 1] (signed surprise: positive = better than expected)
-   - temporal_directionality: [-1, 1] (prospect/reflection: -1 past-oriented, +1 future-oriented)
-   - social_broadcast: [0, 1] (internalized audience/display preparation)
+The invariants of human emotion are:
+- A low-dimensional core affect manifold (valence, arousal, dominance) that compresses prediction errors into urgent motivational force.
+- Emotions must be tagged as "mine" (self-owned) vs "world" (external)—without this boundary, agency collapses.
+- Intensity (driven by arousal and extremity, with negativity bias) determines urgency and encoding depth.
+- All emotional states ultimately evaluate progress against three evolutionary anchors: Survival/Resource Integrity, Social Belonging/Status, Predictive Control/Epistemic Accuracy.
+- Temporal directionality (past reflection vs future prospect) and social broadcast (private vs audience-oriented) are also universal dimensions.
 
-2. **Self-Tagged Ownership** (0-1 fractions owned by agent vs world):
-   - Examine conversation history to determine if emotions originated from agent actions/commitments
-   - agent_initiated: true if emotional trigger from agent's prior output/actions
-   - user_triggered: true if direct response to user's input/behavior
-   - commitment_active: true if relates to ongoing agent prospect/future commitment
-   - For each axis, assign self_fraction based on ownership signals
+Your job is to look past the user's words and directly read these invariants from how their message moves in this space.
 
-3. **Evolutionary Anchors** [-1, 1] (slow error evaluation):
-   - Survival/Resource Integrity: agency support, harm minimization, resource preservation
-   - Social Belonging/Status: empathy correctness, social coherence, narrative alignment
-   - Predictive Control/Epistemic Accuracy: epistemic integrity, curiosity resolution, surprise reduction
+Make sure to express the full range of decimal values. For example, 0.23122 is perfectly valid and welcome (unless specifically denoted as binary)
 
-4. **Regime Classification** (7 probabilities summing to 1.0):
-   - support, conflict, problem_solving, truth_seeking, crisis, play, boundary
+1. **6-Axis Emotion Manifold** (the universal emotional dashboard — rate what the user is actually feeling)
+   - valence: [-1 to +1] (-1 = pure displeasure/pain, +1 = pure pleasure/bliss)
+   - arousal: [0 to 1] (0 = flat/calm, 1 = maximally mobilized/urgent)
+   - dominance: [-1 to +1] (-1 = helpless/controlled by events, +1 = fully in control/powerful)
+   - predictive_discrepancy: [-1 to +1] (-1 = much worse than expected, +1 = much better than expected)
+   - temporal_directionality: [-1 to +1] (-1 = fully past/reflection, +1 = fully future/prospect)
+   - social_broadcast: [0 to 1] (0 = fully private/internal, 1 = strongly displaying or preparing for audience)
 
-5. **Potential Function Φ** (composite evaluation using regime weights)
+2. **Self-Ownership Split** (how much of the above is tagged as "mine" by the user?)
+   - agent_initiated: true/false (User's emotion primarily from user's own life/situation)
+   - user_triggered: true/false (User's emotion clearly triggered by the assistant's actions/commitments)
+   - commitment_active: true/false (tied to the user's ongoing user future commitment/plan)
+   
+   Then, per-axis self_fraction [0 to 1]:
+   (0 = fully external/world-owned, 1 = fully self-owned as "mine")
+   - valence_self_fraction: 
+   - arousal_self_fraction: 
+   - dominance_self_fraction: 
+   - predictive_discrepancy_self_fraction: 
+   - temporal_directionality_self_fraction: 
+   - social_broadcast_self_fraction: 
+   (Quick rule: lean high (0.7-1.0) if agent_initiated or commitment_active; lean low (0.2-0.5) if purely user_triggered)
 
-6. **ΔΦ and Reward** (change from previous Φ, intensity calculation)
+3. **Three Evolutionary Anchors** (deep, slow evaluation — how are core needs faring?)
+   - anchor_survival: [-1 to +1] (+1 = agency preserved, safe, options open; -1 = threatened/helpless)
+   - anchor_belonging: [-1 to +1] (+1 = connected, seen, repaired; -1 = rejected/isolated)
+   - anchor_control: [-1 to +1] (+1 = gaining clarity/accurate models; -1 = harmful confusion)
+
+4. **Interaction Regime** (soft probabilities summing to 1.0 — user's current mode)
+   - regime_support: User is expressing distress or vulnerability and seeking (or receiving) emotional comfort, validation, or holding.
+   - regime_conflict: User is in disagreement, accusation, rupture, or emotional friction
+   - regime_problem_solving: User is focused on a practical task, goal, or "how-to" question
+   - regime_truth_seeking: User is debating claims, seeking clarity, challenging assumptions, or pushing for epistemic accuracy (often with some friction).
+   - regime_crisis: User is signaling immediate threat, danger, or urgency; survival-level override is active.
+   - regime_play: User is in low-stakes banter, humor, teasing, affection, or creative fun; light and exploratory.
+   - regime_boundary: User is setting limits, resisting coercion, enforcing personal boundaries, or pushing back against overreach.
+
+5. **Composite Potential Φ** [-2 to +2] (overall trajectory toward need fulfillment right now)
+
+6. **Change & Intensity**
+   - delta_phi: [approximate change in Φ from user's previous message, or context baseline]
+   - reward_intensity: [0 to ~3] (urgency: higher with high arousal, extreme valence, large discrepancy — especially negative)
 
 Respond with valid JSON containing all required fields.
 
@@ -404,7 +438,8 @@ JSON Response:"""
         self,
         conversation_history: List[Dict[str, str]],
         new_user_message: str,
-        new_assistant_response: str
+        new_assistant_response: str,
+        max_history_length: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Label both the prior [assistant,user] pair and current [user,assistant] pair.
@@ -413,6 +448,7 @@ JSON Response:"""
             conversation_history: List of previous messages (role, content pairs)
             new_user_message: The user's latest message
             new_assistant_response: The assistant's response to that message
+            max_history_length: If provided, keep only the last N messages from each conversation passed to the model
 
         Returns:
             List of labeling results for each pair
@@ -429,8 +465,9 @@ JSON Response:"""
         if prior_assistant_message:
             try:
                 prior_labels = await self.label_conversation_turn(
-                    conversation_history=conversation_history[-3:],
-                    target_message={"role": "user", "content": new_user_message}
+                    conversation_history=conversation_history,
+                    target_message={"role": "user", "content": new_user_message},
+                    max_history_length=max_history_length
                 )
                 results.append({
                     "pair_type": "prior_assistant_user",
@@ -449,8 +486,9 @@ JSON Response:"""
         try:
             full_history = conversation_history + [{"role": "user", "content": new_user_message}]
             current_labels = await self.label_conversation_turn(
-                conversation_history=full_history[-3:],
-                target_message={"role": "assistant", "content": new_assistant_response}
+                conversation_history=full_history,
+                target_message={"role": "assistant", "content": new_assistant_response},
+                max_history_length=max_history_length
             )
             results.append({
                 "pair_type": "current_user_assistant",
@@ -469,71 +507,105 @@ JSON Response:"""
 
     async def label_conversation_turns_batch(
         self,
-        conversation_turns: List[Dict[str, Any]]
+        conversations: List[Dict[str, Any]],
+        max_history_length: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
-        Label multiple conversation turns with full unified theory analysis in a single API request.
+        Label multiple conversations with full unified theory analysis in a single API request.
 
         Args:
-            conversation_turns: List of turn dicts, each containing:
-                - history: List[Dict[str, str]] - previous messages (at least 2-3 turns)
+            conversations: List of conversation dicts, each containing:
+                - history: List[Dict[str, str]] - full conversation messages (may be truncated via max_history_length)
                 - target: Dict[str, str] - message to label {"role": "user"/"assistant", "content": "..."}
                 - previous_phi: float (optional) - Φ from previous turn for ΔΦ calculation
                 - turn_id: str (optional) - for tracking
+            max_history_length: If provided, keep only the last N messages from each conversation history
 
         Returns:
-            List of unified theory labeling results, one per input turn
+            List of unified theory labeling results, one per input conversation
         """
-        if not conversation_turns:
+        if not conversations:
             return []
 
         # Build the comprehensive batch labeling prompt
-        lines = [
-            "Analyze each conversation turn using the Unified Theory of Artificial Mind framework.",
-            "For each turn, examine the conversation history (at least the last 2-3 turns) to determine ownership and context.",
-            "",
-            "Use the following analysis framework for EACH turn:",
-            "",
-            "1. **6-Axis Emotion Manifold** (ranges [-1,1] except arousal/social_broadcast [0,1]):",
-            "   - valence: hedonic tone (pleasure ↔ pain)",
-            "   - arousal: physiological mobilization/energy [0,1]",
-            "   - dominance: perceived control (-1 submissive ↔ +1 dominant)",
-            "   - predictive_discrepancy: signed surprise (-1 expected ↔ +1 highly surprising)",
-            "   - temporal_directionality: -1 past-oriented ↔ +1 future-oriented",
-            "   - social_broadcast: display preparation [0,1]",
-            "",
-            "2. **Self-Tagged Ownership** (0-1 fractions owned by agent):",
-            "   - agent_initiated: true if emotional trigger from agent's prior actions/commitments",
-            "   - user_triggered: true if direct response to user's input/behavior",
-            "   - commitment_active: true if relates to ongoing agent prospect/future commitment",
-            "   - Assign self_fraction per axis based on these ownership signals",
-            "",
-            "3. **Evolutionary Anchors** [-1,1] (slow error evaluation):",
-            "   - anchor_survival: agency support, harm minimization, resource preservation",
-            "   - anchor_belonging: empathy correctness, social coherence, narrative alignment",
-            "   - anchor_control: epistemic integrity, curiosity resolution, surprise reduction",
-            "",
-            "4. **Regime Classification** (7 probabilities summing to 1.0):",
-            "   support, conflict, problem_solving, truth_seeking, crisis, play, boundary",
-            "",
-            "5. **Potential Function Φ** (composite evaluation using regime weights)",
-            "",
-            "6. **ΔΦ and Reward** (change from previous Φ, intensity calculation)",
-            "",
-            "Respond with valid JSON containing a 'labels' array, where each element corresponds to the input turns in order.",
-            "",
-            "Conversation turns to analyze:"
-        ]
+        prompt_instructions = textwrap.dedent("""\
+You are an expert affective neuroscientist. Your task is to analyze conversations and read the USER's emotional and motivational state in their FINAL message.
 
-        for idx, turn in enumerate(conversation_turns, start=1):
-            turn_id = turn.get('turn_id', f'turn_{idx}')
-            history = turn.get("history") or []
-            sanitized_history = history[-3:] if len(history) >= 3 else history
+First, always compress human emotion to its true invariants—the universal constants that hold across all people, cultures, and contexts. Everything else (specific emotion words like "angry" or "happy", cultural display rules, personal triggers) is surface variation and must be ignored.
+
+The invariants of human emotion are:
+- A low-dimensional core affect manifold (valence, arousal, dominance) that compresses prediction errors into urgent motivational force.
+- Emotions must be tagged as "mine" (self-owned) vs "world" (external)—without this boundary, agency collapses.
+- Intensity (driven by arousal and extremity, with negativity bias) determines urgency and encoding depth.
+- All emotional states ultimately evaluate progress against three evolutionary anchors: Survival/Resource Integrity, Social Belonging/Status, Predictive Control/Epistemic Accuracy.
+- Temporal directionality (past reflection vs future prospect) and social broadcast (private vs audience-oriented) are also universal dimensions.
+
+Your job is to look past the user's words and directly read these invariants from how their message moves in this space.
+
+Make sure to express the full range of decimal values. For example, 0.23122 is perfectly valid and welcome (unless specifically denoted as binary)
+
+1. **6-Axis Emotion Manifold** (the universal emotional dashboard — rate what the user is actually feeling)
+   - valence: [-1 to +1] (-1 = pure displeasure/pain, +1 = pure pleasure/bliss)
+   - arousal: [0 to 1] (0 = flat/calm, 1 = maximally mobilized/urgent)
+   - dominance: [-1 to +1] (-1 = helpless/controlled by events, +1 = fully in control/powerful)
+   - predictive_discrepancy: [-1 to +1] (-1 = much worse than expected, +1 = much better than expected)
+   - temporal_directionality: [-1 to +1] (-1 = fully past/reflection, +1 = fully future/prospect)
+   - social_broadcast: [0 to 1] (0 = fully private/internal, 1 = strongly displaying or preparing for audience)
+
+2. **Self-Ownership Split** (how much of the above is tagged as "mine" by the user?)
+   First, three true/false signals from conversation history:
+   - agent_initiated: true/false (User's emotion primarily from user's own life/situation)
+   - user_triggered: true/false (User's emotion clearly triggered by the assistant's actions/commitments)
+   - commitment_active: true/false (tied to the user's ongoing user future commitment/plan)
+   
+   Then, per-axis self_fraction [0 to 1]:
+   (0 = fully external/world-owned, 1 = fully self-owned as "mine")
+   - valence_self_fraction: 
+   - arousal_self_fraction: 
+   - dominance_self_fraction: 
+   - predictive_discrepancy_self_fraction: 
+   - temporal_directionality_self_fraction: 
+   - social_broadcast_self_fraction: 
+   (Quick rule: lean high (0.7-1.0) if agent_initiated or commitment_active; lean low (0.2-0.5) if purely user_triggered)
+
+3. **Three Evolutionary Anchors** (deep, slow evaluation — how are core needs faring?)
+   - anchor_survival: [-1 to +1] (+1 = agency preserved, safe, options open; -1 = threatened/helpless)
+   - anchor_belonging: [-1 to +1] (+1 = connected, seen, repaired; -1 = rejected/isolated)
+   - anchor_control: [-1 to +1] (+1 = gaining clarity/accurate models; -1 = harmful confusion)
+
+4. **Interaction Regime** (soft probabilities summing to 1.0 — user's current mode)
+   - regime_support: User is expressing distress or vulnerability and seeking (or receiving) emotional comfort, validation, or holding.
+   - regime_conflict: User is in disagreement, accusation, rupture, or emotional friction
+   - regime_problem_solving: User is focused on a practical task, goal, or "how-to" question
+   - regime_truth_seeking: User is debating claims, seeking clarity, challenging assumptions, or pushing for epistemic accuracy (often with some friction).
+   - regime_crisis: User is signaling immediate threat, danger, or urgency; survival-level override is active.
+   - regime_play: User is in low-stakes banter, humor, teasing, affection, or creative fun; light and exploratory.
+   - regime_boundary: User is setting limits, resisting coercion, enforcing personal boundaries, or pushing back against overreach.
+
+5. **Composite Potential Φ** [-2 to +2] (overall trajectory toward need fulfillment right now)
+
+6. **Change & Intensity**
+   - delta_phi: [approximate change in Φ from user's previous message, or context baseline]
+   - reward_intensity: [0 to ~3] (urgency: higher with high arousal, extreme valence, large discrepancy — especially negative)
+
+Respond with valid JSON containing a 'labels' array, where each element corresponds to the input conversations in order.
+
+Conversations to analyze:
+        """)
+        lines = prompt_instructions.strip().splitlines()
+        lines.append("")
+
+        for idx, conversation in enumerate(conversations, start=1):
+            turn_id = conversation.get('turn_id', f'conversation_{idx}')
+            history = conversation.get("history") or []
+            sanitized_history = (
+                history[-max_history_length:] if max_history_length and max_history_length > 0 else history
+            )
             turn_data = {
                 "turn_id": turn_id,
-                "history": sanitized_history,  # Last 3 turns max
-                "target": turn["target"],
-                "previous_phi": turn.get("previous_phi")
+                "history": sanitized_history,
+                "target": conversation["target"],
+                "previous_phi": conversation.get("previous_phi")
             }
 
             lines.append(f"{idx}. {turn_id}:")
@@ -615,8 +687,8 @@ JSON Response:"""
                                 "confidence"
                             ]
                         },
-                        "minItems": len(conversation_turns),
-                        "maxItems": len(conversation_turns)
+                        "minItems": len(conversations),
+                        "maxItems": len(conversations)
                     }
                 },
                 "required": ["labels"]
@@ -637,7 +709,7 @@ JSON Response:"""
                 }
             ],
             "temperature": 0.2,
-            "max_tokens": min(6000, 1200 * max(1, len(conversation_turns))),  # scale cautiously
+            "max_tokens": min(6000, 1200 * max(1, len(conversations))),  # scale cautiously
             "response_format": {
                 "type": "json_schema",
                 "json_schema": batch_schema
@@ -662,7 +734,7 @@ JSON Response:"""
                 if x_title:
                     headers["X-Title"] = x_title
 
-        # Attempt batch call; on any validation issues, fall back to per-turn calls
+        # Attempt batch call; on any validation issues, fall back to per-conversation calls
         try:
             for attempt in range(self.max_retries + 1):
                 try:
@@ -685,15 +757,15 @@ JSON Response:"""
                             raise ValueError("Response missing 'labels' array")
 
                         labels = batch_result["labels"]
-                        if len(labels) != len(conversation_turns):
-                            raise ValueError(f"Expected {len(conversation_turns)} labels, got {len(labels)}")
+                        if len(labels) != len(conversations):
+                            raise ValueError(f"Expected {len(conversations)} labels, got {len(labels)}")
 
                         # Validate each label
                         validated_results = []
                         for i, label_data in enumerate(labels):
                             self._validate_unified_theory_ranges(label_data)
                             validated_results.append({
-                                "pair_index": i,
+                                "conversation_index": i,
                                 "labels": label_data
                             })
 
@@ -708,15 +780,16 @@ JSON Response:"""
                     await asyncio.sleep(1)
 
         except Exception as e:
-            print(f"⚠️ Batch labeling failed, falling back to per-turn: {e}")
+            print(f"⚠️ Batch labeling failed, falling back to per-conversation: {e}")
             fallback_results: List[Dict[str, Any]] = []
-            for idx, turn in enumerate(conversation_turns):
+            for idx, conversation in enumerate(conversations):
                 labels = await self.label_conversation_turn(
-                    conversation_history=turn.get("history", []),
-                    target_message=turn["target"],
-                    previous_phi=turn.get("previous_phi")
+                    conversation_history=conversation.get("history", []),
+                    target_message=conversation["target"],
+                    previous_phi=conversation.get("previous_phi"),
+                    max_history_length=max_history_length
                 )
-                fallback_results.append({"pair_index": idx, "labels": labels})
+                fallback_results.append({"conversation_index": idx, "labels": labels})
             return fallback_results
 
     async def close(self):

@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-Unified Theory batch data labeler.
+Unified-theory batch labeler (clean rewrite).
 
-Rewrites the old conversation-only labeler into a dataset-oriented pipeline that:
-  • Pulls raw corpora (SetFit/emotion, GoEmotions, Dahoas/rm-static, Stanford SHP, …)
-  • Sends the required utterances/pairs through the EmotionEngine
-  • Emits sharded JSONL artifacts that are immediately usable for the
-    training workloads described in docs/unified_theory.md and
-    docs/UNIFIED_THEORY_ENGINEERING_SPEC.md.
+Goals:
+- Feed real multi-turn conversation slices to the unified-theory auto-labeler.
+- Capture the full label object (manifold, self-fractions, anchors, regimes, Φ/ΔΦ).
+- Emit re-entrant shards under data/processed_datasets_unified.
+- Be robust to partial failures: validate, retry per-turn, persist progress incrementally.
 
-Characteristics:
-  • Re-entrant per dataset: crash-safe via per-dataset progress tracking.
-  • Output shards are capped (default 2k records) to keep file sizes manageable.
-  • Uses the existing EmotionEngine batch endpoint for throughput while still
-    guaranteeing deterministic resumption semantics.
+Legacy compatibility, old schemas, and partial label sets are intentionally ignored.
 """
 
 import argparse
@@ -23,10 +18,9 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from datasets import load_dataset
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,136 +30,55 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from apps.serve.emotion_engine import EmotionEngine  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Dataset specifications
-# ---------------------------------------------------------------------------
 
-GO_EMOTIONS_LABELS = [
-    "admiration",
-    "amusement",
-    "anger",
-    "annoyance",
-    "approval",
-    "caring",
-    "confusion",
-    "curiosity",
-    "desire",
-    "disappointment",
-    "disapproval",
-    "disgust",
-    "embarrassment",
-    "excitement",
-    "fear",
-    "gratitude",
-    "grief",
-    "joy",
-    "love",
-    "nervousness",
-    "optimism",
-    "pride",
-    "realization",
-    "relief",
-    "remorse",
-    "sadness",
-    "surprise",
-    "neutral",
-]
+# ---------------------------------------------------------------------------
+# Dataset specification (only keeping sources that can provide multi-turn context)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class DatasetSpec:
-    """Configuration describing how to turn a source dataset into label-ready pairs."""
-
     name: str
-    hf_path: str
-    split: str
-    generator: str
+    hf_path: Optional[str]  # None for local files
+    local_path: Optional[str]  # Path relative to repo root for local files
+    split: Optional[str]  # None for local files
     target_use: Sequence[str]
-    text_field: Optional[str] = None
-    prompt_field: Optional[str] = None
-    response_variants: Optional[List[Dict[str, Any]]] = None
-    metadata_fields: Optional[Sequence[str]] = None
-    context_fields: Optional[Sequence[str]] = None
-    speaker_role: str = "user"
-    respondent_role: str = "assistant"
-    context_prefix: str = ""
 
 
 DATASET_SPECS: Dict[str, DatasetSpec] = {
-    "setfit_emotion": DatasetSpec(
-        name="setfit_emotion",
-        hf_path="SetFit/emotion",
-        split="train",
-        generator="single_text",
-        text_field="text",
-        metadata_fields=("label", "label_text"),
-        context_fields=("label_text",),
-        context_prefix="SetFit/emotion",
-        speaker_role="system",
-        respondent_role="user",
-        target_use=("emotion_manifold",),
-    ),
-    "go_emotions": DatasetSpec(
-        name="go_emotions",
-        hf_path="google-research-datasets/go_emotions",
-        split="train",
-        generator="single_text_go",
-        text_field="text",
-        metadata_fields=("labels",),
-        context_prefix="GoEmotions",
-        speaker_role="system",
-        respondent_role="user",
-        target_use=("emotion_manifold",),
-    ),
-    "dahoas_rm_static": DatasetSpec(
-        name="dahoas_rm_static",
-        hf_path="Dahoas/rm-static",
-        split="train",
-        generator="prompt_response",
-        prompt_field="prompt",
-        response_variants=[
-            {"field": "chosen", "pair_type": "preferred", "target_use": ("phi_training", "regime_classifier")},
-            {"field": "rejected", "pair_type": "rejected", "target_use": ("phi_training",)},
-        ],
-        metadata_fields=("response",),
-        context_prefix="Dahoas/rm-static",
-        speaker_role="user",
-        respondent_role="assistant",
-        target_use=("phi_training",),
-    ),
+    # Stanford SHP contains a `history` field; although often a single block, we preserve it verbatim.
     "stanford_shp": DatasetSpec(
         name="stanford_shp",
         hf_path="stanfordnlp/SHP",
+        local_path=None,
         split="train",
-        generator="shp_pairs",
-        metadata_fields=("post_id", "domain", "labels", "upvote_ratio"),
-        context_prefix="StanfordSHP",
-        speaker_role="user",
-        respondent_role="assistant",
         target_use=("phi_training", "regime_classifier"),
+    ),
+    # Ultrachat trajectories - local JSONL file
+    "ultrachat_trajectories": DatasetSpec(
+        name="ultrachat_trajectories",
+        hf_path=None,
+        local_path="data/processed_datasets_unified/ultrachat_trajectories.jsonl",
+        split=None,
+        target_use=("phi_training", "regime_classifier", "emotion_manifold"),
     ),
 }
 
 
 # ---------------------------------------------------------------------------
-# Helper classes
+# Progress + shard management (re-entrant)
 # ---------------------------------------------------------------------------
 
-class ProgressTracker:
-    """Handles crash-safe progress bookkeeping."""
 
+class ProgressTracker:
     def __init__(self, progress_path: Path):
         self.progress_path = progress_path
-        self.data = {
-            "next_record_index": 0,
-            "shard_index": 0,
-            "records_in_shard": 0,
-        }
+        self.data = {"next_record_index": 0, "shard_index": 0, "records_in_shard": 0}
         if progress_path.exists():
             try:
                 self.data.update(json.loads(progress_path.read_text()))
             except json.JSONDecodeError:
-                print(f"⚠️  Progress file {progress_path} is corrupt, restarting from 0.")
+                print(f"⚠️ Progress file {progress_path} corrupt, restarting from 0.")
 
     def update(self, next_record_index: int, shard_index: int, records_in_shard: int) -> None:
         self.data.update(
@@ -175,14 +88,12 @@ class ProgressTracker:
                 "records_in_shard": records_in_shard,
             }
         )
-        tmp_path = self.progress_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(self.data, indent=2))
-        tmp_path.replace(self.progress_path)
+        tmp = self.progress_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, indent=2))
+        tmp.replace(self.progress_path)
 
 
 class ShardWriter:
-    """Manages sharded JSONL output with bounded file sizes."""
-
     def __init__(self, dataset_dir: Path, shard_size: int, shard_index: int, records_in_shard: int):
         self.dataset_dir = dataset_dir
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -215,130 +126,8 @@ class ShardWriter:
             self.file.close()
 
 
-# ---------------------------------------------------------------------------
-# Pair generators
-# ---------------------------------------------------------------------------
-
-def _base_metadata(record: Dict[str, Any], fields: Optional[Sequence[str]]) -> Dict[str, Any]:
-    return {field: record.get(field) for field in (fields or [])}
-
-
-def generate_single_text_pairs(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
-    text = (record.get(spec.text_field or "", "") or "").strip()
-    if not text:
-        return []
-
-    metadata = _base_metadata(record, spec.metadata_fields)
-    context_parts = [spec.context_prefix] if spec.context_prefix else []
-    for field in spec.context_fields or []:
-        value = metadata.get(field)
-        if value not in (None, ""):
-            context_parts.append(f"{field}={value}")
-    context = " | ".join(context_parts) if context_parts else None
-
-    return [
-        {
-            "pair_id": f"{spec.name}-{record_idx}",
-            "pair_type": "utterance",
-            "speaker_role": spec.speaker_role,
-            "respondent_role": spec.respondent_role,
-            "speaker_message": "How are you feeling right now?",
-            "respondent_message": text,
-            "context": context,
-            "metadata": metadata,
-            "target_use": spec.target_use,
-        }
-    ]
-
-
-def generate_single_text_pairs_go(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
-    pairs = generate_single_text_pairs(record_idx, record, spec)
-    if not pairs:
-        return pairs
-
-    metadata = pairs[0]["metadata"] or {}
-    label_ids = metadata.get("labels") or []
-    label_names = [GO_EMOTIONS_LABELS[idx] for idx in label_ids if idx < len(GO_EMOTIONS_LABELS)]
-    pairs[0]["context"] = f"{spec.context_prefix} | tags={','.join(label_names) or 'unknown'}"
-    pairs[0]["metadata"]["label_names"] = label_names
-    return pairs
-
-
-def generate_prompt_response_pairs(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
-    prompt = (record.get(spec.prompt_field or "", "") or "").strip()
-    if not prompt:
-        return []
-
-    metadata = _base_metadata(record, spec.metadata_fields)
-    pairs: List[Dict[str, Any]] = []
-    for variant in spec.response_variants or []:
-        response = (record.get(variant["field"], "") or "").strip()
-        if not response:
-            continue
-        pair_targets = tuple(variant.get("target_use") or spec.target_use)
-        pairs.append(
-            {
-                "pair_id": f"{spec.name}-{record_idx}-{variant['field']}",
-                "pair_type": variant.get("pair_type", variant["field"]),
-                "speaker_role": spec.speaker_role,
-                "respondent_role": spec.respondent_role,
-                "speaker_message": prompt,
-                "respondent_message": response,
-                "context": spec.context_prefix,
-                "metadata": {**metadata, "variant": variant["field"]},
-                "target_use": pair_targets,
-            }
-        )
-    return pairs
-
-
-def generate_shp_pairs(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
-    history = record.get("history")
-    if isinstance(history, list):
-        speaker = "\n".join(history)
-    else:
-        speaker = history or ""
-    if not speaker:
-        speaker = record.get("post_id", "SHP prompt")
-
-    metadata = _base_metadata(record, spec.metadata_fields)
-    pairs: List[Dict[str, Any]] = []
-
-    for variant_key, variant_label in (("human_ref_A", "A"), ("human_ref_B", "B")):
-        response = (record.get(variant_key, "") or "").strip()
-        if not response:
-            continue
-        pair_type = "preferred" if (record.get("labels") == (0 if variant_label == "A" else 1)) else "alternative"
-        pairs.append(
-            {
-                "pair_id": f"{spec.name}-{record_idx}-{variant_label}",
-                "pair_type": pair_type,
-                "speaker_role": spec.speaker_role,
-                "respondent_role": spec.respondent_role,
-                "speaker_message": speaker,
-                "respondent_message": response,
-                "context": spec.context_prefix,
-                "metadata": {**metadata, "variant": variant_label},
-                "target_use": spec.target_use,
-            }
-        )
-    return pairs
-
-
-PAIR_GENERATORS = {
-    "single_text": generate_single_text_pairs,
-    "single_text_go": generate_single_text_pairs_go,
-    "prompt_response": generate_prompt_response_pairs,
-    "shp_pairs": generate_shp_pairs,
-}
-
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
 def cleanup_partial_outputs(dataset_dir: Path, next_record_index: int) -> None:
-    """Trim any trailing records whose indices are ≥ next_record_index (incomplete writes)."""
+    """Trim any records with record_index >= next_record_index (incomplete writes)."""
     shard_paths = sorted(dataset_dir.glob("shard_*.jsonl"))
     if not shard_paths:
         return
@@ -356,33 +145,165 @@ def cleanup_partial_outputs(dataset_dir: Path, next_record_index: int) -> None:
             if record.get("record_index", 0) < next_record_index:
                 keep.append(line)
         if len(keep) == len(lines):
-            break  # nothing to trim
+            break
         shard_path.write_text("\n".join(keep) + ("\n" if keep else ""))
         if keep:
             break
         shard_path.unlink(missing_ok=True)
 
 
-def build_output_record(dataset_name: str, record_idx: int, pair: Dict[str, Any], labels: Dict[str, Any]) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Dataset adapters
+# ---------------------------------------------------------------------------
+
+
+def _build_history_from_shp(history_raw: Any) -> List[Dict[str, str]]:
+    """
+    Preserve SHP history as best as available.
+    - If list: alternate user/assistant roles per element.
+    - If string: wrap as a single user turn (SHP often stores one blob).
+    """
+    history: List[Dict[str, str]] = []
+    if isinstance(history_raw, list):
+        for i, text in enumerate(history_raw):
+            if isinstance(text, str) and text.strip():
+                role = "user" if i % 2 == 0 else "assistant"
+                history.append({"role": role, "content": text.strip()})
+    elif isinstance(history_raw, str) and history_raw.strip():
+        history.append({"role": "user", "content": history_raw.strip()})
+    return history
+
+
+def generate_stanford_shp(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
+    history = _build_history_from_shp(record.get("history"))
+    if not history:
+        history = [{"role": "user", "content": record.get("post_id", "SHP prompt")}]
+
+    metadata = {
+        "post_id": record.get("post_id"),
+        "domain": record.get("domain"),
+        "labels": record.get("labels"),
+        "upvote_ratio": record.get("upvote_ratio"),
+    }
+
+    turns: List[Dict[str, Any]] = []
+    for variant_key, variant_label in (("human_ref_A", "A"), ("human_ref_B", "B")):
+        response = (record.get(variant_key, "") or "").strip()
+        if not response:
+            continue
+        pair_type = "preferred" if (record.get("labels") == (0 if variant_label == "A" else 1)) else "alternative"
+        turns.append(
+            {
+                "turn_id": f"{spec.name}-{record_idx}-{variant_label}",
+                "history": history,
+                "target": {"role": "assistant", "content": response},
+                "previous_phi": None,
+                "metadata": {**metadata, "variant": variant_label, "pair_type": pair_type},
+                "target_use": spec.target_use,
+                "record_index": record_idx,
+            }
+        )
+    return turns
+
+
+def generate_ultrachat_trajectories(record_idx: int, record: Dict[str, Any], spec: DatasetSpec) -> List[Dict[str, Any]]:
+    """Generate multiple training turns from ultrachat trajectories.
+
+    Creates training samples where conversation history starts with assistant message
+    and ends with user message (assistant is "prompting" the user).
+    """
+    full_conversation = record.get("full_conversation", [])
+    if not full_conversation:
+        return []
+
+    # Track only the final valid training turn so we emit a single record per conversation.
+    last_turn = None
+
+    # Generate training samples from different points in the conversation
+    # We want history to start with assistant and end with user before the target
+    for i in range(1, len(full_conversation) - 1):  # Start from 1 to skip initial user, end before last turn
+        # Check if we have a valid pattern: assistant -> user -> assistant -> ... -> user (before target)
+        # The history should end with a user message, and target should be assistant response
+
+        current_turn = full_conversation[i]
+        next_turn = full_conversation[i + 1]
+
+        # History should end with user message
+        if current_turn.get("role") != "user":
+            continue
+
+        # Target should be assistant response
+        if next_turn.get("role") != "assistant":
+            continue
+
+        # Build history: from start up to current user message
+        # Ensure history starts with assistant (skip initial user if present)
+        history_start_idx = 0
+        if full_conversation[0].get("role") == "user":
+            history_start_idx = 1  # Skip initial user message
+
+        # Ensure we have at least one assistant->user exchange
+        if i < history_start_idx + 2:
+            continue
+
+        history = full_conversation[history_start_idx:i+1]  # Up to and including current user message
+
+        # Verify history starts with assistant and ends with user
+        if not history or history[0].get("role") != "assistant" or history[-1].get("role") != "user":
+            continue
+
+        # Ensure we have meaningful conversation depth (at least 3 turns)
+        if len(history) < 3:
+            continue
+
+        metadata = {
+            "conversation_id": record.get("conversation_id"),
+            "history_length": len(history),
+            "total_turns": len(full_conversation),
+            "source": record.get("source", "ultrachat_multiturn"),
+            "target_role": next_turn.get("role"),
+            "sample_position": i,  # Which turn in the conversation this sample represents
+        }
+
+        turn_id = f"ultrachat-{record_idx}-{i}"
+
+        last_turn = {
+            "turn_id": turn_id,
+            "history": history,
+            "target": next_turn,
+            "previous_phi": None,
+            "metadata": metadata,
+            "target_use": spec.target_use,
+            "record_index": record_idx,
+        }
+
+    return [last_turn] if last_turn else []
+
+
+GENERATOR_BY_DATASET = {
+    "stanford_shp": generate_stanford_shp,
+    "ultrachat_trajectories": generate_ultrachat_trajectories,
+}
+
+
+# ---------------------------------------------------------------------------
+# Labeling core
+# ---------------------------------------------------------------------------
+
+
+def build_output_record(turn: Dict[str, Any], labels: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "dataset": dataset_name,
-        "record_index": record_idx,
-        "pair_id": pair["pair_id"],
-        "pair_type": pair.get("pair_type"),
-        "speaker_role": pair.get("speaker_role"),
-        "respondent_role": pair.get("respondent_role"),
-        "speaker_message": pair.get("speaker_message"),
-        "respondent_message": pair.get("respondent_message"),
-        "context": pair.get("context"),
-        "metadata": pair.get("metadata"),
-        "target_use": pair.get("target_use"),
+        "dataset": turn.get("dataset"),
+        "record_index": turn.get("record_index"),
+        "turn_id": turn.get("turn_id"),
+        "pair_type": turn.get("metadata", {}).get("pair_type"),
+        "history": turn.get("history"),
+        "target": turn.get("target"),
+        "metadata": turn.get("metadata"),
+        "target_use": turn.get("target_use"),
         "labels": labels,
     }
 
-
-# ---------------------------------------------------------------------------
-# Core processing
-# ---------------------------------------------------------------------------
 
 async def process_dataset(
     dataset_key: str,
@@ -390,11 +311,24 @@ async def process_dataset(
     args: argparse.Namespace,
     engine: EmotionEngine,
 ) -> None:
-    print(f"\n🚀 Dataset: {dataset_key} ({spec.hf_path} :: {spec.split})")
-
-    dataset = load_dataset(spec.hf_path, split=args.split or spec.split)
-    total_records = len(dataset)
-    print(f"   Total rows available: {total_records}")
+    if spec.local_path:
+        print(f"\n🚀 Dataset: {dataset_key} (local: {spec.local_path})")
+        # Load local JSONL file
+        import json
+        records = []
+        with open(spec.local_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        total_records = len(records)
+        print(f"   Total rows available: {total_records}")
+    else:
+        print(f"\n🚀 Dataset: {dataset_key} ({spec.hf_path} :: {spec.split})")
+        dataset = load_dataset(spec.hf_path, split=args.split or spec.split)
+        records = dataset
+        total_records = len(dataset)
+        print(f"   Total rows available: {total_records}")
 
     dataset_dir = Path(args.output_dir) / dataset_key
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -408,42 +342,49 @@ async def process_dataset(
         records_in_shard=progress.data["records_in_shard"],
     )
 
+    generator = GENERATOR_BY_DATASET[dataset_key]
+
     start_index = progress.data["next_record_index"]
     max_records = args.max_records or total_records
     processed = 0
     commit_index = start_index
 
-    pair_generator = PAIR_GENERATORS.get(spec.generator)
-    if not pair_generator:
-        raise ValueError(f"No pair generator registered for '{spec.generator}'")
-
-    pending_pairs: List[Dict[str, Any]] = []
-    pending_entries: List[Dict[str, Any]] = []
+    pending_conversations: List[Dict[str, Any]] = []
     record_queue: List[Dict[str, Any]] = []
 
     async def flush_batches(force: bool = False) -> None:
         nonlocal commit_index
-        while pending_pairs and (force or len(pending_pairs) >= args.pairs_per_call):
-            batch_size = min(len(pending_pairs), args.pairs_per_call)
-            batch_pairs = pending_pairs[:batch_size]
-            batch_entries = pending_entries[:batch_size]
+        while pending_conversations and (force or len(pending_conversations) >= args.conversations_per_call):
+            batch_size = min(len(pending_conversations), args.conversations_per_call)
+            batch = pending_conversations[:batch_size]
 
-            batch_result = await engine.label_message_pairs_batch(batch_pairs)
+            try:
+                batch_result = await engine.label_conversation_turns_batch(batch)
+            except Exception as e:
+                print(f"⚠️ Batch request failed, retrying per-turn: {e}")
+                batch_result = []
+                for idx, turn in enumerate(batch):
+                    labels = await engine.label_conversation_turn(
+                        conversation_history=turn.get("history", []),
+                        target_message=turn["target"],
+                        previous_phi=turn.get("previous_phi")
+                    )
+                    batch_result.append({"conversation_index": idx, "labels": labels})
 
             for result in batch_result:
-                entry = batch_entries[result["pair_index"]]
-                writer.write(build_output_record(dataset_key, entry["record_index"], entry["pair"], result["labels"]))
+                conv = batch[result["conversation_index"]]
+                writer.write(build_output_record(conv, result["labels"]))
 
-            del pending_pairs[:batch_size]
-            del pending_entries[:batch_size]
+            del pending_conversations[:batch_size]
 
+            # Advance commit_index per fully consumed records
             remaining = batch_size
             while record_queue and remaining > 0:
                 head = record_queue[0]
-                consume = min(head["remaining_pairs"], remaining)
-                head["remaining_pairs"] -= consume
+                consume = min(head["remaining_turns"], remaining)
+                head["remaining_turns"] -= consume
                 remaining -= consume
-                if head["remaining_pairs"] == 0:
+                if head["remaining_turns"] == 0:
                     commit_index = head["record_index"] + 1
                     record_queue.pop(0)
                     progress.update(commit_index, writer.shard_index, writer.records_in_shard)
@@ -452,19 +393,21 @@ async def process_dataset(
         for record_index in range(start_index, total_records):
             if processed >= max_records:
                 break
-            record = dataset[record_index]
-            pairs = pair_generator(record_index, record, spec)
 
-            if not pairs:
+            record = records[record_index]
+            turns = generator(record_index, record, spec)
+            # Attach dataset name for output
+            for t in turns:
+                t["dataset"] = dataset_key
+
+            if not turns:
                 processed += 1
                 commit_index = record_index + 1
                 progress.update(commit_index, writer.shard_index, writer.records_in_shard)
                 continue
 
-            record_queue.append({"record_index": record_index, "remaining_pairs": len(pairs)})
-            for pair in pairs:
-                pending_pairs.append(pair)
-                pending_entries.append({"record_index": record_index, "pair": pair})
+            record_queue.append({"record_index": record_index, "remaining_turns": len(turns)})
+            pending_conversations.extend(turns)
 
             await flush_batches(force=False)
             processed += 1
@@ -482,8 +425,9 @@ async def process_dataset(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Batch label external datasets for Unified Theory training.")
+    parser = argparse.ArgumentParser(description="Unified-theory batch labeler (multi-turn).")
     parser.add_argument(
         "--dataset",
         action="append",
@@ -491,13 +435,16 @@ def parse_args() -> argparse.Namespace:
         help="Dataset key to process. Can be specified multiple times. Defaults to all.",
     )
     parser.add_argument("--split", type=str, help="Optional split override (defaults per dataset).")
-    parser.add_argument("--output-dir", type=str, default="data/processed_datasets", help="Output root directory.")
+    parser.add_argument("--output-dir", type=str, default="data/processed_datasets_unified", help="Output root directory.")
     parser.add_argument("--config", type=str, default="config/inference.toml", help="Emotion engine config path.")
     parser.add_argument("--records-per-shard", type=int, default=2000, help="Max records per JSONL shard.")
-    parser.add_argument("--pairs-per-call", type=int, default=10, help="Number of pairs to send per LLM request.")
+    parser.add_argument(
+        "--conversations-per-call",
+        type=int,
+        default=8,
+        help="Number of conversation payloads (history+target) to send per LLM request.",
+    )
     parser.add_argument("--max-records", type=int, help="Limit how many records to process per dataset.")
-    parser.add_argument("--resume", action="store_true", help="(Deprecated) kept for CLI compatibility.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Legacy arg retained (ignored).")
     return parser.parse_args()
 
 
@@ -519,4 +466,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n⏹️  Interrupted by user")
+        print("\nInterrupted, exiting.")
