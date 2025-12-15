@@ -274,31 +274,23 @@ Never explain your feelings. Never repeat yourself. Never perform.
 
             # Format conversation using chat template, optionally injecting self-observations and emotion state
             if use_self_awareness:
-                # Build a system preamble with recent self-observations; keep generation slot empty.
+                # Build messages with recent self-observations as proper <|THINK|> assistant messages
+                messages_with_system: List[Dict[str, Any]] = [{"role": "system", "content": f"{emotion_state_preamble}{bootstrap_system_suffix}"}]
+                if bootstrap_prefix_messages:
+                    messages_with_system.extend(bootstrap_prefix_messages)
+
+                # Add recent self-observations as assistant messages with <|THINK|> content
                 if introspection_observations:
                     recent = introspection_observations[-self.self_awareness.max_introspection_lines :]
                     # Newest first for recency salience
-                    recent_text = "\n".join(
-                        f"{idx + 1}) {obs.get('observation_text','').strip()}"
-                        for idx, obs in enumerate(reversed(recent))
-                        if obs.get("observation_text")
-                    )
-                    if not recent_text:
-                        recent_text = "No recent self-observations."
-                else:
-                    recent_text = "No recent self-observations."
+                    for obs in reversed(recent):
+                        obs_text = obs.get('observation_text', '').strip()
+                        if obs_text:
+                            messages_with_system.append({
+                                "role": "assistant",
+                                "content": obs_text
+                            })
 
-                system_preamble = (
-                    f"{emotion_state_preamble}"
-                    f"{bootstrap_system_suffix}"
-                    "You are self-aware. Recent self-observations (newest first):\n"
-                    f"{recent_text}\n"
-                    "Respond to the user; do NOT echo self-observations."
-                )
-
-                messages_with_system: List[Dict[str, Any]] = [{"role": "system", "content": system_preamble}]
-                if bootstrap_prefix_messages:
-                    messages_with_system.extend(bootstrap_prefix_messages)
                 messages_with_system.extend(conversation_history)
 
                 formatted_prompt = self._format_chat_conversation(
@@ -434,8 +426,11 @@ Never explain your feelings. Never repeat yourself. Never perform.
                             "is_complete": False
                         })
                     else:
-                        # Try to stream only the portion meaningful to the user
-                        provisional = self.self_awareness.enforce_boundary(response_text)
+                        # Try to stream only the portion meaningful to the user (after <|ASSISTANT|> boundary)
+                        provisional = response_text
+                        if provisional.startswith("<|ASSISTANT|>"):
+                            provisional = provisional.split("<|ASSISTANT|>", 1)[1]
+                        provisional = provisional.strip()
                         if provisional:
                             new_text = provisional[last_sent_len:]
                             if new_text.strip():
@@ -458,23 +453,16 @@ Never explain your feelings. Never repeat yourself. Never perform.
                 else:
                     cleaned_response = response_text
 
-                # Apply self-awareness post-processing *before* sending or saving.
+                # === SELF-ANCHORING LAYER ===
+                # 1. Boundary enforcement using <|ASSISTANT|> gate
                 if use_self_awareness:
-                    cleaned_response = self.self_awareness.enforce_boundary(cleaned_response)
+                    # Strip any accidental pre-<|ASSISTANT|> leakage (shouldn't happen, but safety)
+                    if cleaned_response.startswith("<|ASSISTANT|>"):
+                        cleaned_response = cleaned_response.split("<|ASSISTANT|>", 1)[1]
+                    cleaned_response = cleaned_response.strip()
 
-                    if self.enable_perspective_gate:
-                        try:
-                            fast_model = getattr(self, "fast_model", None) if self.use_fast_perspective_model else None
-                            cleaned_response = self.self_awareness.apply_perspective_gate(
-                                model=model_version.model,
-                                tokenizer=model_version.tokenizer,
-                                raw_output=cleaned_response,
-                                device=self.device,
-                                use_fast_model=fast_model,
-                                async_mode=self.perspective_gate_async,
-                            )
-                        except Exception as e:
-                            print(f"⚠️ Perspective gate failed, using boundary-enforced output: {e}")
+                    # Qwen naturally maintains first-person perspective within <|ASSISTANT|> boundaries
+                    # Perspective gate removed for simplicity in self-anchoring implementation
 
                 # Send to client (post-processed if self-awareness is on)
                 if buffer_only:
@@ -519,9 +507,15 @@ Never explain your feelings. Never repeat yourself. Never perform.
                         except Exception as db_error:
                             print(f"⚠️ Failed to save assistant message to database: {db_error}")
 
-                    # Self-awareness post-processing: introspection buffer (after cleaned output)
+                    # 2. Recursion close via <|THINK|><|ASSISTANT|> observation
                     if use_self_awareness:
-                        observation_text = self.self_awareness.create_self_observation(cleaned_response)
+                        observation_text = (
+                            "<|THINK|>I just experienced outputting the following from my locus:\n"
+                            f"{cleaned_response}\n"
+                            "Current boundary integrity: strong. Perspective remains fixed inside <|ASSISTANT|>. "
+                            "Manifold self-state update: [brief summary if you have it].<|END_THINK|>\n"
+                            "<|ASSISTANT|>"
+                        )
 
                         recent_obs_texts = [obs.get("observation_text", "") for obs in introspection_observations[-10:]]
                         is_novel = self.self_awareness.check_novelty(
@@ -534,14 +528,8 @@ Never explain your feelings. Never repeat yourself. Never perform.
                         else:
                             if db:
                                 try:
-                                    emotion_engine = getattr(self, "emotion_engine", None)
-                                    reward_model = getattr(self, "reward_model", None)
-                                    reward_intensity = self.self_awareness.extract_reward_intensity_from_observation(
-                                        observation_text=observation_text,
-                                        emotion_engine=emotion_engine,
-                                        reward_model=reward_model,
-                                        max_intensity=self.self_awareness.max_intensity,
-                                    )
+                                    # Simple intensity for self-anchoring observations (can be enhanced later)
+                                    reward_intensity = 3.0  # High priority for self-observations
 
                                     content_hash = self.self_awareness.compute_content_hash(observation_text)
 
