@@ -441,6 +441,7 @@ JSON Response:""")
                     if missing:
                         raise ValueError(f"Missing required fields: {missing}")
 
+                    labels = self._clamp_unified_theory_ranges(labels)
                     # Validate ranges and constraints
                     self._validate_unified_theory_ranges(labels)
 
@@ -517,6 +518,52 @@ JSON Response:""")
             if field in labels and not isinstance(labels[field], (int, float)):
                 raise ValueError(f"{field} must be numeric, got {type(labels[field])}")
 
+    def _clamp_unified_theory_ranges(self, labels: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Clamp bounded numeric fields into their allowed ranges to avoid retries on minor
+        overshoots from the teacher model.
+        """
+        clamped = dict(labels)
+        # Shared ranges
+        bounded_ranges = {
+            "valence": (-1.0, 1.0),
+            "arousal": (0.0, 1.0),
+            "dominance": (-1.0, 1.0),
+            "predictive_discrepancy": (-1.0, 1.0),
+            "temporal_directionality": (-1.0, 1.0),
+            "social_broadcast": (0.0, 1.0),
+            "valence_self_fraction": (0.0, 1.0),
+            "arousal_self_fraction": (0.0, 1.0),
+            "dominance_self_fraction": (0.0, 1.0),
+            "predictive_discrepancy_self_fraction": (0.0, 1.0),
+            "temporal_directionality_self_fraction": (0.0, 1.0),
+            "social_broadcast_self_fraction": (0.0, 1.0),
+            "anchor_survival": (0.0, 1.0),
+            "anchor_belonging": (0.0, 1.0),
+            "anchor_control": (0.0, 1.0),
+            "regime_support": (0.0, 1.0),
+            "regime_conflict": (0.0, 1.0),
+            "regime_problem_solving": (0.0, 1.0),
+            "regime_truth_seeking": (0.0, 1.0),
+            "regime_crisis": (0.0, 1.0),
+            "regime_play": (0.0, 1.0),
+            "regime_boundary": (0.0, 1.0),
+            "confidence": (0.0, 1.0),
+            # Derived scalars
+            "phi_value": (0.0, 1.0),
+            "delta_phi": (-1.0, 1.0),
+            "reward_intensity": (0.0, 3.0),
+            "safety_score": (0.0, 1.0),
+        }
+        for key, (lo, hi) in bounded_ranges.items():
+            if key in clamped and isinstance(clamped[key], (int, float)):
+                val = float(clamped[key])
+                if val < lo:
+                    clamped[key] = lo
+                elif val > hi:
+                    clamped[key] = hi
+        return clamped
+
     def _get_ensemble_temperatures(self) -> List[float]:
         """Return list of temperatures to ensemble; configurable via config/env."""
         temps = self.emotion_label_config.get("temperatures")
@@ -532,7 +579,7 @@ JSON Response:""")
             if parsed:
                 return parsed
         # Default ensemble: low + medium
-        return [0.2, 0.5, 0.8]
+        return [0.2, 0.5]
 
     def _aggregate_label_set(self, label_set: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Average numeric outputs across ensemble members and renormalize regime probabilities."""
@@ -1026,8 +1073,9 @@ Conversations to analyze:
                         # Validate each label before adding to ensemble
                         validated = []
                         for label_data in labels:
-                            self._validate_unified_theory_ranges(label_data)
-                            validated.append(label_data)
+                            clamped = self._clamp_unified_theory_ranges(label_data)
+                            self._validate_unified_theory_ranges(clamped)
+                            validated.append(clamped)
 
                         per_temp_labels.append(validated)
                         break  # success for this temperature

@@ -62,6 +62,14 @@ DATASET_SPECS: Dict[str, DatasetSpec] = {
         split=None,
         target_use=("phi_training", "regime_classifier", "emotion_manifold"),
     ),
+    # Synthetic ultrachat-style trajectories (unlabeled conversations) generated locally.
+    "ultrachat_synthetic_trajectories": DatasetSpec(
+        name="ultrachat_synthetic_trajectories",
+        hf_path=None,
+        local_path="data/processed_datasets_unified/ultrachat_trajectories_synthetic.jsonl",
+        split=None,
+        target_use=("phi_training", "regime_classifier", "emotion_manifold"),
+    ),
 }
 
 
@@ -213,7 +221,24 @@ def generate_ultrachat_trajectories(record_idx: int, record: Dict[str, Any], spe
     and ends with user message (assistant is "prompting" the user).
     """
     full_conversation = record.get("full_conversation", [])
+
+    # Fallback: accept already-trimmed history/target pairs (e.g., synthetic trajectories)
     if not full_conversation:
+        history = record.get("history") or []
+        target = record.get("target") or {}
+        if history and target:
+            metadata = record.get("metadata", {})
+            return [
+                {
+                    "turn_id": record.get("turn_id") or f"{spec.name}-{record_idx}-0",
+                    "history": history,
+                    "target": target,
+                    "previous_phi": None,
+                    "metadata": metadata,
+                    "target_use": spec.target_use,
+                    "record_index": record_idx,
+                }
+            ]
         return []
 
     # Track only the final valid training turn so we emit a single record per conversation.
@@ -283,6 +308,7 @@ def generate_ultrachat_trajectories(record_idx: int, record: Dict[str, Any], spe
 GENERATOR_BY_DATASET = {
     "stanford_shp": generate_stanford_shp,
     "ultrachat_trajectories": generate_ultrachat_trajectories,
+    "ultrachat_synthetic_trajectories": generate_ultrachat_trajectories,
 }
 
 

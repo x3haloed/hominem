@@ -158,7 +158,7 @@ class MultiTurnTrajectoryGenerator:
     def _create_user_target_trajectories(self, conversation: List[Dict], conv_id: int) -> List[Dict]:
         """
         Produce trajectories where the TARGET is the human/user turn.
-        History includes all prior turns (up to the target index) to support ownership/ΔΦ.
+        History is truncated to the last 3 turns (inclusive) to match manifold/self-tag receptive field.
         """
         trajectories: List[Dict] = []
         for idx, turn in enumerate(conversation):
@@ -182,6 +182,9 @@ class MultiTurnTrajectoryGenerator:
             target_text = turn.get("content", "")
             if not self._is_emotional(target_text):
                 continue  # skip bland / low-affect requests
+
+            # Truncate to last 3 turns to align with manifold/self-tag training input
+            history = history[-3:]
 
             trajectories.append({
                 "id": f"multiturn_{conv_id}_{idx}",
@@ -288,3 +291,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
