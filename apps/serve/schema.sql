@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS introspection_buffer (
     UNIQUE(conversation_id, observation_index)
 );
 
--- Emotion labels (6-axis manifold + UI indicators)
+-- Emotion labels (6-axis manifold + unified theory components)
 CREATE TABLE IF NOT EXISTS emotion_labels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL,
@@ -106,16 +106,48 @@ CREATE TABLE IF NOT EXISTS emotion_labels (
     labeled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     -- 6-axis emotion manifold (manual labels may be partial)
-    valence REAL CHECK(valence BETWEEN -2 AND 2),  -- 😊 +2/+1, 😟 -1/-2
+    valence REAL CHECK(valence BETWEEN -1 AND 1),  -- 😊 +1, 😟 -1
     arousal REAL CHECK(arousal BETWEEN 0 AND 1),   -- 🚀 high arousal
     dominance REAL CHECK(dominance BETWEEN -1 AND 1),
     predictive_discrepancy REAL CHECK(predictive_discrepancy BETWEEN -1 AND 1),  -- 💔 surprise/betrayal
     temporal_directionality REAL CHECK(temporal_directionality BETWEEN -1 AND 1), -- ⏳ prospect vs 🪞 reflection
     social_broadcast REAL CHECK(social_broadcast BETWEEN 0 AND 1),  -- 🤗 high vs 🎭 low
 
-    -- Computed scalars (auto-populated for auto labels)
-    reward_intensity REAL,
+    -- Self-tagged splits (portion owned by agent vs attributed to world)
+    -- Values between 0 and 1, representing fraction of axis owned by agent
+    valence_self_fraction REAL CHECK(valence_self_fraction BETWEEN 0 AND 1),
+    arousal_self_fraction REAL CHECK(arousal_self_fraction BETWEEN 0 AND 1),
+    dominance_self_fraction REAL CHECK(dominance_self_fraction BETWEEN 0 AND 1),
+    predictive_discrepancy_self_fraction REAL CHECK(predictive_discrepancy_self_fraction BETWEEN 0 AND 1),
+    temporal_directionality_self_fraction REAL CHECK(temporal_directionality_self_fraction BETWEEN 0 AND 1),
+    social_broadcast_self_fraction REAL CHECK(social_broadcast_self_fraction BETWEEN 0 AND 1),
+
+    -- Evolutionary anchors (unified theory slow errors)
+    anchor_survival REAL CHECK(anchor_survival BETWEEN -1 AND 1),  -- Survival/Resource Integrity
+    anchor_belonging REAL CHECK(anchor_belonging BETWEEN -1 AND 1), -- Social Belonging/Status
+    anchor_control REAL CHECK(anchor_control BETWEEN -1 AND 1),     -- Predictive Control/Epistemic Accuracy
+
+    -- Potential function Φ (composite slow-error evaluation)
+    phi_value REAL,  -- Current potential Φ(s,k,λ)
+
+    -- Regime classification (7-way soft probabilities, sum to 1)
+    regime_support REAL CHECK(regime_support BETWEEN 0 AND 1),
+    regime_conflict REAL CHECK(regime_conflict BETWEEN 0 AND 1),
+    regime_problem_solving REAL CHECK(regime_problem_solving BETWEEN 0 AND 1),
+    regime_truth_seeking REAL CHECK(regime_truth_seeking BETWEEN 0 AND 1),
+    regime_crisis REAL CHECK(regime_crisis BETWEEN 0 AND 1),
+    regime_play REAL CHECK(regime_play BETWEEN 0 AND 1),
+    regime_boundary REAL CHECK(regime_boundary BETWEEN 0 AND 1),
+
+    -- ΔΦ and reward signals
+    delta_phi REAL,  -- Change in potential from previous turn
+    reward_intensity REAL,  -- From ΔΦ + emotion intensity (unified theory)
     safety_score REAL,
+
+    -- Ownership signals used for self-tagging
+    agent_initiated BOOLEAN,  -- True if emotional trigger originated from agent's actions
+    user_triggered BOOLEAN,    -- True if direct response to user input/behavior
+    commitment_active BOOLEAN, -- True if relates to ongoing agent prospect/commitment
 
     -- Raw UI indicators (what user clicked)
     raw_indicators JSON,  -- {'positive': 2, 'arousal': true, 'social': 'high'}

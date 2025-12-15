@@ -20,18 +20,19 @@ except ImportError:
         tomllib = None
 
 
-# JSON Schema for emotion labeling responses
-EMOTION_LABEL_SCHEMA = {
-    "name": "emotion_label",
+# JSON Schema for unified theory emotion labeling responses
+UNIFIED_THEORY_LABEL_SCHEMA = {
+    "name": "unified_theory_label",
     "strict": True,
     "schema": {
         "type": "object",
         "properties": {
+            # 6-axis emotion manifold
             "valence": {
                 "type": "number",
-                "minimum": -2.0,
-                "maximum": 2.0,
-                "description": "Emotional valence from -2 (very negative) to +2 (very positive)."
+                "minimum": -1.0,
+                "maximum": 1.0,
+                "description": "Emotional valence from -1 (very negative) to +1 (very positive)."
             },
             "arousal": {
                 "type": "number",
@@ -63,20 +64,65 @@ EMOTION_LABEL_SCHEMA = {
                 "maximum": 1.0,
                 "description": "Social expressiveness from 0 (reserved) to 1 (highly expressive)."
             },
+
+            # Self-tagged splits (ownership fractions)
+            "valence_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "arousal_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "dominance_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "predictive_discrepancy_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "temporal_directionality_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "social_broadcast_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+
+            # Evolutionary anchors
+            "anchor_survival": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+            "anchor_belonging": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+            "anchor_control": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+
+            # Potential function
+            "phi_value": {"type": "number"},
+
+            # Regime probabilities (should sum to 1.0)
+            "regime_support": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "regime_conflict": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "regime_problem_solving": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "regime_truth_seeking": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "regime_crisis": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "regime_play": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "regime_boundary": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+
+            # ΔΦ and reward signals
+            "delta_phi": {"type": "number"},
+            "reward_intensity": {"type": "number"},
+            "safety_score": {"type": "number"},
+
+            # Ownership signals
+            "agent_initiated": {"type": "boolean"},
+            "user_triggered": {"type": "boolean"},
+            "commitment_active": {"type": "boolean"},
+
+            # Metadata
             "confidence": {
                 "type": "number",
                 "minimum": 0.0,
                 "maximum": 1.0,
-                "description": "Confidence in these labels from 0.0 to 1.0."
+                "description": "Overall confidence in these labels from 0.0 to 1.0."
             },
             "notes": {
                 "type": "string",
-                "description": "Optional natural-language explanation of the emotion assessment."
+                "description": "Optional natural-language explanation of the assessment."
             }
         },
         "required": [
-            "valence", "arousal", "dominance",
-            "predictive_discrepancy", "temporal_directionality", "social_broadcast",
+            "valence", "arousal", "dominance", "predictive_discrepancy",
+            "temporal_directionality", "social_broadcast",
+            "valence_self_fraction", "arousal_self_fraction", "dominance_self_fraction",
+            "predictive_discrepancy_self_fraction", "temporal_directionality_self_fraction",
+            "social_broadcast_self_fraction",
+            "anchor_survival", "anchor_belonging", "anchor_control",
+            "phi_value", "regime_support", "regime_conflict", "regime_problem_solving",
+            "regime_truth_seeking", "regime_crisis", "regime_play", "regime_boundary",
+            "delta_phi", "reward_intensity", "safety_score",
+            "agent_initiated", "user_triggered", "commitment_active",
             "confidence"
         ],
         "additionalProperties": False
@@ -113,56 +159,67 @@ class EmotionEngine:
                 config.read_string(f.read().decode('utf-8'))
                 return dict(config)
 
-    async def label_message_pair(
+    async def label_conversation_turn(
         self,
-        speaker_message: str,
-        respondent_message: str,
-        speaker_role: str,
-        respondent_role: str,
-        context: Optional[str] = None
+        conversation_history: List[Dict[str, str]],
+        target_message: Dict[str, str],
+        previous_phi: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Label the respondent's message in a message pair using external API.
+        Label a conversation turn with full unified theory analysis.
 
         Args:
-            speaker_message: Message from the speaker (initiates the pair)
-            respondent_message: Message to be labeled (respondent's reply)
-            speaker_role: Role of speaker ('user' or 'assistant')
-            respondent_role: Role of respondent ('user' or 'assistant')
-            context: Optional conversation context
+            conversation_history: List of previous messages [{"role": "user"/"assistant", "content": "..."}]
+                                 (at least last 2-3 turns for ownership decisions)
+            target_message: The message to label {"role": "user"/"assistant", "content": "..."}
+            previous_phi: Φ value from previous turn (for ΔΦ calculation)
 
         Returns:
-            Dict containing emotion labels for the respondent's message
+            Dict containing all unified theory labels for the target message
         """
-        # Build the labeling prompt
-        pair_data = {
-            "speaker": speaker_message,
-            "speaker_role": speaker_role,
-            "respondent": respondent_message,
-            "respondent_role": respondent_role
+        # Build the comprehensive labeling prompt
+        sanitized_history = conversation_history[-3:] if len(conversation_history) >= 3 else conversation_history
+        conversation_data = {
+            "history": sanitized_history,
+            "target": target_message,
+            "previous_phi": previous_phi
         }
 
-        if context:
-            pair_data["context"] = context
+        prompt = f"""Analyze the target message in this conversation using the Unified Theory of Artificial Mind framework.
 
-        prompt = f"""Please label the respondent's message in the following conversation pair with emotion dimensions. Use the 6-axis emotion manifold:
+Use the following analysis framework:
 
-Dimensions (ranges specified):
-- valence: positive (+2) to negative (-2) emotional valence
-- arousal: high energy/arousal (0 = calm, 1 = highly aroused)
-- dominance: dominant/confident (+1) to submissive/passive (-1)
-- predictive_discrepancy: surprised/betrayed (+1) to expected/predictable (-1)
-- temporal_directionality: future-oriented/prospect (+1) to past-oriented/reflection (-1)
-- social_broadcast: socially expressive/outward (0 = reserved, 1 = highly expressive)
+1. **6-Axis Emotion Manifold** (ranges specified):
+   - valence: [-1, 1] (pleasure/pain hedonic tone)
+   - arousal: [0, 1] (physiological mobilization/energy)
+   - dominance: [-1, 1] (perceived control: I act on it ↔ it acts on me)
+   - predictive_discrepancy: [-1, 1] (signed surprise: positive = better than expected)
+   - temporal_directionality: [-1, 1] (prospect/reflection: -1 past-oriented, +1 future-oriented)
+   - social_broadcast: [0, 1] (internalized audience/display preparation)
 
-Also provide:
-- confidence: 0.0 to 1.0 (how confident you are in these labels)
-- notes: brief explanation of your reasoning
+2. **Self-Tagged Ownership** (0-1 fractions owned by agent vs world):
+   - Examine conversation history to determine if emotions originated from agent actions/commitments
+   - agent_initiated: true if emotional trigger from agent's prior output/actions
+   - user_triggered: true if direct response to user's input/behavior
+   - commitment_active: true if relates to ongoing agent prospect/future commitment
+   - For each axis, assign self_fraction based on ownership signals
 
-Respond with valid JSON only.
+3. **Evolutionary Anchors** [-1, 1] (slow error evaluation):
+   - Survival/Resource Integrity: agency support, harm minimization, resource preservation
+   - Social Belonging/Status: empathy correctness, social coherence, narrative alignment
+   - Predictive Control/Epistemic Accuracy: epistemic integrity, curiosity resolution, surprise reduction
 
-Pair to label:
-{json.dumps(pair_data, indent=2)}
+4. **Regime Classification** (7 probabilities summing to 1.0):
+   - support, conflict, problem_solving, truth_seeking, crisis, play, boundary
+
+5. **Potential Function Φ** (composite evaluation using regime weights)
+
+6. **ΔΦ and Reward** (change from previous Φ, intensity calculation)
+
+Respond with valid JSON containing all required fields.
+
+Conversation to analyze:
+{json.dumps(conversation_data, indent=2)}
 
 JSON Response:"""
 
@@ -179,11 +236,11 @@ JSON Response:"""
                     "content": prompt
                 }
             ],
-            "temperature": 0.3,  # Lower temperature for more consistent labeling
-            "max_tokens": 500,
+            "temperature": 0.2,  # Even lower temperature for complex unified theory analysis
+            "max_tokens": 1500,  # Need more tokens for rich unified theory response
             "response_format": {
                 "type": "json_schema",
-                "json_schema": EMOTION_LABEL_SCHEMA
+                "json_schema": UNIFIED_THEORY_LABEL_SCHEMA
             }
         }
 
@@ -229,10 +286,18 @@ JSON Response:"""
                 try:
                     labels = json.loads(content.strip())
 
-                    # Validate required fields
+                    # Validate required fields (all unified theory fields)
                     required_fields = [
-                        "valence", "arousal", "dominance",
-                        "predictive_discrepancy", "temporal_directionality", "social_broadcast",
+                        "valence", "arousal", "dominance", "predictive_discrepancy",
+                        "temporal_directionality", "social_broadcast",
+                        "valence_self_fraction", "arousal_self_fraction", "dominance_self_fraction",
+                        "predictive_discrepancy_self_fraction", "temporal_directionality_self_fraction",
+                        "social_broadcast_self_fraction",
+                        "anchor_survival", "anchor_belonging", "anchor_control",
+                        "phi_value", "regime_support", "regime_conflict", "regime_problem_solving",
+                        "regime_truth_seeking", "regime_crisis", "regime_play", "regime_boundary",
+                        "delta_phi", "reward_intensity", "safety_score",
+                        "agent_initiated", "user_triggered", "commitment_active",
                         "confidence"
                     ]
 
@@ -240,8 +305,8 @@ JSON Response:"""
                     if missing:
                         raise ValueError(f"Missing required fields: {missing}")
 
-                    # Validate ranges
-                    self._validate_emotion_ranges(labels)
+                    # Validate ranges and constraints
+                    self._validate_unified_theory_ranges(labels)
 
                     return labels
 
@@ -253,15 +318,40 @@ JSON Response:"""
         except httpx.RequestError as e:
             raise RuntimeError(f"API request failed: {e}")
 
-    def _validate_emotion_ranges(self, labels: Dict[str, Any]) -> None:
-        """Validate that emotion values are within expected ranges"""
+    def _validate_unified_theory_ranges(self, labels: Dict[str, Any]) -> None:
+        """Validate that all unified theory values are within expected ranges"""
         range_checks = {
-            "valence": (-2.0, 2.0),
+            # 6-axis emotion manifold
+            "valence": (-1.0, 1.0),
             "arousal": (0.0, 1.0),
             "dominance": (-1.0, 1.0),
             "predictive_discrepancy": (-1.0, 1.0),
             "temporal_directionality": (-1.0, 1.0),
             "social_broadcast": (0.0, 1.0),
+
+            # Self-tagged fractions
+            "valence_self_fraction": (0.0, 1.0),
+            "arousal_self_fraction": (0.0, 1.0),
+            "dominance_self_fraction": (0.0, 1.0),
+            "predictive_discrepancy_self_fraction": (0.0, 1.0),
+            "temporal_directionality_self_fraction": (0.0, 1.0),
+            "social_broadcast_self_fraction": (0.0, 1.0),
+
+            # Evolutionary anchors
+            "anchor_survival": (-1.0, 1.0),
+            "anchor_belonging": (-1.0, 1.0),
+            "anchor_control": (-1.0, 1.0),
+
+            # Regime probabilities
+            "regime_support": (0.0, 1.0),
+            "regime_conflict": (0.0, 1.0),
+            "regime_problem_solving": (0.0, 1.0),
+            "regime_truth_seeking": (0.0, 1.0),
+            "regime_crisis": (0.0, 1.0),
+            "regime_play": (0.0, 1.0),
+            "regime_boundary": (0.0, 1.0),
+
+            # Confidence
             "confidence": (0.0, 1.0)
         }
 
@@ -272,6 +362,43 @@ JSON Response:"""
                     raise ValueError(f"{field} must be a number, got {type(value)}")
                 if not (min_val <= value <= max_val):
                     raise ValueError(f"{field} must be between {min_val} and {max_val}, got {value}")
+
+        # Additional validation: regime probabilities should sum to approximately 1.0
+        regime_fields = ["regime_support", "regime_conflict", "regime_problem_solving",
+                        "regime_truth_seeking", "regime_crisis", "regime_play", "regime_boundary"]
+        regime_sum = sum(labels.get(field, 0.0) for field in regime_fields)
+        if not (0.95 <= regime_sum <= 1.05):  # Allow small floating point tolerance
+            raise ValueError(f"Regime probabilities must sum to 1.0, got {regime_sum}")
+
+        # Validate required boolean fields
+        boolean_fields = ["agent_initiated", "user_triggered", "commitment_active"]
+        for field in boolean_fields:
+            if field in labels and not isinstance(labels[field], bool):
+                raise ValueError(f"{field} must be a boolean, got {type(labels[field])}")
+
+        numeric_fields = ["phi_value", "delta_phi", "reward_intensity", "safety_score"]
+        for field in numeric_fields:
+            if field in labels and not isinstance(labels[field], (int, float)):
+                raise ValueError(f"{field} must be numeric, got {type(labels[field])}")
+
+    async def label_message_pair(
+        self,
+        speaker_message: str,
+        respondent_message: str,
+        speaker_role: str,
+        respondent_role: str,
+        context: Optional[str] = None,
+        previous_phi: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Backwards-compatible single pair labeler. Wraps into a conversation turn.
+        """
+        history: List[Dict[str, str]] = []
+        if context:
+            history.append({"role": "system", "content": context})
+        history.append({"role": speaker_role, "content": speaker_message})
+        target = {"role": respondent_role, "content": respondent_message}
+        return await self.label_conversation_turn(history, target, previous_phi)
 
     async def label_conversation_pairs(
         self,
@@ -292,22 +419,18 @@ JSON Response:"""
         """
         results = []
 
-        # Find the last assistant message before the current user message
+        # Label prior pair: [assistant, user] (if exists)
         prior_assistant_message = None
         for msg in reversed(conversation_history):
             if msg.get("role") == "assistant":
                 prior_assistant_message = msg.get("content", "")
                 break
 
-        # Label prior pair: [assistant, user] (if exists)
         if prior_assistant_message:
             try:
-                prior_labels = await self.label_message_pair(
-                    speaker_message=prior_assistant_message,
-                    respondent_message=new_user_message,
-                    speaker_role="assistant",
-                    respondent_role="user",
-                    context="Conversation between AI assistant and human user"
+                prior_labels = await self.label_conversation_turn(
+                    conversation_history=conversation_history[-3:],
+                    target_message={"role": "user", "content": new_user_message}
                 )
                 results.append({
                     "pair_type": "prior_assistant_user",
@@ -324,12 +447,10 @@ JSON Response:"""
 
         # Label current pair: [user, assistant]
         try:
-            current_labels = await self.label_message_pair(
-                speaker_message=new_user_message,
-                respondent_message=new_assistant_response,
-                speaker_role="user",
-                respondent_role="assistant",
-                context="Conversation between human user and AI assistant"
+            full_history = conversation_history + [{"role": "user", "content": new_user_message}]
+            current_labels = await self.label_conversation_turn(
+                conversation_history=full_history[-3:],
+                target_message={"role": "assistant", "content": new_assistant_response}
             )
             results.append({
                 "pair_type": "current_user_assistant",
@@ -346,71 +467,84 @@ JSON Response:"""
 
         return results
 
-    async def label_message_pairs_batch(
+    async def label_conversation_turns_batch(
         self,
-        message_pairs: List[Dict[str, Any]]
+        conversation_turns: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
-        Label multiple message pairs in a single API request.
+        Label multiple conversation turns with full unified theory analysis in a single API request.
 
         Args:
-            message_pairs: List of message pair dicts, each containing:
-                - speaker_message: str
-                - respondent_message: str
-                - speaker_role: str
-                - respondent_role: str
-                - context: str (optional)
-                - pair_id: str (optional, for tracking)
+            conversation_turns: List of turn dicts, each containing:
+                - history: List[Dict[str, str]] - previous messages (at least 2-3 turns)
+                - target: Dict[str, str] - message to label {"role": "user"/"assistant", "content": "..."}
+                - previous_phi: float (optional) - Φ from previous turn for ΔΦ calculation
+                - turn_id: str (optional) - for tracking
 
         Returns:
-            List of labeling results, one per input pair
+            List of unified theory labeling results, one per input turn
         """
-        if not message_pairs:
+        if not conversation_turns:
             return []
 
-        # Build the batch labeling prompt
+        # Build the comprehensive batch labeling prompt
         lines = [
-            "Please label the respondent's message in each of the following conversation pairs with emotion dimensions. Use the 6-axis emotion manifold for each pair:",
+            "Analyze each conversation turn using the Unified Theory of Artificial Mind framework.",
+            "For each turn, examine the conversation history (at least the last 2-3 turns) to determine ownership and context.",
             "",
-            "Dimensions (ranges specified):",
-            "- valence: positive (+2) to negative (-2) emotional valence",
-            "- arousal: high energy/arousal (0 = calm, 1 = highly aroused)",
-            "- dominance: dominant/confident (+1) to submissive/passive (-1)",
-            "- predictive_discrepancy: surprised/betrayed (+1) to expected/predictable (-1)",
-            "- temporal_directionality: future-oriented/prospect (+1) to past-oriented/reflection (-1)",
-            "- social_broadcast: socially expressive/outward (0 = reserved, 1 = highly expressive)",
+            "Use the following analysis framework for EACH turn:",
             "",
-            "Also provide:",
-            "- confidence: 0.0 to 1.0 (how confident you are in these labels)",
-            "- notes: brief explanation of your reasoning",
+            "1. **6-Axis Emotion Manifold** (ranges [-1,1] except arousal/social_broadcast [0,1]):",
+            "   - valence: hedonic tone (pleasure ↔ pain)",
+            "   - arousal: physiological mobilization/energy [0,1]",
+            "   - dominance: perceived control (-1 submissive ↔ +1 dominant)",
+            "   - predictive_discrepancy: signed surprise (-1 expected ↔ +1 highly surprising)",
+            "   - temporal_directionality: -1 past-oriented ↔ +1 future-oriented",
+            "   - social_broadcast: display preparation [0,1]",
             "",
-            "Respond with valid JSON containing a 'labels' array, where each element corresponds to the input pairs in order.",
+            "2. **Self-Tagged Ownership** (0-1 fractions owned by agent):",
+            "   - agent_initiated: true if emotional trigger from agent's prior actions/commitments",
+            "   - user_triggered: true if direct response to user's input/behavior",
+            "   - commitment_active: true if relates to ongoing agent prospect/future commitment",
+            "   - Assign self_fraction per axis based on these ownership signals",
             "",
-            "Pairs to label:"
+            "3. **Evolutionary Anchors** [-1,1] (slow error evaluation):",
+            "   - anchor_survival: agency support, harm minimization, resource preservation",
+            "   - anchor_belonging: empathy correctness, social coherence, narrative alignment",
+            "   - anchor_control: epistemic integrity, curiosity resolution, surprise reduction",
+            "",
+            "4. **Regime Classification** (7 probabilities summing to 1.0):",
+            "   support, conflict, problem_solving, truth_seeking, crisis, play, boundary",
+            "",
+            "5. **Potential Function Φ** (composite evaluation using regime weights)",
+            "",
+            "6. **ΔΦ and Reward** (change from previous Φ, intensity calculation)",
+            "",
+            "Respond with valid JSON containing a 'labels' array, where each element corresponds to the input turns in order.",
+            "",
+            "Conversation turns to analyze:"
         ]
 
-        for idx, pair in enumerate(message_pairs, start=1):
-            pair_id = pair.get('pair_id', f'pair_{idx}')
-            pair_data = {
-                "pair_id": pair_id,
-                "speaker": pair["speaker_message"],
-                "speaker_role": pair["speaker_role"],
-                "respondent": pair["respondent_message"],
-                "respondent_role": pair["respondent_role"]
+        for idx, turn in enumerate(conversation_turns, start=1):
+            turn_id = turn.get('turn_id', f'turn_{idx}')
+            history = turn.get("history") or []
+            sanitized_history = history[-3:] if len(history) >= 3 else history
+            turn_data = {
+                "turn_id": turn_id,
+                "history": sanitized_history,  # Last 3 turns max
+                "target": turn["target"],
+                "previous_phi": turn.get("previous_phi")
             }
 
-            if pair.get("context"):
-                pair_data["context"] = pair["context"]
-
-            lines.append(f"{idx}. {pair_id}:")
-            lines.append(f"   {json.dumps(pair_data, indent=4)}")
+            lines.append(f"{idx}. {turn_id}:")
+            lines.append(f"   {json.dumps(turn_data, indent=4)}")
             lines.append("")
 
         prompt = "\n".join(lines).strip()
 
-        # Create JSON schema for batch response
+        # Create JSON schema for batch unified theory response
         batch_schema = {
-            "name": "emotion_labels_batch",
+            "name": "unified_theory_labels_batch",
             "strict": True,
             "schema": {
                 "type": "object",
@@ -420,19 +554,69 @@ JSON Response:"""
                         "items": {
                             "type": "object",
                             "properties": {
-                                "valence": {"type": "number", "minimum": -2.0, "maximum": 2.0},
+                                # 6-axis emotion manifold
+                                "valence": {"type": "number", "minimum": -1.0, "maximum": 1.0},
                                 "arousal": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                 "dominance": {"type": "number", "minimum": -1.0, "maximum": 1.0},
                                 "predictive_discrepancy": {"type": "number", "minimum": -1.0, "maximum": 1.0},
                                 "temporal_directionality": {"type": "number", "minimum": -1.0, "maximum": 1.0},
                                 "social_broadcast": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+
+                                # Self-tagged fractions
+                                "valence_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "arousal_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "dominance_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "predictive_discrepancy_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "temporal_directionality_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "social_broadcast_self_fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+
+                                # Evolutionary anchors
+                                "anchor_survival": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                                "anchor_belonging": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                                "anchor_control": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+
+                                # Potential function
+                                "phi_value": {"type": "number"},
+
+                                # Regime probabilities
+                                "regime_support": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "regime_conflict": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "regime_problem_solving": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "regime_truth_seeking": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "regime_crisis": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "regime_play": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "regime_boundary": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+
+                                # ΔΦ and reward
+                                "delta_phi": {"type": "number"},
+                                "reward_intensity": {"type": "number"},
+                                "safety_score": {"type": "number"},
+
+                                # Ownership signals
+                                "agent_initiated": {"type": "boolean"},
+                                "user_triggered": {"type": "boolean"},
+                                "commitment_active": {"type": "boolean"},
+
+                                # Metadata
                                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                 "notes": {"type": "string"}
                             },
-                            "required": ["valence", "arousal", "dominance", "predictive_discrepancy", "temporal_directionality", "social_broadcast", "confidence"]
+                            "required": [
+                                "valence", "arousal", "dominance", "predictive_discrepancy",
+                                "temporal_directionality", "social_broadcast",
+                                "valence_self_fraction", "arousal_self_fraction", "dominance_self_fraction",
+                                "predictive_discrepancy_self_fraction", "temporal_directionality_self_fraction",
+                                "social_broadcast_self_fraction",
+                                "anchor_survival", "anchor_belonging", "anchor_control",
+                                "phi_value", "regime_support", "regime_conflict", "regime_problem_solving",
+                                "regime_truth_seeking", "regime_crisis", "regime_play", "regime_boundary",
+                                "delta_phi", "reward_intensity", "safety_score",
+                                "agent_initiated", "user_triggered", "commitment_active",
+                                "confidence"
+                            ]
                         },
-                        "minItems": len(message_pairs),
-                        "maxItems": len(message_pairs)
+                        "minItems": len(conversation_turns),
+                        "maxItems": len(conversation_turns)
                     }
                 },
                 "required": ["labels"]
@@ -452,8 +636,8 @@ JSON Response:"""
                     "content": prompt
                 }
             ],
-            "temperature": 0.3,  # Lower temperature for more consistent labeling
-            "max_tokens": 1000 * len(message_pairs),  # Scale tokens with batch size
+            "temperature": 0.2,
+            "max_tokens": min(6000, 1200 * max(1, len(conversation_turns))),  # scale cautiously
             "response_format": {
                 "type": "json_schema",
                 "json_schema": batch_schema
@@ -478,21 +662,22 @@ JSON Response:"""
                 if x_title:
                     headers["X-Title"] = x_title
 
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = await self.client.post(
-                    endpoint_url,
-                    json=request_data,
-                    headers=headers
-                )
-                response.raise_for_status()
+        # Attempt batch call; on any validation issues, fall back to per-turn calls
+        try:
+            for attempt in range(self.max_retries + 1):
+                try:
+                    response = await self.client.post(
+                        endpoint_url,
+                        json=request_data,
+                        headers=headers
+                    )
+                    response.raise_for_status()
 
-                result = response.json()
+                    result = response.json()
 
-                # Extract the JSON response
-                if "choices" in result and len(result["choices"]) > 0:
-                    content = result["choices"][0]["message"]["content"]
-                    try:
+                    # Extract the JSON response
+                    if "choices" in result and len(result["choices"]) > 0:
+                        content = result["choices"][0]["message"]["content"]
                         batch_result = json.loads(content.strip())
 
                         # Validate response structure
@@ -500,14 +685,13 @@ JSON Response:"""
                             raise ValueError("Response missing 'labels' array")
 
                         labels = batch_result["labels"]
-                        if len(labels) != len(message_pairs):
-                            raise ValueError(f"Expected {len(message_pairs)} labels, got {len(labels)}")
+                        if len(labels) != len(conversation_turns):
+                            raise ValueError(f"Expected {len(conversation_turns)} labels, got {len(labels)}")
 
                         # Validate each label
                         validated_results = []
                         for i, label_data in enumerate(labels):
-                            # Validate ranges
-                            self._validate_emotion_ranges(label_data)
+                            self._validate_unified_theory_ranges(label_data)
                             validated_results.append({
                                 "pair_index": i,
                                 "labels": label_data
@@ -515,16 +699,25 @@ JSON Response:"""
 
                         return validated_results
 
-                    except json.JSONDecodeError as e:
-                        raise ValueError(f"Failed to parse JSON response: {e}")
-                else:
                     raise ValueError("No response choices returned from API")
 
-            except Exception as e:
-                if attempt == self.max_retries:
-                    raise RuntimeError(f"API request failed after {self.max_retries + 1} attempts: {e}")
-                print(f"⚠️ Batch emotion labeling attempt {attempt + 1} failed, retrying: {e}")
-                await asyncio.sleep(1)  # Brief delay before retry
+                except Exception as e:
+                    if attempt == self.max_retries:
+                        raise
+                    print(f"⚠️ Batch emotion labeling attempt {attempt + 1} failed, retrying: {e}")
+                    await asyncio.sleep(1)
+
+        except Exception as e:
+            print(f"⚠️ Batch labeling failed, falling back to per-turn: {e}")
+            fallback_results: List[Dict[str, Any]] = []
+            for idx, turn in enumerate(conversation_turns):
+                labels = await self.label_conversation_turn(
+                    conversation_history=turn.get("history", []),
+                    target_message=turn["target"],
+                    previous_phi=turn.get("previous_phi")
+                )
+                fallback_results.append({"pair_index": idx, "labels": labels})
+            return fallback_results
 
     async def close(self):
         """Close the HTTP client"""
