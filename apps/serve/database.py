@@ -8,9 +8,12 @@ import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import os
+import uuid
 
 class DatabaseManager:
     """SQLite database manager for conversations and labels"""
+
+    CANONICAL_ID = "canonical"
 
     def __init__(self, db_path: str):
         """Initialize database connection and create tables if needed"""
@@ -20,6 +23,7 @@ class DatabaseManager:
 
         # Create tables if they don't exist
         self._create_tables()
+        self._ensure_canonical_conversation()
 
     def _create_tables(self):
         """Create database tables from schema"""
@@ -32,16 +36,62 @@ class DatabaseManager:
             self.connection.executescript(schema)
             self.connection.commit()
 
+    def _ensure_canonical_conversation(self) -> None:
+        """Ensure the canonical conversation row exists."""
+        cursor = self.connection.execute(
+            "SELECT 1 FROM conversations WHERE conversation_id = ?",
+            (self.CANONICAL_ID,),
+        )
+        if cursor.fetchone():
+            return
+
+        self.connection.execute(
+            """
+            INSERT INTO conversations (id, conversation_id, title)
+            VALUES (1, ?, 'Canonical Conversation')
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (self.CANONICAL_ID,),
+        )
+        self.connection.commit()
+
+    @staticmethod
+    def _canonical_db_id() -> int:
+        return 1
+
+    def _recalculate_context_tokens(self) -> None:
+        cursor = self.connection.execute(
+            """
+            SELECT COALESCE(SUM(COALESCE(token_count, 0)), 0) AS total_tokens
+            FROM messages
+            WHERE archived = 0
+            """
+        )
+        total = cursor.fetchone()["total_tokens"]
+        self.connection.execute(
+            """
+            UPDATE conversations
+            SET context_tokens = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (total,),
+        )
+        self.connection.commit()
+
     def close(self):
         """Close database connection"""
         if self.connection:
             self.connection.close()
 
     def get_conversations(self) -> List[Dict[str, Any]]:
-        """Get all active conversations"""
+        """Return the single canonical conversation entry."""
         cursor = self.connection.execute("""
             SELECT id, conversation_id, title, created_at, updated_at,
-                   json_extract(metadata, '$') as metadata
+                   json_extract(metadata, '$') as metadata,
+                   window_token_limit,
+                   saturation_threshold,
+                   context_tokens,
+                   last_sleep_at
             FROM conversations
             WHERE is_active = TRUE
             ORDER BY updated_at DESC
@@ -53,12 +103,19 @@ class DatabaseManager:
         self,
         conversation_id: str,
         include_introspection: bool = False,
+        include_archived: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Get a specific conversation with all messages and labels."""
-        # Get conversation info
+        """Get the canonical conversation with all messages and labels."""
+        if conversation_id != self.CANONICAL_ID:
+            raise ValueError("Only the canonical conversation is supported.")
+
         cursor = self.connection.execute("""
             SELECT id, conversation_id, title, created_at, updated_at,
-                   json_extract(metadata, '$') as metadata
+                   json_extract(metadata, '$') as metadata,
+                   window_token_limit,
+                   saturation_threshold,
+                   context_tokens,
+                   last_sleep_at
             FROM conversations
             WHERE conversation_id = ? AND is_active = TRUE
         """, (conversation_id,))
@@ -97,8 +154,9 @@ class DatabaseManager:
             LEFT JOIN emotion_labels el_user ON m.id = el_user.message_id AND el_user.labeler = 'user'
             LEFT JOIN emotion_labels el_auto ON m.id = el_auto.message_id AND el_auto.labeler = 'auto'
             WHERE m.conversation_id = (SELECT id FROM conversations WHERE conversation_id = ?)
+              AND (? OR m.archived = 0)
             ORDER BY m.message_index ASC
-        """, (conversation_id,))
+        """, (conversation_id, int(include_archived)))
 
         messages = []
         for row in cursor.fetchall():
@@ -153,30 +211,30 @@ class DatabaseManager:
         return conversation
 
     def create_conversation(self, conversation_id: str, title: Optional[str] = None) -> int:
-        """Create a new conversation"""
-        cursor = self.connection.execute("""
-            INSERT INTO conversations (conversation_id, title)
-            VALUES (?, ?)
-        """, (conversation_id, title))
-
+        """Maintain backwards compatibility; only the canonical conversation exists."""
+        if conversation_id != self.CANONICAL_ID:
+            raise ValueError("Multiple conversations are no longer supported.")
+        self.connection.execute(
+            """
+            UPDATE conversations
+            SET title = COALESCE(?, title),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (title,),
+        )
         self.connection.commit()
-        return cursor.lastrowid
+        return 1
 
-    def add_message(self, conversation_id: str, role: str, content: str,
+    def add_message(self, conversation_id: str = CANONICAL_ID, role: str = "user", content: str = "",
                    token_count: Optional[int] = None,
                    processing_time_ms: Optional[int] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> int:
-        """Add a message to a conversation"""
-        # Get conversation ID
-        cursor = self.connection.execute(
-            "SELECT id FROM conversations WHERE conversation_id = ?",
-            (conversation_id,)
-        )
-        conv_row = cursor.fetchone()
-        if not conv_row:
-            raise ValueError(f"Conversation {conversation_id} not found")
+        """Add a message to the canonical conversation."""
+        if conversation_id != self.CANONICAL_ID:
+            raise ValueError("Conversation mismatch; only the canonical conversation is supported.")
 
-        conv_db_id = conv_row[0]
+        conv_db_id = self._canonical_db_id()
 
         # Get next message index
         cursor = self.connection.execute(
@@ -203,6 +261,7 @@ class DatabaseManager:
         """, (conv_db_id,))
 
         self.connection.commit()
+        self._recalculate_context_tokens()
         return message_index
 
     def add_emotion_label(self, conversation_id: str, message_index: int, labeler: str,
@@ -376,6 +435,122 @@ class DatabaseManager:
         deleted = cursor.rowcount
         self.connection.commit()
         return deleted
+
+    # ------------------------------------------------------------------
+    # Canonical context + sleep helpers
+    # ------------------------------------------------------------------
+
+    def get_context_window_stats(self) -> Dict[str, Any]:
+        cursor = self.connection.execute(
+            """
+            SELECT window_token_limit, saturation_threshold, context_tokens, last_sleep_at
+            FROM conversations
+            WHERE id = 1
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise RuntimeError("Canonical conversation state missing.")
+        limit = row["window_token_limit"]
+        threshold = row["saturation_threshold"]
+        tokens = row["context_tokens"]
+        percent = tokens / limit if limit else 0.0
+        return {
+            "token_limit": limit,
+            "threshold_ratio": threshold,
+            "current_tokens": tokens,
+            "percent_of_limit": percent,
+            "last_sleep_at": row["last_sleep_at"],
+            "should_sleep": percent >= threshold,
+        }
+
+    def needs_sleep_cycle(self) -> bool:
+        stats = self.get_context_window_stats()
+        return stats["should_sleep"]
+
+    def archive_messages_for_sleep(self, keep_fraction: float = 0.2) -> Optional[Dict[str, Any]]:
+        cursor = self.connection.execute(
+            """
+            SELECT id, message_index, role, content,
+                   COALESCE(token_count, 0) AS token_count,
+                   metadata
+            FROM messages
+            WHERE archived = 0
+            ORDER BY message_index ASC
+            """
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+
+        total = len(rows)
+        archive_count = int(total * (1.0 - keep_fraction))
+        if archive_count < 1:
+            return None
+
+        to_archive = rows[:archive_count]
+        token_sum = sum(row["token_count"] for row in to_archive)
+        batch_uuid = str(uuid.uuid4())
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO sleep_batches (batch_uuid, status, message_count, token_count)
+            VALUES (?, 'pending', ?, ?)
+            """,
+            (batch_uuid, len(to_archive), token_sum),
+        )
+        batch_id = cursor.lastrowid
+
+        for row in to_archive:
+            self.connection.execute(
+                """
+                INSERT INTO sleep_batch_messages (batch_id, message_index, role, content, token_count, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    row["message_index"],
+                    row["role"],
+                    row["content"],
+                    row["token_count"],
+                    row["metadata"],
+                ),
+            )
+
+        message_ids = [row["id"] for row in to_archive]
+        placeholders = ",".join(["?"] * len(message_ids))
+        self.connection.execute(
+            f"""
+            UPDATE messages
+            SET archived = 1, sleep_batch_id = ?
+            WHERE id IN ({placeholders})
+            """,
+            (batch_id, *message_ids),
+        )
+
+        self.connection.execute(
+            """
+            UPDATE conversations
+            SET updated_at = CURRENT_TIMESTAMP,
+                context_tokens = (
+                    SELECT COALESCE(SUM(COALESCE(token_count, 0)), 0)
+                    FROM messages
+                    WHERE archived = 0
+                ),
+                last_sleep_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """
+        )
+
+        self.connection.commit()
+
+        return {
+            "batch_id": batch_id,
+            "batch_uuid": batch_uuid,
+            "archived_messages": len(to_archive),
+            "archived_tokens": token_sum,
+            "remaining_messages": total - archive_count,
+        }
 
     def get_training_data(self, start_date: Optional[str] = None,
                          end_date: Optional[str] = None,

@@ -1,32 +1,79 @@
--- Conversation and labeling database schema for hominem serving system
--- This is the canonical source of truth for conversation history and labels
+PRAGMA foreign_keys = OFF;
+DROP TABLE IF EXISTS emotion_labels;
+DROP TABLE IF EXISTS reward_labels;
+DROP TABLE IF EXISTS introspection_buffer;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS conversations;
+DROP TABLE IF EXISTS sleep_batches;
+DROP TABLE IF EXISTS sleep_batch_messages;
+PRAGMA foreign_keys = ON;
 
--- Main conversations table (canonical conversation history)
+-- Canonical conversation metadata (single row)
 CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT UNIQUE NOT NULL,  -- UUID for conversation thread
-    title TEXT,  -- Auto-generated or user-set title
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    conversation_id TEXT UNIQUE NOT NULL CHECK (conversation_id = 'canonical'),
+    title TEXT DEFAULT 'Canonical Conversation',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    metadata JSON,  -- Model version, temperature, etc.
-    is_active BOOLEAN DEFAULT TRUE  -- For soft deletion
+    metadata JSON,
+    is_active BOOLEAN DEFAULT TRUE,
+    window_token_limit INTEGER NOT NULL DEFAULT 32768,
+    saturation_threshold REAL NOT NULL DEFAULT 0.75,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    last_sleep_at DATETIME
 );
 
--- Individual messages within conversations
+INSERT INTO conversations (id, conversation_id, title)
+SELECT 1, 'canonical', 'Canonical Conversation'
+WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE id = 1);
+
+-- Canonical message log (single ordered stream)
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER NOT NULL,
-    message_index INTEGER NOT NULL,  -- Order within conversation (0-based)
-    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),  -- Message sender
+    conversation_id INTEGER NOT NULL DEFAULT 1 CHECK (conversation_id = 1),
+    message_index INTEGER NOT NULL UNIQUE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'sleep_header')),
     content TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    token_count INTEGER,  -- Approximate token count
-    processing_time_ms INTEGER,  -- How long AI took to respond
-    metadata JSON,  -- Model info, temperature, etc.
+    token_count INTEGER,
+    processing_time_ms INTEGER,
+    metadata JSON,
+    archived BOOLEAN DEFAULT FALSE,
+    sleep_batch_id INTEGER,
 
     FOREIGN KEY (conversation_id) REFERENCES conversations(id),
-    UNIQUE(conversation_id, message_index)
+    FOREIGN KEY (sleep_batch_id) REFERENCES sleep_batches(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_active ON messages(archived, message_index);
+CREATE INDEX IF NOT EXISTS idx_messages_sleep ON messages(sleep_batch_id);
+
+-- Sleep batches capture archived context windows queued for consolidation
+CREATE TABLE IF NOT EXISTS sleep_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_uuid TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')) DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    processed_at DATETIME,
+    message_count INTEGER DEFAULT 0,
+    token_count INTEGER DEFAULT 0,
+    metadata JSON
+);
+
+-- Snapshot of messages assigned to a sleep batch (immutable)
+CREATE TABLE IF NOT EXISTS sleep_batch_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    message_index INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    token_count INTEGER,
+    metadata JSON,
+
+    FOREIGN KEY (batch_id) REFERENCES sleep_batches(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sleep_batch_messages ON sleep_batch_messages(batch_id, message_index);
 
 -- Introspection buffer (self-observations for self-awareness)
 CREATE TABLE IF NOT EXISTS introspection_buffer (
