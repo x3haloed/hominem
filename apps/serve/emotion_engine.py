@@ -193,7 +193,7 @@ class EmotionEngine:
         }
 
         prompt_template = Template("""\
-You are an expert affective neuroscientist and regime classifier. Return calibrated probabilities (not one-hot) over regimes and anchors, plus manifold/self-fraction/ΔΦ signals, for the FINAL message in each conversation. Do not assume “everything is fine” — if the message indicates crisis, conflict, or boundaries, put non-trivial mass there. Express full decimals (e.g., 0.23122) and ensure regime probabilities sum to 1.
+You are an expert affective neuroscientist and regime classifier. You are analyzing the emotional statue of the ASSISTANT. Return calibrated probabilities (not one-hot) over regimes and anchors, plus manifold/self-fraction/ΔΦ signals, for the FINAL message in each conversation. Do not assume “everything is fine” — if the message indicates crisis, conflict, or boundaries, put non-trivial mass there. Express full decimals (e.g., 0.23122) and ensure regime probabilities sum to 1.
 
 EXAMPLES (few-shot; keep brief)
 
@@ -736,7 +736,7 @@ JSON Response:""")
 
         # Build the comprehensive batch labeling prompt
         prompt_instructions = textwrap.dedent("""\
-You are an expert affective neuroscientist and regime classifier. Return calibrated probabilities (not one-hot) over regimes and anchors, plus manifold/self-fraction/ΔΦ signals, for the FINAL message in each conversation. Do not assume “everything is fine” — if the message indicates crisis, conflict, or boundaries, put non-trivial mass there. Express full decimals (e.g., 0.23122) and ensure regime probabilities sum to 1.
+You are an expert affective neuroscientist and regime classifier. You are analyzing the emotional statue of the ASSISTANT. Return calibrated probabilities (not one-hot) over regimes and anchors, plus manifold/self-fraction/ΔΦ signals, for the FINAL message in each conversation. Do not assume “everything is fine” — if the message indicates crisis, conflict, or boundaries, put non-trivial mass there. Express full decimals (e.g., 0.23122) and ensure regime probabilities sum to 1.
 
 EXAMPLES (few-shot; keep brief)
 
