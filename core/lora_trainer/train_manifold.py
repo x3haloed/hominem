@@ -119,6 +119,8 @@ def main() -> None:
         help="Base model ID for regression head",
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Number of steps to accumulate gradients")
     parser.add_argument("--num-epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max-length", type=int, default=512)
@@ -199,6 +201,7 @@ def main() -> None:
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_epochs,
         learning_rate=args.lr,
         eval_strategy=eval_strategy,
