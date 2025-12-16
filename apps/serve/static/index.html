@@ -1,116 +1,94 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hominem LoRA Chat</title>
-    <link rel="stylesheet" href="/static/style.css">
+  <meta charset="UTF-8">
+  <title>Unified Theory Chat</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f6f6f8; color: #222; }
+    header { background: #111; color: #fff; padding: 12px 16px; }
+    main { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; padding: 16px; }
+    #chat { background: #fff; border-radius: 8px; padding: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); height: 80vh; display: flex; flex-direction: column; }
+    #log { flex: 1; overflow-y: auto; padding: 8px; }
+    .msg { margin-bottom: 10px; }
+    .role { font-weight: bold; }
+    #inputRow { display: flex; gap: 8px; }
+    #inputRow textarea { flex: 1; resize: vertical; min-height: 48px; }
+    button { padding: 8px 12px; }
+    #metrics { background: #fff; border-radius: 8px; padding: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); height: 80vh; overflow-y: auto; font-size: 13px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+  </style>
 </head>
 <body>
-    <div id="app">
-        <!-- Sidebar with conversations -->
-        <div id="sidebar">
-            <div id="sidebar-header">
-                <button id="new-conversation-btn">New Chat</button>
-            </div>
+  <header>
+    <h2>Unified Theory Chat</h2>
+  </header>
+  <main>
+    <section id="chat">
+      <div id="log"></div>
+      <div style="padding-bottom: 8px;">
+        <label><input type="checkbox" id="thinkingToggle"> Enable thinking mode</label>
+      </div>
+      <div id="inputRow">
+        <textarea id="input" placeholder="Say something..."></textarea>
+        <button id="send">Send</button>
+      </div>
+    </section>
+    <section id="metrics">
+      <h3>Metrics (last turn)</h3>
+      <pre id="metricsPre">—</pre>
+    </section>
+  </main>
+  <script>
+    const convoId = "canonical";
+    const logEl = document.getElementById("log");
+    const inputEl = document.getElementById("input");
+    const sendEl = document.getElementById("send");
+    const metricsEl = document.getElementById("metricsPre");
+    const thinkingToggle = document.getElementById("thinkingToggle");
 
-            <!-- Model status -->
-            <div id="model-status">
-                <div id="model-info">
-                    <div class="model-indicator" id="model-indicator">
-                        <span class="status-dot" id="status-dot"></span>
-                        <span id="model-name">No Model</span>
-                    </div>
-                    <button id="model-settings-btn">⚙️</button>
-                </div>
-            </div>
-            <div id="conversations-list">
-                <!-- Conversations will be loaded here -->
-            </div>
-        </div>
+    function append(role, content) {
+      const div = document.createElement("div");
+      div.className = "msg";
+      div.innerHTML = `<span class="role">${role}:</span> ${content}`;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
 
-        <!-- Main chat area -->
-        <div id="main">
-            <div id="chat-header">
-                <h1 id="conversation-title">Select a conversation</h1>
-                <div id="chat-controls">
-                    <label class="control-toggle">
-                        <input type="checkbox" id="thinking-toggle" checked>
-                        <span class="toggle-slider"></span>
-                        Thinking Mode
-                    </label>
-                </div>
-            </div>
+    async function loadMessages() {
+      const res = await fetch(`/messages?conversation_id=${encodeURIComponent(convoId)}&limit=200`);
+      const data = await res.json();
+      logEl.innerHTML = "";
+      data.messages.forEach(m => append(m.role, m.content));
+    }
 
-            <div id="messages-container">
-                <!-- Messages will appear here -->
-                <div id="welcome-message" class="message assistant">
-                    <div class="message-content">
-                        <p>Welcome to Hominem! Start a new conversation or select an existing one.</p>
-                    </div>
-                </div>
-            </div>
+    async function send() {
+      const userMsg = inputEl.value.trim();
+      if (!userMsg) return;
+      append("user", userMsg);
+      inputEl.value = "";
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          conversation_id: convoId,
+          user_message: userMsg,
+          enable_thinking: thinkingToggle.checked,
+        })
+      });
+      const data = await res.json();
+      append("assistant", data.assistant);
+      metricsEl.textContent = JSON.stringify(data.metrics, null, 2);
+    }
 
-            <div id="input-container">
-                <div id="message-input-wrapper">
-                    <textarea
-                        id="message-input"
-                        placeholder="Type your message here..."
-                        rows="1"
-                        maxlength="4000"
-                    ></textarea>
-                    <button id="send-btn" disabled>Send</button>
-                </div>
-                <div id="input-status">
-                    <span id="status-text">Ready</span>
-                    <div id="typing-indicator" style="display: none;">
-                        <span></span><span></span><span></span>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
+    sendEl.onclick = send;
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
 
-    <!-- Emotion labeling modal/popup -->
-    <div id="emotion-labeler" class="emotion-labeler hidden">
-        <div class="emotion-reactions">
-            <!-- Reaction buttons will be populated here -->
-        </div>
-        <div class="emotion-details">
-            <div class="emotion-sliders">
-                <!-- Detailed sliders for fine-tuning -->
-            </div>
-            <div class="emotion-notes">
-                <textarea placeholder="Optional notes..."></textarea>
-            </div>
-            <div class="emotion-actions">
-                <button class="save-btn">Save Labels</button>
-                <button class="cancel-btn">Cancel</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Model selection modal -->
-    <div id="model-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="model-modal-title">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 id="model-modal-title">Select Model</h2>
-                <button id="model-modal-close" aria-label="Close model selection">✕</button>
-            </div>
-            <div class="modal-body">
-                <label for="base-model-select">Base model</label>
-                <select id="base-model-select"></select>
-
-                <label for="lora-select">LoRA adapter</label>
-                <select id="lora-select"></select>
-            </div>
-            <div class="modal-actions">
-                <button id="model-modal-cancel">Cancel</button>
-                <button id="model-modal-load" class="primary">Load Model</button>
-            </div>
-        </div>
-    </div>
-
-    <script src="/static/app.js"></script>
+    loadMessages();
+  </script>
 </body>
 </html>

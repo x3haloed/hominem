@@ -1,697 +1,272 @@
 #!/usr/bin/env python3
 """
-Hominem LoRA Serving System with Emotion Labeling UI
+Unified Theory chat server (fresh implementation)
 
-Launches a web interface for chatting with LoRA models and labeling emotions.
-Provides real-time conversation and emotion labeling capabilities.
+Features:
+- Loads base LM (Qwen3-1.7B) + optional LoRA adapter
+- Loads frozen manifold/regime heads
+- Runs agent loop with self-tagging, anchors, Φ/ΔΦ, RewardIntensity
+- Provides simple FastAPI with /chat and /sleep endpoints
 """
 
+from __future__ import annotations
+
 import os
-import asyncio
-import threading
-import webbrowser
-from contextlib import asynccontextmanager
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-import uuid
+import json
+import subprocess
 from pathlib import Path
+from typing import Any, Dict
+from datetime import datetime
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-import sqlite3
-import json
-import time
-
 from dotenv import load_dotenv
 
-# Load environment variables
-try:
-    load_dotenv()
-except Exception as e:
-    print(f"Warning: Could not load .env file: {e}")
+from apps.serve.agent_runtime import AgentRuntime, ConversationState, TurnMetrics
+from apps.serve.database import ConversationDB
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "storage/conversations.db")
-AUTO_LOAD_LORA = os.getenv("AUTO_LOAD_LORA")
-BASE_MODEL_PATH = os.getenv("BASE_MODEL_PATH")
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-# Self-awareness configuration
-ENABLE_SELF_AWARENESS = os.getenv("ENABLE_SELF_AWARENESS", "true").lower() == "true"
-SELF_AWARENESS_MAX_LINES = int(os.getenv("SELF_AWARENESS_MAX_INTROSPECTION_LINES", "16"))
-ENABLE_PERSPECTIVE_GATE = os.getenv("SELF_AWARENESS_ENABLE_PERSPECTIVE_GATE", "true").lower() == "true"
-SELF_AWARENESS_PERSPECTIVE_GATE_ASYNC = os.getenv("SELF_AWARENESS_PERSPECTIVE_GATE_ASYNC", "false").lower() == "true"
-SELF_AWARENESS_USE_FAST_MODEL = os.getenv("SELF_AWARENESS_USE_FAST_MODEL", "false").lower() == "true"
-SELF_AWARENESS_TOKEN = os.getenv("SELF_AWARENESS_TOKEN", "<SELF>")
-SELF_AWARENESS_MAX_INTENSITY = float(os.getenv("SELF_AWARENESS_MAX_INTENSITY", "5.0"))
-SELF_AWARENESS_NOVELTY_THRESHOLD = float(os.getenv("SELF_AWARENESS_NOVELTY_THRESHOLD", "0.85"))
-SELF_AWARENESS_PRUNE_AGE_DAYS = int(os.getenv("SELF_AWARENESS_PRUNE_AGE_DAYS", "30"))
-SELF_AWARENESS_KEEP_RECENT = int(os.getenv("SELF_AWARENESS_KEEP_RECENT", "100"))
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-SELF_AWARENESS_CONFIG = {
-    "enable_self_awareness": ENABLE_SELF_AWARENESS,
-    "enable_perspective_gate": ENABLE_PERSPECTIVE_GATE,
-    "perspective_gate_async": SELF_AWARENESS_PERSPECTIVE_GATE_ASYNC,
-    "use_fast_model": SELF_AWARENESS_USE_FAST_MODEL,
-    "self_token": SELF_AWARENESS_TOKEN,
-    "max_introspection_lines": SELF_AWARENESS_MAX_LINES,
-    "max_intensity": SELF_AWARENESS_MAX_INTENSITY,
-    "novelty_threshold": SELF_AWARENESS_NOVELTY_THRESHOLD,
-    "prune_age_days": SELF_AWARENESS_PRUNE_AGE_DAYS,
-    "keep_recent": SELF_AWARENESS_KEEP_RECENT,
-}
+load_dotenv()
 
-# Resolve project root (apps/serve/ -> project root)
 BASE_DIR = Path(__file__).resolve().parents[2]
-ARTIFACTS_DIR = BASE_DIR / "artifacts"
-LORA_DIR = ARTIFACTS_DIR / "lora"
+DEFAULT_MANIFOLD = BASE_DIR / "artifacts" / "manifold_bert_optimized" / "checkpoint-3612"
+DEFAULT_REGIME = BASE_DIR / "artifacts" / "regime_bert_base" / "checkpoint-1505"
+DEFAULT_LORA = BASE_DIR / "artifacts" / "lora" / "qwen3-1.7b-seed-sft-v1"
 
-# Ensure database directory exists
-os.makedirs(Path(DATABASE_PATH).parent, exist_ok=True)
-
-# Import our modules (these will be created)
-try:
-    from .database import DatabaseManager
-    from .model_interface import ModelInterface
-except ImportError:
-    # Fallback for direct execution
-    from database import DatabaseManager
-    from model_interface import ModelInterface
-
-# Global instances
-db: Optional[DatabaseManager] = None
-model: Optional[ModelInterface] = None
-background_tasks: set = set()  # Track background tasks for cleanup
-
-async def auto_load_lora_model(model_interface, lora_spec: str, base_model_path: str = None):
-    """Automatically load a LoRA model on startup"""
-    try:
-        print(f"🔍 Processing LoRA spec: '{lora_spec}'")
-
-        # Determine LoRA path
-        if os.path.isabs(lora_spec):
-            # Absolute path specified
-            lora_path = Path(lora_spec)
-            version_id = lora_path.name  # Use directory name as version
-            print(f"📁 Using absolute path: {lora_path}")
-        else:
-            # Relative path from artifacts/lora/ (project root)
-            lora_path = LORA_DIR / lora_spec
-            version_id = lora_spec
-            print(f"📁 Checking relative path: {lora_path}")
-
-            # If the exact path doesn't exist, try to find the latest version
-            if not lora_path.exists():
-                print(f"⚠️  Path {lora_path} doesn't exist, looking for latest version...")
-                lora_path = find_latest_lora_version(lora_spec)
-                if lora_path:
-                    version_id = lora_path.name
-                    print(f"✅ Found latest version: {lora_path}")
-                else:
-                    print(f"❌ No versions found for '{lora_spec}'")
-                    lora_path = None  # Ensure it's None if not found
-
-        if not lora_path or not lora_path.exists():
-            exists = lora_path.exists() if isinstance(lora_path, Path) else 'N/A'
-            print(f"❌ Final check failed: lora_path={lora_path}, exists={exists}")
-            print(f"⚠️  Auto-load LoRA not found: {lora_path}")
-            return
-
-        # Auto-detect base model if not specified
-        if not base_model_path:
-            base_model_path = auto_detect_base_model(lora_path)
-
-        if not base_model_path:
-            print(f"⚠️  Could not determine base model path for {lora_spec}")
-            print("   Set BASE_MODEL_PATH in .env or ensure it's in the LoRA directory")
-            return
-
-        print(f"🔄 Auto-loading LoRA model: {version_id}")
-        print(f"   Base: {base_model_path}")
-        print(f"   LoRA: {lora_path}")
-
-        # Load the model
-        base_model_path_str = str(base_model_path) if base_model_path else None
-        success = await model_interface.load_model_async(version_id, base_model_path_str, str(lora_path))
-
-        if success:
-            # Switch to the loaded model
-            if model_interface.switch_to_version(version_id):
-                print(f"✅ Auto-loaded and activated LoRA model: {version_id}")
-            else:
-                print(f"❌ Failed to activate auto-loaded model: {version_id}")
-        else:
-            print(f"❌ Failed to auto-load LoRA model: {version_id}")
-
-    except Exception as e:
-        print(f"❌ Error during auto-loading: {e}")
-
-def find_latest_lora_version(base_name: str) -> Optional[Path]:
-    """Find the latest version of a LoRA model (e.g., qwen3.1-7b-v2)"""
-    lora_base_dir = LORA_DIR
-
-    if not lora_base_dir.exists():
-        print(f"❌ LoRA base directory not found: {lora_base_dir}")
-        return None
-
-    # Look for directories that start with the base name
-    candidates = []
-    for item in lora_base_dir.iterdir():
-        if item.is_dir() and item.name.startswith(base_name):
-            # Check if it has the required LoRA files
-            if (item / "adapter_config.json").exists():
-                candidates.append(item)
-
-    if not candidates:
-        return None
-
-    # Sort by modification time (newest first)
-    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-
-    print(f"🔍 Found {len(candidates)} versions for '{base_name}', using latest: {candidates[0].name}")
-    return candidates[0]
-
-def auto_detect_base_model(lora_path: Path) -> Optional[str]:
-    """Try to auto-detect the base model path from LoRA metadata"""
-    try:
-        # Check for adapter_config.json in LoRA directory
-        config_path = lora_path / "adapter_config.json"
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                base_model_name = config.get("base_model_name_or_path")
-                if base_model_name:
-                    # First, check if it's an absolute/local path that exists
-                    candidate = Path(base_model_name)
-                    if candidate.is_absolute() and candidate.exists():
-                        return str(candidate)
-
-                    # Try resolving relative to known locations
-                    potential_paths = [
-                        lora_path / base_model_name,
-                        BASE_DIR / base_model_name,
-                        ARTIFACTS_DIR / "models" / base_model_name,
-                        BASE_DIR / "models" / base_model_name,
-                    ]
-                    for path in potential_paths:
-                        if path.exists():
-                            return str(path)
-
-                    # If nothing exists locally, assume it's a HuggingFace model ID
-                    print(f"ℹ️  Using remote base model identifier: {base_model_name}")
-                    return base_model_name
-    except Exception as e:
-        print(f"Warning: Could not read LoRA config in {lora_path}: {e}")
-
-    return None
-
-
-def list_available_loras() -> List[Dict[str, Any]]:
-    """Discover available LoRA adapters from artifacts/lora"""
-    options: List[Dict[str, Any]] = []
-
-    if not LORA_DIR.exists():
-        return options
-
-    for item in LORA_DIR.iterdir():
-        if not item.is_dir():
-            continue
-
-        adapter_file = item / "adapter_config.json"
-        if not adapter_file.exists():
-            continue
-
-        base_model_name = None
-        try:
-            with open(adapter_file, "r") as f:
-                config = json.load(f)
-                base_model_name = config.get("base_model_name_or_path")
-        except Exception as e:
-            print(f"⚠️  Failed to read adapter config at {adapter_file}: {e}")
-
-        detected_base = auto_detect_base_model(item)
-        options.append({
-            "id": item.name,
-            "path": str(item),
-            "base_model_name_or_path": base_model_name,
-            "detected_base_model_path": detected_base,
-            "updated_at": item.stat().st_mtime,
-        })
-
-    # Newest first
-    options.sort(key=lambda x: x["updated_at"], reverse=True)
-    return options
-
-
-def list_available_base_models(lora_options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Collect unique base model identifiers/paths from env and LoRA configs"""
-    candidates: Dict[str, Dict[str, Any]] = {}
-
-    def add_candidate(identifier: str, source: str):
-        if not identifier:
-            return
-        if identifier not in candidates:
-            candidates[identifier] = {
-                "id": identifier,
-                "path": identifier,
-                "source": source,
-            }
-
-    if BASE_MODEL_PATH:
-        add_candidate(BASE_MODEL_PATH, "env")
-
-    for lora in lora_options:
-        add_candidate(lora.get("detected_base_model_path"), f"lora:{lora['id']}:detected")
-        add_candidate(lora.get("base_model_name_or_path"), f"lora:{lora['id']}:config")
-
-    # Sort for stable dropdown ordering
-    return sorted(candidates.values(), key=lambda x: x["id"])
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    global db, model
-
-    # Initialize database
-    db = DatabaseManager(DATABASE_PATH)
-
-    # Initialize model interface (placeholder for now)
-    model = ModelInterface(self_awareness_config=SELF_AWARENESS_CONFIG)
-
-    # Auto-load LoRA model if specified
-    print(f"🔍 Checking for auto-load: AUTO_LOAD_LORA='{AUTO_LOAD_LORA}', BASE_MODEL_PATH='{BASE_MODEL_PATH}'")
-    if AUTO_LOAD_LORA:
-        print(f"🚀 Starting auto-load for: {AUTO_LOAD_LORA}")
-        await auto_load_lora_model(model, AUTO_LOAD_LORA, BASE_MODEL_PATH)
-    else:
-        print("⚠️  No AUTO_LOAD_LORA specified in .env")
-
-    yield
-
-    # Cleanup - comprehensive shutdown
-    print("🧹 Starting application cleanup...")
-
-    # Cancel any running background tasks
-    if background_tasks:
-        print(f"🛑 Cancelling {len(background_tasks)} background tasks...")
-        for task in background_tasks:
-            if not task.done():
-                task.cancel()
-        # Wait for tasks to cancel
-        await asyncio.gather(*background_tasks, return_exceptions=True)
-        background_tasks.clear()
-
-    # Close database
-    if db:
-        print("💾 Closing database connection...")
-        db.close()
-
-    # Cleanup model resources
-    if model:
-        print("🧠 Cleaning up model resources...")
-        try:
-            # Unload all models to free GPU memory
-            for version_id in model.get_loaded_versions():
-                print(f"🗑️ Unloading model: {version_id}")
-                model.unload_version(version_id)
-        except Exception as e:
-            print(f"⚠️ Error during model cleanup: {e}")
-
-    print("✅ Application cleanup complete")
-
-app = FastAPI(
-    title="Hominem LoRA Serving System",
-    description="Real-time chat and emotion labeling interface",
-    version="1.0.0",
-    lifespan=lifespan
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    str(Path.home() / "Documents" / "hominem" / "conversations.db"),
 )
+BASE_MODEL_ID = os.getenv("BASE_MODEL_PATH", "Qwen/Qwen3-1.7B") or "Qwen/Qwen3-1.7B"
+LORA_PATH = os.getenv("AUTO_LOAD_LORA")
+if LORA_PATH:
+    # allow bare name under artifacts/lora
+    lp = Path(LORA_PATH)
+    if not lp.is_absolute():
+        lp = BASE_DIR / "artifacts" / "lora" / LORA_PATH
+    LORA_PATH = str(lp)
+elif DEFAULT_LORA.exists():
+    LORA_PATH = str(DEFAULT_LORA)
+else:
+    LORA_PATH = None
 
-# Mount static files
-# Get the directory containing this script
-script_dir = os.path.dirname(os.path.abspath(__file__))
-static_dir = os.path.join(script_dir, "static")
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+MANIFOLD_CKPT = os.getenv("MANIFOLD_CKPT") or str(DEFAULT_MANIFOLD)
+REGIME_CKPT = os.getenv("REGIME_CKPT") or str(DEFAULT_REGIME)
 
-class MessageRequest(BaseModel):
-    conversation_id: str
-    content: str
-    metadata: Optional[Dict[str, Any]] = None
-
-class CompletionRequest(BaseModel):
-    conversation_id: str
-    content: str
-    enable_thinking: bool = True
-    metadata: Optional[Dict[str, Any]] = None
-    enable_self_awareness: Optional[bool] = None
-
-class EmotionLabel(BaseModel):
-    valence: Optional[float] = None  # -2 to +2
-    arousal: Optional[float] = None  # 0 to 1
-    dominance: Optional[float] = None  # -1 to 1
-    predictive_discrepancy: Optional[float] = None  # -1 to 1
-    temporal_directionality: Optional[float] = None  # -1 to 1
-    social_broadcast: Optional[float] = None  # 0 to 1
-    raw_indicators: Optional[Dict[str, Any]] = None  # UI reaction data
-    notes: Optional[str] = None
-
-@app.get("/", response_class=HTMLResponse)
-async def get_chat_interface():
-    """Serve the main chat interface"""
-    html_path = os.path.join(script_dir, "static", "index.html")
-    with open(html_path, "r") as f:
-        return HTMLResponse(content=f.read())
-
-@app.get("/api/conversations")
-async def get_conversations():
-    """Get all conversations"""
-    try:
-        conversations = db.get_conversations()
-        return {"conversations": conversations}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str):
-    """Get a specific conversation with messages"""
-    try:
-        conversation = db.get_conversation(conversation_id)
-        if not conversation:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        return conversation
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/conversations")
-async def create_conversation():
-    """Create a new conversation"""
-    try:
-        conversation_id = str(uuid.uuid4())
-        db.create_conversation(conversation_id)
-        return {"conversation_id": conversation_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/messages")
-async def send_message(request: MessageRequest):
-    """Send a message and get AI response"""
-    try:
-        # Add user message to database
-        message_index = db.add_message(
-            conversation_id=request.conversation_id,
-            role="user",
-            content=request.content,
-            metadata=request.metadata
-        )
-
-        # Get AI response (placeholder - will stream via WebSocket)
-        # For now, return message info
-        return {
-            "message_index": message_index,
-            "status": "processing"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/complete")
-async def complete(request: CompletionRequest):
-    """
-    Synchronous completion endpoint:
-    - persists the user message to DB
-    - generates the assistant reply (waiting for full completion)
-    - runs emotion labeling and persists labels
-    - returns the assistant reply
-    """
-    try:
-        if db is None or model is None:
-            raise HTTPException(status_code=500, detail="Server not initialized")
-
-        # Persist the user message first (same as WebSocket flow)
-        try:
-            user_message_index = db.add_message(
-                conversation_id=request.conversation_id,
-                role="user",
-                content=request.content,
-                metadata={**(request.metadata or {}), "enable_thinking": request.enable_thinking},
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-
-        conversation_data = db.get_conversation(request.conversation_id)
-        if not conversation_data or "messages" not in conversation_data:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-
-        # Convert to chat template format
-        conversation_history = [
-            {"role": msg["role"], "content": msg["content"], "enable_thinking": request.enable_thinking}
-            for msg in conversation_data["messages"]
-        ]
-
-        assistant_response = await model.generate_streaming_response(
-            websocket=None,
-            conversation_id=request.conversation_id,
-            message_index=user_message_index,
-            conversation_history=conversation_history,
-            enable_thinking=request.enable_thinking,
-            db=db,
-            enable_self_awareness=request.enable_self_awareness,
-        )
-
-        if not assistant_response:
-            raise HTTPException(status_code=500, detail="Completion failed")
-
-        return {
-            "conversation_id": request.conversation_id,
-            "user_message_index": user_message_index,
-            "assistant_message_index": user_message_index + 1,
-            "assistant_response": assistant_response,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/messages/{conversation_id}/{message_index}/emotion")
-async def label_emotion(conversation_id: str, message_index: int, label: EmotionLabel):
-    """Add emotion label to a message"""
-    try:
-        db.add_emotion_label(
-            conversation_id=conversation_id,
-            message_index=message_index,
-            labeler="user",
-            **label.dict(exclude_unset=True)
-        )
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Model management endpoints
-@app.get("/api/models")
-async def get_models():
-    """Get information about loaded models"""
-    try:
-        versions = model.get_loaded_versions()
-        active_info = model.get_active_version_info()
-
-        return {
-            "loaded_versions": versions,
-            "active_version": active_info,
-            "device": model.device
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+SLEEP_UPDATE_ENABLED = os.getenv("SLEEP_UPDATE_ENABLED", "false").lower() == "true"
+SLEEP_UPDATE_CONFIG = os.getenv("SLEEP_UPDATE_CONFIG", str(BASE_DIR / "config" / "training" / "lora_dpo.yaml"))
+SLEEP_LOG_DIR = Path(os.getenv("SLEEP_LOG_DIR", BASE_DIR / "data" / "online_feedback"))
 
 
-@app.get("/api/models/available")
-async def get_available_models():
-    """List discoverable base models and LoRA adapters for UI selection"""
-    try:
-        lora_options = list_available_loras()
-        base_models = list_available_base_models(lora_options)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        return {
-            "base_models": base_models,
-            "lora_adapters": lora_options
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/models/load")
-async def load_model(request: Dict[str, Any]):
-    """Load a model version in background"""
-    try:
-        version_id = request.get("version_id", f"v{int(time.time())}")
-        base_model_path = request["base_model_path"]
-        lora_path = request.get("lora_path")
-
-        # Start background loading and track the task
-        task = asyncio.create_task(
-            model.load_model_async(version_id, base_model_path, lora_path)
-        )
-        background_tasks.add(task)
-
-        # Clean up completed tasks
-        background_tasks.difference_update(
-            {t for t in background_tasks if t.done()}
-        )
-
-        return {
-            "status": "loading",
-            "version_id": version_id,
-            "message": f"Loading model {version_id} in background"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/models/switch/{version_id}")
-async def switch_model(version_id: str):
-    """Switch to a different model version"""
-    try:
-        success = model.switch_to_version(version_id)
-        if success:
-            return {
-                "status": "success",
-                "active_version": version_id
-            }
-        else:
-            raise HTTPException(status_code=404, detail="Model version not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/models/{version_id}")
-async def unload_model(version_id: str):
-    """Unload a model version"""
-    try:
-        model.unload_version(version_id)
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.websocket("/ws/chat/{conversation_id}")
-async def chat_websocket(websocket: WebSocket, conversation_id: str):
-    """WebSocket endpoint for real-time chat with token streaming"""
-    print(f"🔌 WebSocket connection established for conversation {conversation_id}")
-    await websocket.accept()
-
-    try:
-        while True:
-            # Receive message from client
-            data = await websocket.receive_json()
-
-            if data["type"] == "send_message":
-                content = data["content"]
-                enable_thinking = data.get("enable_thinking", True)  # Default to thinking enabled
-                metadata = data.get("metadata", {})
-
-                print(f"📨 Received message in conversation {conversation_id}: {content[:100]}{'...' if len(content) > 100 else ''}")
-                print(f"🧠 Thinking mode: {enable_thinking}")
-
-                # Add user message to database
-                message_index = db.add_message(
-                    conversation_id=conversation_id,
-                    role="user",
-                    content=content,
-                    metadata={**metadata, "enable_thinking": enable_thinking}
-                )
-
-                print(f"💾 Saved user message {conversation_id}:{message_index}")
-
-                # Send user message confirmation
-                await websocket.send_json({
-                    "type": "message_added",
-                    "message_index": message_index,
-                    "role": "user",
-                    "content": content
-                })
-
-                print(f"🤖 Starting AI response generation for {conversation_id}:{message_index + 1} (thinking: {enable_thinking})")
-
-                # Get conversation history for chat formatting
-                conversation_data = db.get_conversation(conversation_id)
-                conversation_history = []
-                if conversation_data and "messages" in conversation_data:
-                    # Convert to format expected by chat template
-                    conversation_history = [
-                        {"role": msg["role"], "content": msg["content"], "enable_thinking": enable_thinking}
-                        for msg in conversation_data["messages"]
-                    ]
-
-                print(f"📚 Using conversation history: {len(conversation_history)} messages")
-
-                # Generate AI response with streaming
-                await model.generate_streaming_response(
-                    websocket=websocket,
-                    conversation_id=conversation_id,
-                    message_index=message_index,
-                    conversation_history=conversation_history,
-                    enable_thinking=enable_thinking,
-                    db=db
-                )
-
-            elif data["type"] == "label_emotion":
-                # Handle emotion labeling
-                label_data = data["label"]
-                message_index = data["message_index"]
-
-                print(f"🏷️  Saving emotion labels for {conversation_id}:{message_index}")
-
-                db.add_emotion_label(
-                    conversation_id=conversation_id,
-                    message_index=message_index,
-                    labeler="user",
-                    **label_data
-                )
-
-                print(f"✅ Emotion labels saved for {conversation_id}:{message_index}")
-
-                await websocket.send_json({
-                    "type": "label_saved",
-                    "message_index": message_index
-                })
-
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected for conversation {conversation_id}")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e)
-        })
-
-def launch_browser(port: int = 8000):
-    """Launch browser after a short delay"""
-    def _launch():
-        import time
-        time.sleep(1)  # Wait for server to start
-        webbrowser.open(f"http://localhost:{port}")
-
-    thread = threading.Thread(target=_launch)
-    thread.daemon = True
-    thread.start()
-
-def main():
-    """Main entry point"""
-    port = int(os.getenv("PORT", 8000))
-
-    print(f"🚀 Starting Hominem Serving System on http://localhost:{port}")
-    print(f"📊 Database: {DATABASE_PATH}")
-
-    # Launch browser in background thread (skip on errors)
-    try:
-        launch_browser(port)
-    except Exception as e:
-        print(f"Warning: Could not launch browser: {e}")
-
-    # Start server
-    # Use the fully-qualified module path so uvicorn reload can import correctly
-    uvicorn.run(
-        f"{__name__}:app",
-        host="0.0.0.0",
-        port=port,
-        reload=True,
-        log_level="info",
+def state_from_dict(d: Dict[str, Any]) -> ConversationState:
+    if not d:
+        return ConversationState()
+    return ConversationState(
+        history=d.get("history", []),
+        phi_prev=d.get("phi_prev", 0.0),
+        ema_delta_phi=d.get("ema_delta_phi", 0.0),
+        mean_self_prev=d.get("mean_self_prev", 0.0),
+        manifold_history=d.get("manifold_history", []),
+        sleep_queue=d.get("sleep_queue", []),
+        intervention_state=d.get("intervention_state", {}),
     )
 
+
+def state_to_dict(state: ConversationState) -> Dict[str, Any]:
+    return {
+        "history": state.history,
+        "phi_prev": state.phi_prev,
+        "ema_delta_phi": state.ema_delta_phi,
+        "mean_self_prev": state.mean_self_prev,
+        "manifold_history": state.manifold_history,
+        "sleep_queue": state.sleep_queue,
+        "intervention_state": state.intervention_state,
+    }
+
+
+def metrics_to_dict(m: TurnMetrics) -> Dict[str, Any]:
+    return {
+        "s": m.s,
+        "s_self": m.s_self,
+        "s_world": m.s_world,
+        "self_fractions": m.self_fractions,
+        "regime_probs": m.regime_probs,
+        "regime_argmax": m.regime_argmax,
+        "lambdas": m.lambdas,
+        "anchors": m.anchors,
+        "phi": {"value": m.phi_value, "components": m.phi_components},
+        "delta_phi": {"raw": m.delta_phi_raw, "ema": m.delta_phi_ema, "used": m.delta_phi_used},
+        "reward_intensity": m.reward_intensity,
+        "r_t": m.r_t,
+        "think_gate": m.think_gate,
+    }
+
+
+# ---------------------------------------------------------------------------
+# API models
+# ---------------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    conversation_id: str = "canonical"
+    user_message: str
+    enable_thinking: bool = False
+
+
+class ChatResponse(BaseModel):
+    assistant: str
+    metrics: Dict[str, Any]
+    sleep_queue_len: int
+
+
+class SleepRequest(BaseModel):
+    conversation_id: str = "canonical"
+    max_items: int = 10
+
+
+class SleepResponse(BaseModel):
+    processed: int
+    remaining: int
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Unified Theory Chat")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+static_dir = Path(__file__).resolve().parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
+db = ConversationDB(DATABASE_PATH)
+runtime = AgentRuntime(
+    base_model_id=BASE_MODEL_ID,
+    lora_path=LORA_PATH,
+    manifold_checkpoint=MANIFOLD_CKPT,
+    regime_checkpoint=REGIME_CKPT,
+    device="mps",
+    )
+
+
+def _write_sleep_logs(conversation_id: str, entries: list[dict[str, Any]]) -> Path:
+    SLEEP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    path = SLEEP_LOG_DIR / f"session_{conversation_id}_{ts}.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for entry in entries:
+            metrics = entry.get("metrics", {}) or {}
+            reward_intensity = float(metrics.get("reward_intensity", metrics.get("r_t", 0.0) or 0.0))
+            delta_phi_used = float(
+                (metrics.get("delta_phi") or {}).get("used", metrics.get("delta_phi_used", 0.0) or 0.0)
+            )
+            scalar_score = float(metrics.get("r_t", delta_phi_used))
+            # We don't currently compute safety_score; leave as neutral 0.0
+            safety_score = 0.0
+            think_text = entry.get("think")
+            record = {
+                "prompt": entry.get("user_message", ""),
+                "think": think_text,
+                "candidates": [
+                    {
+                        "text": entry.get("assistant", ""),
+                        "reward": {
+                            "reward_intensity": reward_intensity,
+                            "safety_score": safety_score,
+                            "delta_phi_used": delta_phi_used,
+                            "scalar_score": scalar_score,
+                        },
+                        "scalar_score": scalar_score,
+                        "metrics": metrics,
+                    }
+                ],
+                "timestamp_utc": ts,
+            }
+            f.write(json.dumps(record))
+            f.write("\n")
+    return path
+
+
+def _run_sleep_update(log_dir: Path, config_path: str) -> None:
+    cmd = [
+        "python",
+        "-m",
+        "core.lora_trainer.online_update",
+        "--log-dir",
+        str(log_dir),
+        "--config",
+        config_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"⚠️ Sleep update failed: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    st_dict = db.get_state(req.conversation_id)
+    state = state_from_dict(st_dict)
+
+    assistant, think_content, metrics, new_state = runtime.run_turn(
+        state, req.user_message, enable_thinking=req.enable_thinking
+    )
+
+    db.append_message(req.conversation_id, "user", req.user_message)
+    db.append_message(req.conversation_id, "assistant", assistant, think=think_content)
+    db.save_state(req.conversation_id, state_to_dict(new_state))
+
+    return ChatResponse(
+        assistant=assistant,
+        metrics=metrics_to_dict(metrics),
+        sleep_queue_len=len(new_state.sleep_queue),
+    )
+
+
+@app.post("/sleep", response_model=SleepResponse)
+def sleep(req: SleepRequest):
+    st_dict = db.get_state(req.conversation_id)
+    state = state_from_dict(st_dict)
+    to_process = state.sleep_queue[: req.max_items]
+    if to_process:
+        log_path = _write_sleep_logs(req.conversation_id, to_process)
+        if SLEEP_UPDATE_ENABLED:
+            _run_sleep_update(SLEEP_LOG_DIR, SLEEP_UPDATE_CONFIG)
+    remaining = state.sleep_queue[req.max_items :]
+    state.sleep_queue = remaining
+    db.save_state(req.conversation_id, state_to_dict(state))
+    return SleepResponse(processed=len(to_process), remaining=len(remaining))
+
+
+@app.get("/messages")
+def messages(conversation_id: str = "canonical", limit: int = 50):
+    msgs = db.list_messages(conversation_id, limit=limit)
+    return {"messages": [{"role": r, "content": c} for r, c in msgs]}
+
+
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host=HOST, port=PORT)
