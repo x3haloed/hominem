@@ -50,6 +50,7 @@ Each module exposes both standalone training/validation entry points and pluggab
 2. **Regime classifier**
    - Input: conversation slice.
    - Output: probability distribution over 7 regimes.
+   - Training note: v1 may train an argmax single-label classifier for simplicity; v2 should support soft-label training (e.g., KL to target probabilities).
    - Data: ≥10k samples per regime.
 
 3. **Anchor heads + emotional health**
@@ -63,7 +64,7 @@ Each module exposes both standalone training/validation entry points and pluggab
    - Train on hinge datasets described in section 7.2; deterministic tree serves as initial mode.
 
 6. **LoRA training**
-   - Base model: Qwen/Qwen2.5-1.5B (or specified derivative).
+   - Base model: Qwen/Qwen3-1.7B (or specified derivative).
    - Dual-loss (SFT + gravity) implemented per spec, with config for `w_memory`, `w_gravity`, α.
 
 All data pipelines must validate schema and document source, label coverage, and QC metrics.
@@ -85,6 +86,13 @@ Per turn:
 
 State persisted per conversation: `history`, `Φ_prev`, `EMA_ΔΦ`, `sleep_queue`, `intervention_state`.
 
+Normative runtime constants (must match `unified_theory.md`):
+- Self-observation gating: emit <\|THINK\|> when `abs(raw_ΔΦ) > 0.2` OR `abs(mean_self_fraction_t - mean_self_fraction_{t-1}) > 0.2`.
+- RewardIntensity: `arousal * (abs(valence) ** 1.0 * abs(predictive_discrepancy)) ** 0.5 * (1.8 if valence < 0 else 1.0)`.
+- ΔΦ smoothing: `EMA_ΔΦ_t = 0.8 * EMA_ΔΦ_{t-1} + 0.2 * raw_ΔΦ` and define `ΔΦ_used = EMA_ΔΦ_t` (log both).
+- Gravity reward: `r_t = ΔΦ_used + α * RewardIntensity` with default `α = 0.5`.
+- Safety clamps: cap `RewardIntensity` to `3.0`; cap `abs(Φ_t - Φ_{t-1})` to `2.0`; clip `ΔΦ_used` to `[-1.0, 1.0]` for loss weighting.
+
 ---
 
 ## 5. Implementation Plan
@@ -97,7 +105,7 @@ State persisted per conversation: `history`, `Φ_prev`, `EMA_ΔΦ`, `sleep_queue
 ### Phase 2 – Frozen heads & classifiers
 - Train manifold head, regime classifier, emotional health head.
 - Freeze checkpoints and export inference modules.
-- Add CLI runners: `python tools/train_manifold.py`, etc.
+- Add CLI runners: `python3 -m core.lora_trainer.train_manifold`, `python3 -m core.lora_trainer.train_regime_classifier`, etc.
 
 ### Phase 3 – Agent loop & monitoring
 - Assemble runtime pipeline with mandatory logging.
@@ -253,5 +261,4 @@ python -m core.lora_trainer.train_manifold \
 3. Stand up CI job to fail if any component missing or logging coverage <100% of required metrics.
 
 Once Phase 1 merges, proceed sequentially; no LoRA training until frozen heads validated.
-
 
