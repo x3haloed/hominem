@@ -1,6 +1,10 @@
 #
 # Local trained reward model artifacts (too large for git)
 *.safetensors
+# Training checkpoints (too large for git)
+**/optimizer.pt
+**/scheduler.pt
+**/rng_state.pth
 # Created by https://www.toptal.com/developers/gitignore/api/venv,macos,python,visualstudiocode,windows,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=venv,macos,python,visualstudiocode,windows,linux
 
