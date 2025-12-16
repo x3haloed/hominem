@@ -18,13 +18,15 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prune low-signal labeled trajectories")
-    parser.add_argument("--input", required=True, help="Input labeled shard (.jsonl)")
-    parser.add_argument("--output", required=True, help="Output pruned shard (.jsonl)")
+    parser.add_argument("--input", help="Input labeled shard (.jsonl)")
+    parser.add_argument("--input-dir", help="Input directory of labeled shards (.jsonl)")
+    parser.add_argument("--output", help="Output pruned shard (.jsonl)")
+    parser.add_argument("--output-dir", help="Output directory for pruned shards (.jsonl)")
     parser.add_argument(
         "--boring-sample-prob",
         type=float,
@@ -73,31 +75,53 @@ def is_spicy(lbl: Dict[str, Any], args: argparse.Namespace) -> bool:
 
 def main() -> None:
     args = parse_args()
+    if not args.input and not args.input_dir:
+        raise SystemExit("Provide --input or --input-dir")
+    if args.input_dir and not args.output_dir:
+        raise SystemExit("When using --input-dir, provide --output-dir")
+    if args.input and not args.output:
+        raise SystemExit("When using --input, provide --output")
+
     random.seed(0)
-    in_path = Path(args.input)
-    out_path = Path(args.output)
+    total_kept = 0
+    total_dropped = 0
 
-    kept = 0
-    dropped = 0
-
-    with in_path.open() as fin, out_path.open("w") as fout:
-        for line in fin:
-            if not line.strip():
-                continue
-            obj = json.loads(line)
-            labels = obj.get("labels", {})
-            if is_spicy(labels, args):
-                fout.write(line)
-                kept += 1
-            else:
-                if random.random() < args.boring_sample_prob:
+    def process_file(in_path: Path, out_path: Path) -> None:
+        nonlocal total_kept, total_dropped
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        kept = 0
+        dropped = 0
+        with in_path.open() as fin, out_path.open("w") as fout:
+            for line in fin:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                labels = obj.get("labels", {})
+                if is_spicy(labels, args):
                     fout.write(line)
                     kept += 1
                 else:
-                    dropped += 1
+                    if random.random() < args.boring_sample_prob:
+                        fout.write(line)
+                        kept += 1
+                    else:
+                        dropped += 1
+        total_kept += kept
+        total_dropped += dropped
+        print(f"[{in_path.name}] kept {kept}, dropped {dropped} -> {out_path}")
 
-    print(f"Kept {kept} rows, dropped {dropped}")
-    print(f"Output written to {out_path}")
+    if args.input:
+        process_file(Path(args.input), Path(args.output))
+    else:
+        in_dir = Path(args.input_dir)
+        out_dir = Path(args.output_dir)
+        files: List[Path] = sorted(in_dir.glob("*.jsonl"))
+        if not files:
+            raise SystemExit(f"No .jsonl files in {in_dir}")
+        for fp in files:
+            process_file(fp, out_dir / fp.name)
+
+    print(f"Total kept {total_kept}, dropped {total_dropped}")
 
 
 if __name__ == "__main__":

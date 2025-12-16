@@ -66,9 +66,13 @@ REGIME_KEYS: Tuple[str, ...] = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate UltraChat trajectory shard label distributions"
+        description="Validate UltraChat trajectory label distributions (single file or directory of shards)"
     )
-    parser.add_argument("--path", required=True, help="Path to shard .jsonl file")
+    parser.add_argument(
+        "--path",
+        required=True,
+        help="Path to shard .jsonl file OR directory containing multiple shard .jsonl files",
+    )
     parser.add_argument(
         "--min-records",
         type=int,
@@ -116,11 +120,16 @@ def parse_args() -> argparse.Namespace:
 
 def load_records(path: Path) -> List[Dict]:
     records: List[Dict] = []
-    with path.open() as f:
-        for line in f:
-            if not line.strip():
-                continue
-            records.append(json.loads(line))
+    if path.is_dir():
+        files = sorted(path.glob("*.jsonl"))
+    else:
+        files = [path]
+    for fp in files:
+        with fp.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                records.append(json.loads(line))
     return records
 
 
@@ -207,7 +216,7 @@ def main() -> None:
     args = parse_args()
     path = Path(args.path)
     if not path.exists():
-        sys.stderr.write(f"Shard not found: {path}\n")
+        sys.stderr.write(f"Path not found: {path}\n")
         sys.exit(1)
 
     records = load_records(path)
