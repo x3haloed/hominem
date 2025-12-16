@@ -38,7 +38,7 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFOLD = BASE_DIR / "artifacts" / "manifold_bert_optimized" / "checkpoint-3612"
 DEFAULT_REGIME = BASE_DIR / "artifacts" / "regime_bert_base" / "checkpoint-1505"
-DEFAULT_LORA = BASE_DIR / "artifacts" / "lora" / "qwen3-1.7b-seed-sft-v1"
+DEFAULT_LORA = BASE_DIR / "artifacts" / "lora" / "qwen3-1.7b-seed-sft-v3"
 
 DATABASE_PATH = os.getenv(
     "DATABASE_PATH",
