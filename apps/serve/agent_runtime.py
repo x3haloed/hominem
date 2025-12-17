@@ -475,6 +475,11 @@ class AgentRuntime:
             add_generation_prompt=not think_block,
             enable_thinking=enable_thinking and not bool(think_block),
         )
+
+        if not enable_thinking:
+            import re
+            prompt = re.sub(r'<think>.*?</think>\s*', '', prompt, flags=re.DOTALL)
+
         if think_block:
             prompt += think_block
             if not enable_thinking:
@@ -504,11 +509,15 @@ class AgentRuntime:
         # Return only the newly generated portion (after prompt)
         generated = text[len(prompt):].strip()
         think_content: str | None = None
-        lower = generated.lower()
-        start = lower.find("<think>")
-        end = lower.find("</think>")
+
+        # Extract think content from generated text (regardless of think_block)
+        # The model might generate think tags even when we don't want them
+        generated_lower = generated.lower()
+        start = generated_lower.find("<think>")
+        end = generated_lower.find("</think>")
         if start != -1 and end != -1 and end > start:
             think_content = generated[start + len("<think>"): end].strip()
+            # Remove think block from generated output
             generated = (generated[:start] + generated[end + len("</think>"):]).strip()
         return generated, think_content
 
