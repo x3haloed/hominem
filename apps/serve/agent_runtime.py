@@ -582,7 +582,8 @@ class AgentRuntime:
         # Build response (insert think block if gated)
         think_block = None
         if think_gate:
-            think_block = f"<|im_start|>assistant\n<think>\nI notice ΔΦ={raw_delta_phi:.2f}, self={mean_self:.2f}. Regime: {regime_argmax}. Anchors: {anchors}\n"
+            anchors_str = ", ".join(f"{k}: {v:.2f}" for k, v in anchors.items())
+            think_block = f"<|im_start|>assistant\n<think>\nI notice ΔΦ={raw_delta_phi:.2f}, self={mean_self:.2f}. Regime: {regime_argmax}. Anchors: {anchors_str}\n"
 
         # Update history with user msg and optional think block
         new_history = list(state.history) + [{"role": "user", "content": user_message}]
