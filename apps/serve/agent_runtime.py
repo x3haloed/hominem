@@ -356,14 +356,23 @@ class ConversationState:
     manifold_history: List[Dict[str, float]] = field(default_factory=list)  # recent s_self
     sleep_queue: List[Dict[str, Any]] = field(default_factory=list)
     intervention_state: Dict[str, Any] = field(default_factory=dict)
+    last_post: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class TurnMetrics:
+    pre: "TurnMetricsSnapshot"
+    post: "TurnMetricsSnapshot"
+    think_gate: bool
+
+
+@dataclass
+class TurnMetricsSnapshot:
     s: Dict[str, float]
     s_self: Dict[str, float]
     s_world: Dict[str, float]
     self_fractions: Dict[str, float]
+    mean_self: float
     regime_probs: Dict[str, float]
     regime_argmax: str
     lambdas: Dict[str, float]
@@ -375,7 +384,6 @@ class TurnMetrics:
     delta_phi_ema: float
     reward_intensity: float
     r_t: float
-    think_gate: bool
 
 
 class AgentRuntime:
@@ -421,14 +429,95 @@ class AgentRuntime:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _record_to_text(self, history: List[Dict[str, str]], user_message: str) -> str:
-        turns = history[-3:] + [{"role": "assistant", "content": user_message}]
+    def _history_to_text(self, history: List[Dict[str, str]]) -> str:
+        turns = history[-3:]
         parts = []
         for t in turns:
             role = t.get("role", "user")
             content = t.get("content", "")
             parts.append(f"{role}: {content}")
         return "\n".join(parts)
+
+    def _predict_manifold_and_regime(self, history: List[Dict[str, str]]) -> Tuple[Dict[str, float], Dict[str, float], str]:
+        record_text = self._history_to_text(history)
+        s_row = self._predict_manifold([record_text])[0]
+        k_row = self._predict_regime([record_text])[0]
+
+        s: Dict[str, float] = {}
+        for axis, raw in zip(MANIFOLD_KEYS, s_row):
+            if axis in ("arousal", "social_broadcast"):
+                s[axis] = float(clamp(raw, 0.0, 1.0))
+            else:
+                s[axis] = float(clamp(raw, -1.0, 1.0))
+
+        raw = [float(v) for v in k_row[: len(REGIME_NAMES)]]
+        sum_raw = sum(raw)
+        prob_like = all(0.0 <= v <= 1.0 for v in raw) and 0.98 <= sum_raw <= 1.02
+        if prob_like:
+            probs = raw
+        else:
+            m = max(raw) if raw else 0.0
+            exps = [math.exp(v - m) for v in raw]
+            z = sum(exps)
+            probs = [e / z for e in exps] if z > 0 else [1.0 / len(REGIME_NAMES)] * len(REGIME_NAMES)
+        regime_probs = {name: p for name, p in zip(REGIME_NAMES, probs)}
+        regime_argmax = max(regime_probs.items(), key=lambda kv: kv[1])[0]
+        return s, regime_probs, regime_argmax
+
+    def _compute_snapshot(
+        self,
+        *,
+        history: List[Dict[str, str]],
+        phi_prev: float,
+        ema_delta_phi_prev: float,
+        mean_self_prev: float,
+        manifold_history: List[Dict[str, float]],
+    ) -> Tuple[TurnMetricsSnapshot, bool]:
+        s, regime_probs, regime_argmax = self._predict_manifold_and_regime(history)
+        signals = derive_binary_signals(history, s)
+        s_self, s_world, self_fracs = split_self_world(s, signals=signals)
+        mean_self = float(sum(self_fracs.values()) / len(self_fracs))
+
+        lambdas = lambda_multipliers_from_regime_probs(regime_probs)
+        anchors = aggregate_anchor_scores(s_self, regime_argmax, history=manifold_history)
+        phi_components = {
+            "lambda_survival": lambdas["lambda_survival"] * anchors["survival"],
+            "lambda_belonging": lambdas["lambda_belonging"] * anchors["belonging"],
+            "lambda_control": lambdas["lambda_control"] * anchors["control"],
+            "lambda_emotional": lambdas["lambda_emotional"] * anchors["emotional_health"],
+        }
+        phi_value = float(clamp(sum(phi_components.values()), -3.0, 3.0))
+
+        raw_delta_phi = float(clamp(phi_value - phi_prev, -2.0, 2.0))
+        ema_delta_phi = float(0.8 * ema_delta_phi_prev + 0.2 * raw_delta_phi)
+        delta_phi_used = float(clamp(ema_delta_phi, -1.0, 1.0))
+
+        intensity = reward_intensity_from_s(s)
+        r_t = float(delta_phi_used + self.alpha * intensity)
+
+        # Temporarily disabled self-reflection system for personality training
+        # Original: think_gate = bool(abs(raw_delta_phi) > 0.2 or abs(mean_self - mean_self_prev) > 0.2)
+        think_gate = False
+
+        snapshot = TurnMetricsSnapshot(
+            s=s,
+            s_self=s_self,
+            s_world=s_world,
+            self_fractions=self_fracs,
+            mean_self=mean_self,
+            regime_probs=regime_probs,
+            regime_argmax=regime_argmax,
+            lambdas=lambdas,
+            anchors=anchors,
+            phi_value=phi_value,
+            phi_components=phi_components,
+            delta_phi_raw=raw_delta_phi,
+            delta_phi_used=delta_phi_used,
+            delta_phi_ema=ema_delta_phi,
+            reward_intensity=intensity,
+            r_t=r_t,
+        )
+        return snapshot, think_gate
 
     @torch.no_grad()
     def _predict_manifold(self, texts: List[str]) -> List[List[float]]:
@@ -469,21 +558,16 @@ class AgentRuntime:
         enable_thinking: bool = False,
     ) -> str:
         messages = list(history)
+        # Do not rely on template-level thinking injection; it varies across templates/models.
+        # We only ever inject our own fully-enclosed <think> block when `think_block` is provided.
         prompt = self.lm_tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=not think_block,
-            enable_thinking=enable_thinking and not bool(think_block),
+            enable_thinking=enable_thinking or bool(think_block),
         )
-
-        if not enable_thinking:
-            import re
-            prompt = re.sub(r'<think>.*?</think>\s*', '', prompt, flags=re.DOTALL)
-
         if think_block:
             prompt += think_block
-            if not enable_thinking:
-                prompt += "</think>\n\n"
         return prompt
 
     @torch.no_grad()
@@ -496,18 +580,21 @@ class AgentRuntime:
     ) -> Tuple[str, str | None]:
         prompt = self._format_prompt(history, think_block=think_block, enable_thinking=enable_thinking)
         inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_len = int(inputs["input_ids"].shape[-1])
         output = self.lm.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.6 if enable_thinking or think_block else 0.7,
-            top_p=0.95 if enable_thinking or think_block else 0.8,
-            top_k=20,
+            temperature=0.1,  # More deterministic
+            top_p=0.9,
+            top_k=40,
             min_p=0.0,
+            repetition_penalty=1.2,  # Reduce repetition
         )
-        text = self.lm_tokenizer.decode(output[0], skip_special_tokens=True)
-        # Return only the newly generated portion (after prompt)
-        generated = text[len(prompt):].strip()
+        # Decode only the newly generated tokens. Using string slicing on the decoded text is brittle
+        # because the decoded prompt may not be a byte-for-byte prefix of the decoded output.
+        new_tokens = output[0][input_len:]
+        generated = self.lm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         think_content: str | None = None
 
         # Extract think content from generated text (regardless of think_block)
@@ -525,77 +612,76 @@ class AgentRuntime:
     # Main entry point
     # ------------------------------------------------------------------
     def run_turn(self, state: ConversationState, user_message: str, enable_thinking: bool = False) -> Tuple[str, str | None, TurnMetrics, ConversationState]:
-        record_text = self._record_to_text(state.history, user_message)
-        s_row = self._predict_manifold([record_text])[0]
-        k_row = self._predict_regime([record_text])[0]
-
-        s: Dict[str, float] = {}
-        for axis, raw in zip(MANIFOLD_KEYS, s_row):
-            if axis in ("arousal", "social_broadcast"):
-                s[axis] = float(clamp(raw, 0.0, 1.0))
-            else:
-                s[axis] = float(clamp(raw, -1.0, 1.0))
-
-        probs = [float(clamp(v, 0.0, 1.0)) for v in k_row[: len(REGIME_NAMES)]]
-        total = sum(probs)
-        if total <= 0:
-            probs = [1.0 / len(REGIME_NAMES)] * len(REGIME_NAMES)
-        else:
-            probs = [p / total for p in probs]
-        regime_probs = {name: p for name, p in zip(REGIME_NAMES, probs)}
-        regime_argmax = max(regime_probs.items(), key=lambda kv: kv[1])[0]
-
-        signals = derive_binary_signals(state.history + [{"role": "user", "content": user_message}], s)
-        s_self, s_world, self_fracs = split_self_world(s, signals=signals)
-        mean_self = float(sum(self_fracs.values()) / len(self_fracs))
-
         hist = state.manifold_history
-        lambdas = lambda_multipliers_from_regime_probs(regime_probs)
-        anchors = aggregate_anchor_scores(s_self, regime_argmax, history=hist)
-        phi_components = {
-            "lambda_survival": lambdas["lambda_survival"] * anchors["survival"],
-            "lambda_belonging": lambdas["lambda_belonging"] * anchors["belonging"],
-            "lambda_control": lambdas["lambda_control"] * anchors["control"],
-            "lambda_emotional": lambdas["lambda_emotional"] * anchors["emotional_health"],
-        }
-        phi_value = float(clamp(sum(phi_components.values()), -3.0, 3.0))
-
-        raw_delta_phi = float(clamp(phi_value - state.phi_prev, -2.0, 2.0))
-        ema_delta_phi = float(0.8 * state.ema_delta_phi + 0.2 * raw_delta_phi)
-        delta_phi_used = float(clamp(ema_delta_phi, -1.0, 1.0))
-
-        intensity = reward_intensity_from_s(s)
-        r_t = float(delta_phi_used + self.alpha * intensity)
-
-        think_gate = bool(abs(raw_delta_phi) > 0.2 or abs(mean_self - state.mean_self_prev) > 0.2)
-
-        metrics = TurnMetrics(
-            s=s,
-            s_self=s_self,
-            s_world=s_world,
-            self_fractions=self_fracs,
-            regime_probs=regime_probs,
-            regime_argmax=regime_argmax,
-            lambdas=lambdas,
-            anchors=anchors,
-            phi_value=phi_value,
-            phi_components=phi_components,
-            delta_phi_raw=raw_delta_phi,
-            delta_phi_used=delta_phi_used,
-            delta_phi_ema=ema_delta_phi,
-            reward_intensity=intensity,
-            r_t=r_t,
-            think_gate=think_gate,
+        pre_history = list(state.history) + [{"role": "user", "content": user_message}]
+        pre, think_gate = self._compute_snapshot(
+            history=pre_history,
+            phi_prev=state.phi_prev,
+            ema_delta_phi_prev=state.ema_delta_phi,
+            mean_self_prev=state.mean_self_prev,
+            manifold_history=hist,
         )
 
         # Build response (insert think block if gated)
         think_block = None
         if think_gate:
-            anchors_str = ", ".join(f"{k}: {v:.2f}" for k, v in anchors.items())
-            think_block = f"<|im_start|>assistant\n<think>\nI notice ΔΦ={raw_delta_phi:.2f}, self={mean_self:.2f}. Regime: {regime_argmax}. Anchors: {anchors_str}\n"
+            prior_post = state.last_post or {}
+            prior_assistant = ""
+            for t in reversed(state.history):
+                if (t.get("role") or "").lower() == "assistant":
+                    prior_assistant = (t.get("content") or "").strip()
+                    break
+
+            def fmt_axes(values: Dict[str, Any]) -> str:
+                if not isinstance(values, dict):
+                    return "—"
+                parts = []
+                for axis in MANIFOLD_KEYS:
+                    if axis in values:
+                        try:
+                            parts.append(f"{axis}={float(values[axis]):+.2f}")
+                        except Exception:
+                            pass
+                return ", ".join(parts) if parts else "—"
+
+            def excerpt(text: str, limit: int = 320) -> str:
+                t = (text or "").replace("\n", " ").strip()
+                if len(t) <= limit:
+                    return t
+                return t[:limit].rstrip() + "…"
+
+            anchors_str = ", ".join(f"{k}: {v:.2f}" for k, v in pre.anchors.items())
+            prior_summary = ""
+            if prior_post:
+                try:
+                    prior_summary = (
+                        "Post-turn self-observation (prior assistant turn):\n"
+                        f"- I just output: \"{excerpt(prior_assistant)}\"\n"
+                        f"- Owned manifold (s_self): {fmt_axes(prior_post.get('s_self', {}))}\n"
+                        f"- Regime: {prior_post.get('regime_argmax', '—')}\n"
+                        f"- Anchors: {', '.join(f'{k}: {float(v):+.2f}' for k, v in (prior_post.get('anchors') or {}).items())}\n"
+                        f"- Φ={float(prior_post.get('phi_value', 0.0)):+.2f}, ΔΦ_raw={float(prior_post.get('delta_phi_raw', 0.0)):+.2f}, "
+                        f"ΔΦ_used={float(prior_post.get('delta_phi_used', 0.0)):+.2f}, "
+                        f"Intensity={float(prior_post.get('reward_intensity', 0.0)):.2f}, r_t={float(prior_post.get('r_t', 0.0)):+.2f}\n"
+                        "- These prediction errors and anchor implications are mine.\n\n"
+                    )
+                except Exception:
+                    prior_summary = ""
+
+            think_block = (
+                "<|im_start|>assistant\n<think>\n"
+                f"{prior_summary}"
+                "Pre-turn self-observation (responding to the new user message):\n"
+                f"- I notice ΔΦ={pre.delta_phi_raw:+.2f} (EMA used {pre.delta_phi_used:+.2f}), self={pre.mean_self:.2f}.\n"
+                f"- Owned manifold (s_self): {fmt_axes(pre.s_self)}\n"
+                f"- Regime: {pre.regime_argmax}. Anchors: {anchors_str}\n"
+                "- These prediction errors and anchor implications are mine.\n"
+                "- Next move should maximize expected ΔΦ toward the anchors.\n"
+                "</think>\n\n"
+            )
 
         # Update history with user msg and optional think block
-        new_history = list(state.history) + [{"role": "user", "content": user_message}]
+        new_history = list(pre_history)
 
         # Generate assistant content
         assistant_content, generated_think = self.generate(
@@ -603,18 +689,34 @@ class AgentRuntime:
         )
         new_history.append({"role": "assistant", "content": assistant_content})
 
+        # Post-generation metrics are computed on the assistant message (with user context).
+        post, _ = self._compute_snapshot(
+            history=new_history,
+            phi_prev=state.phi_prev,
+            ema_delta_phi_prev=state.ema_delta_phi,
+            mean_self_prev=state.mean_self_prev,
+            manifold_history=hist,
+        )
+
+        metrics = TurnMetrics(pre=pre, post=post, think_gate=think_gate)
+
         # Update state
-        state.phi_prev = phi_value
-        state.ema_delta_phi = ema_delta_phi
-        state.mean_self_prev = mean_self
-        state.manifold_history = (hist + [dict(s_self)])[-10:]
+        state.phi_prev = post.phi_value
+        state.ema_delta_phi = post.delta_phi_ema
+        state.mean_self_prev = post.mean_self
+        state.manifold_history = (hist + [dict(post.s_self)])[-10:]
+        state.last_post = dict(post.__dict__)
         # Sleep queue stub: push high-intensity events
-        if abs(r_t) > 0.5:
+        if abs(post.r_t) > 0.5:
             state.sleep_queue.append(
                 {
                     "user_message": user_message,
                     "assistant": assistant_content,
-                    "metrics": metrics.__dict__,
+                    "metrics": {
+                        "pre": pre.__dict__,
+                        "post": post.__dict__,
+                        "think_gate": think_gate,
+                    },
                 }
             )
         state.history = new_history

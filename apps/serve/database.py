@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -29,17 +30,21 @@ class ConversationDB:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # FastAPI runs sync endpoints in a threadpool, so DB access may occur from
+        # threads other than the one that created the connection.
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._lock = threading.RLock()
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
     def get_state(self, conversation_id: str) -> Dict[str, Any]:
-        cur = self.conn.execute(
-            "SELECT state_json FROM conversations WHERE conversation_id=?",
-            (conversation_id,),
-        )
-        row = cur.fetchone()
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT state_json FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            row = cur.fetchone()
         if not row:
             return {}
         try:
@@ -49,26 +54,29 @@ class ConversationDB:
 
     def save_state(self, conversation_id: str, state: Dict[str, Any]) -> None:
         payload = json.dumps(state)
-        self.conn.execute(
-            """
-            INSERT INTO conversations(conversation_id, state_json, updated_at)
-            VALUES(?,?,CURRENT_TIMESTAMP)
-            ON CONFLICT(conversation_id) DO UPDATE SET state_json=excluded.state_json, updated_at=CURRENT_TIMESTAMP
-            """,
-            (conversation_id, payload),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO conversations(conversation_id, state_json, updated_at)
+                VALUES(?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(conversation_id) DO UPDATE SET state_json=excluded.state_json, updated_at=CURRENT_TIMESTAMP
+                """,
+                (conversation_id, payload),
+            )
+            self.conn.commit()
 
     def append_message(self, conversation_id: str, role: str, content: str, think: str | None = None) -> None:
-        self.conn.execute(
-            "INSERT INTO messages(conversation_id, role, content, think) VALUES (?,?,?,?)",
-            (conversation_id, role, content, think),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO messages(conversation_id, role, content, think) VALUES (?,?,?,?)",
+                (conversation_id, role, content, think),
+            )
+            self.conn.commit()
 
     def list_messages(self, conversation_id: str, limit: int = 50) -> List[Tuple[str, str]]:
-        cur = self.conn.execute(
-            "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
-            (conversation_id, limit),
-        )
-        return list(reversed(cur.fetchall()))
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
+                (conversation_id, limit),
+            )
+            return list(reversed(cur.fetchall()))

@@ -28,7 +28,7 @@ load_dotenv()
 # Ensure repository root is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from apps.serve.emotion_engine import EmotionEngine  # noqa: E402
+from apps.cli.emotion_engine import EmotionEngine  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

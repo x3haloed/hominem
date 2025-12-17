@@ -1,8 +1,8 @@
 """
-Hominem Serving System
+Unified Theory Chat (canonical server)
 
-A real-time chat interface for LoRA models with emotion labeling capabilities.
-Provides conversation management, WebSocket streaming, and emotion annotation.
+Minimal FastAPI server for the unified-theory runtime (`apps/serve/agent_runtime.py`),
+with a simple static UI and SQLite persistence.
 """
 
 __version__ = "1.0.0"

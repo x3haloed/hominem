@@ -82,6 +82,7 @@ def state_from_dict(d: Dict[str, Any]) -> ConversationState:
         manifold_history=d.get("manifold_history", []),
         sleep_queue=d.get("sleep_queue", []),
         intervention_state=d.get("intervention_state", {}),
+        last_post=d.get("last_post", {}),
     )
 
 
@@ -94,23 +95,31 @@ def state_to_dict(state: ConversationState) -> Dict[str, Any]:
         "manifold_history": state.manifold_history,
         "sleep_queue": state.sleep_queue,
         "intervention_state": state.intervention_state,
+        "last_post": state.last_post,
     }
 
 
 def metrics_to_dict(m: TurnMetrics) -> Dict[str, Any]:
+    def snapshot_to_dict(snap: Any) -> Dict[str, Any]:
+        return {
+            "s": snap.s,
+            "s_self": snap.s_self,
+            "s_world": snap.s_world,
+            "self_fractions": snap.self_fractions,
+            "mean_self": snap.mean_self,
+            "regime_probs": snap.regime_probs,
+            "regime_argmax": snap.regime_argmax,
+            "lambdas": snap.lambdas,
+            "anchors": snap.anchors,
+            "phi": {"value": snap.phi_value, "components": snap.phi_components},
+            "delta_phi": {"raw": snap.delta_phi_raw, "ema": snap.delta_phi_ema, "used": snap.delta_phi_used},
+            "reward_intensity": snap.reward_intensity,
+            "r_t": snap.r_t,
+        }
+
     return {
-        "s": m.s,
-        "s_self": m.s_self,
-        "s_world": m.s_world,
-        "self_fractions": m.self_fractions,
-        "regime_probs": m.regime_probs,
-        "regime_argmax": m.regime_argmax,
-        "lambdas": m.lambdas,
-        "anchors": m.anchors,
-        "phi": {"value": m.phi_value, "components": m.phi_components},
-        "delta_phi": {"raw": m.delta_phi_raw, "ema": m.delta_phi_ema, "used": m.delta_phi_used},
-        "reward_intensity": m.reward_intensity,
-        "r_t": m.r_t,
+        "pre": snapshot_to_dict(m.pre),
+        "post": snapshot_to_dict(m.post),
         "think_gate": m.think_gate,
     }
 
@@ -154,10 +163,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-static_dir = Path(__file__).resolve().parent / "static"
-if static_dir.exists():
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-
 db = ConversationDB(DATABASE_PATH)
 runtime = AgentRuntime(
     base_model_id=BASE_MODEL_ID,
@@ -175,11 +180,18 @@ def _write_sleep_logs(conversation_id: str, entries: list[dict[str, Any]]) -> Pa
     with path.open("w", encoding="utf-8") as f:
         for entry in entries:
             metrics = entry.get("metrics", {}) or {}
-            reward_intensity = float(metrics.get("reward_intensity", metrics.get("r_t", 0.0) or 0.0))
-            delta_phi_used = float(
-                (metrics.get("delta_phi") or {}).get("used", metrics.get("delta_phi_used", 0.0) or 0.0)
-            )
-            scalar_score = float(metrics.get("r_t", delta_phi_used))
+            # Support legacy (flat metrics dict) and new ({"pre":..., "post":...}) schemas.
+            post_metrics = metrics.get("post") if isinstance(metrics, dict) else None
+            if isinstance(post_metrics, dict):
+                reward_intensity = float(post_metrics.get("reward_intensity", 0.0) or 0.0)
+                delta_phi_used = float((post_metrics.get("delta_phi") or {}).get("used", 0.0) or 0.0)
+                scalar_score = float(post_metrics.get("r_t", delta_phi_used) or 0.0)
+            else:
+                reward_intensity = float(metrics.get("reward_intensity", metrics.get("r_t", 0.0) or 0.0))
+                delta_phi_used = float(
+                    (metrics.get("delta_phi") or {}).get("used", metrics.get("delta_phi_used", 0.0) or 0.0)
+                )
+                scalar_score = float(metrics.get("r_t", delta_phi_used))
             # We don't currently compute safety_score; leave as neutral 0.0
             safety_score = 0.0
             think_text = entry.get("think")
@@ -238,7 +250,9 @@ def chat(req: ChatRequest):
 
     db.append_message(req.conversation_id, "user", req.user_message)
     db.append_message(req.conversation_id, "assistant", assistant, think=think_content)
-    db.save_state(req.conversation_id, state_to_dict(new_state))
+    merged_state = dict(st_dict or {})
+    merged_state.update(state_to_dict(new_state))
+    db.save_state(req.conversation_id, merged_state)
 
     return ChatResponse(
         assistant=assistant,
@@ -258,7 +272,9 @@ def sleep(req: SleepRequest):
             _run_sleep_update(SLEEP_LOG_DIR, SLEEP_UPDATE_CONFIG)
     remaining = state.sleep_queue[req.max_items :]
     state.sleep_queue = remaining
-    db.save_state(req.conversation_id, state_to_dict(state))
+    merged_state = dict(st_dict or {})
+    merged_state.update(state_to_dict(state))
+    db.save_state(req.conversation_id, merged_state)
     return SleepResponse(processed=len(to_process), remaining=len(remaining))
 
 
@@ -266,6 +282,10 @@ def sleep(req: SleepRequest):
 def messages(conversation_id: str = "canonical", limit: int = 50):
     msgs = db.list_messages(conversation_id, limit=limit)
     return {"messages": [{"role": r, "content": c} for r, c in msgs]}
+
+static_dir = Path(__file__).resolve().parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
 
 if __name__ == "__main__":
