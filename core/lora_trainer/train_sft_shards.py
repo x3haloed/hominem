@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,6 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedul
 from peft import LoraConfig, get_peft_model
 
 from core.data.shard_loader import MissingDatasetError, ShardLoader, print_shard_summary
+from core.training_logger import TrainingJSONLogger
 
 
 @dataclass
@@ -150,6 +153,27 @@ def build_sft_samples(
     return out
 
 
+def _split_train_val(
+    samples: Sequence[SFTShardSample],
+    *,
+    validation_split: float,
+    validation_seed: int,
+) -> Tuple[List[SFTShardSample], Optional[List[SFTShardSample]]]:
+    if validation_split <= 0:
+        return list(samples), None
+    if not 0 < validation_split < 1:
+        raise ValueError("validation-split must be between 0 and 1 (exclusive)")
+
+    items = list(samples)
+    rng = random.Random(int(validation_seed))
+    rng.shuffle(items)
+    val_size = int(len(items) * float(validation_split))
+    val_size = max(1, min(val_size, len(items) - 1))
+    val_items = items[:val_size]
+    train_items = items[val_size:]
+    return train_items, val_items
+
+
 class SFTShardDataset(Dataset[Dict[str, torch.Tensor]]):
     def __init__(
         self,
@@ -219,6 +243,22 @@ class SFTShardDataset(Dataset[Dict[str, torch.Tensor]]):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Seed LoRA via SFT using unified-theory shards.")
+    parser.add_argument("--run-id", default=None, help="Optional run id for metric logging.")
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Optional log root dir. If set, writes JSONL logs to log-dir/<run-id>/ when database logging is disabled.",
+    )
+    parser.add_argument(
+        "--no-database-logging",
+        action="store_true",
+        help="If set, logs metrics to JSONL files instead of the SQLite training tables.",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Optional SQLite path for training metrics (defaults to DATABASE_PATH/HOMINEM_DB_PATH).",
+    )
     parser.add_argument(
         "--data-roots",
         nargs="+",
@@ -255,6 +295,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--max-grad-norm", type=float, default=0.3)
+    parser.add_argument("--logging-steps", type=int, default=10)
+
+    parser.add_argument(
+        "--validation-split",
+        type=float,
+        default=0.0,
+        help="Fraction of usable samples held out for validation (0 = disabled).",
+    )
+    parser.add_argument("--validation-seed", type=int, default=42)
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=0,
+        help="If >0, runs validation every N optimizer steps (requires validation-split > 0).",
+    )
+    parser.add_argument(
+        "--eval-max-batches",
+        type=int,
+        default=0,
+        help="If >0, caps the number of validation batches per evaluation run.",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=0,
+        help="If >0, uses this batch size for validation (otherwise uses batch-size).",
+    )
+    parser.add_argument(
+        "--save-best",
+        action="store_true",
+        help="If set, saves best adapter checkpoint (by val_loss) to output-dir/best/.",
+    )
 
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -278,6 +350,61 @@ def parse_args() -> argparse.Namespace:
         help="If set, drops examples with labels.safety_score below this threshold.",
     )
     return parser.parse_args()
+
+
+@torch.no_grad()
+def _evaluate(
+    *,
+    model,
+    val_loader: DataLoader,
+    device: torch.device,
+    max_batches: int,
+) -> Dict[str, float]:
+    model.eval()
+
+    raw_losses: List[float] = []
+    weighted_losses: List[float] = []
+    weight_means: List[float] = []
+
+    for i, batch in enumerate(val_loader):
+        if max_batches and i >= max_batches:
+            break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        outputs = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+        )
+        raw_loss = float(outputs.loss.detach().cpu())
+        weight_mean = float(batch["weight"].mean().detach().cpu())
+        weighted_loss = raw_loss * weight_mean
+        raw_losses.append(raw_loss)
+        weighted_losses.append(weighted_loss)
+        weight_means.append(weight_mean)
+
+    model.train()
+    if not raw_losses:
+        return {
+            "val_loss": float("nan"),
+            "val_loss_weighted": float("nan"),
+            "val_weight_mean": float("nan"),
+            "val_ppl": float("nan"),
+        }
+
+    val_loss = float(sum(raw_losses) / len(raw_losses))
+    val_loss_weighted = float(sum(weighted_losses) / len(weighted_losses))
+    val_weight_mean = float(sum(weight_means) / len(weight_means))
+    try:
+        val_ppl = float(math.exp(min(val_loss, 20.0)))
+    except OverflowError:
+        val_ppl = float("inf")
+
+    return {
+        "val_loss": val_loss,
+        "val_loss_weighted": val_loss_weighted,
+        "val_weight_mean": val_weight_mean,
+        "val_ppl": val_ppl,
+    }
 
 
 def main() -> None:
@@ -309,6 +436,14 @@ def main() -> None:
 
     print(f"🧩 SFT samples: {len(samples)}")
 
+    train_samples, val_samples = _split_train_val(
+        samples,
+        validation_split=float(args.validation_split),
+        validation_seed=int(args.validation_seed),
+    )
+    if val_samples:
+        print(f"🔎 Validation samples: {len(val_samples)} (split={float(args.validation_split):.4f})")
+
     device = _device()
     torch_dtype = _torch_dtype_for_device(device)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_id, trust_remote_code=True, padding_side="left")
@@ -332,15 +467,26 @@ def main() -> None:
     model = get_peft_model(model, lora_config)
     model.train()
 
-    dataset = SFTShardDataset(
-        samples,
+    train_dataset = SFTShardDataset(
+        train_samples,
         tokenizer,
         max_length=int(args.max_length),
         enable_thinking=bool(args.enable_thinking),
     )
-    loader_dl = DataLoader(dataset, batch_size=int(args.batch_size), shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=int(args.batch_size), shuffle=True)
 
-    total_steps = math.ceil(len(loader_dl) / max(1, int(args.gradient_accumulation_steps))) * int(args.num_epochs)
+    val_loader: Optional[DataLoader] = None
+    if val_samples:
+        val_dataset = SFTShardDataset(
+            val_samples,
+            tokenizer,
+            max_length=int(args.max_length),
+            enable_thinking=bool(args.enable_thinking),
+        )
+        eval_batch_size = int(args.eval_batch_size) if int(args.eval_batch_size) > 0 else int(args.batch_size)
+        val_loader = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=False)
+
+    total_steps = math.ceil(len(train_loader) / max(1, int(args.gradient_accumulation_steps))) * int(args.num_epochs)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr))
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -348,38 +494,215 @@ def main() -> None:
         num_training_steps=int(total_steps),
     )
 
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = (
+        str(args.run_id)
+        if args.run_id
+        else f"sft_shards_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    use_database_logging = not bool(args.no_database_logging)
+    log_root = Path(args.log_dir) if args.log_dir else (out_dir / "logs")
+    run_log_dir = log_root / run_id
+    logger = TrainingJSONLogger(
+        run_id=run_id,
+        component="train_sft_shards",
+        output_dir=run_log_dir,
+        use_database=use_database_logging,
+        db_path=str(args.db_path) if args.db_path else None,
+        meta={
+            "base_model_id": str(args.base_model_id),
+            "output_dir": str(out_dir),
+            "datasets": list(args.datasets),
+            "data_roots": list(args.data_roots),
+            "num_samples_total": len(samples),
+            "num_samples_train": len(train_samples),
+            "num_samples_val": len(val_samples) if val_samples else 0,
+            "validation_split": float(args.validation_split),
+            "max_length": int(args.max_length),
+            "batch_size": int(args.batch_size),
+            "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+            "num_epochs": int(args.num_epochs),
+            "lr": float(args.lr),
+            "warmup_steps": int(args.warmup_steps),
+            "lora_r": int(args.lora_r),
+            "lora_alpha": int(args.lora_alpha),
+            "lora_dropout": float(args.lora_dropout),
+            "lora_target_modules": list(args.lora_target_modules),
+            "intensity_scale": float(args.intensity_scale),
+            "safety_min": float(args.safety_min) if args.safety_min is not None else None,
+            "enable_thinking": bool(args.enable_thinking),
+            "device": str(device),
+            "torch_dtype": str(torch_dtype) if torch_dtype is not None else None,
+        },
+    )
+
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
-    for epoch in range(int(args.num_epochs)):
-        for step, batch in enumerate(loader_dl):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-            )
-            loss = outputs.loss
-            loss = loss * batch["weight"].mean()
-            loss = loss / max(1, int(args.gradient_accumulation_steps))
-            if not torch.isfinite(loss):
-                optimizer.zero_grad(set_to_none=True)
-                continue
-            loss.backward()
+    best_val_loss: Optional[float] = None
 
-            if (step + 1) % max(1, int(args.gradient_accumulation_steps)) == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+    grad_accum = max(1, int(args.gradient_accumulation_steps))
+    logging_steps = max(1, int(args.logging_steps))
+    eval_steps = max(0, int(args.eval_steps))
+    max_grad_norm = float(args.max_grad_norm)
+
+    accum_raw_loss = 0.0
+    accum_weighted_loss = 0.0
+    accum_weight_mean = 0.0
+    accum_micro_steps = 0
+
+    try:
+        for epoch in range(int(args.num_epochs)):
+            def finish_optimizer_step(*, is_remainder: bool) -> None:
+                nonlocal accum_raw_loss, accum_weighted_loss, accum_weight_mean, accum_micro_steps
+                nonlocal best_val_loss, global_step
+
+                if accum_micro_steps <= 0:
+                    return
+
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm))
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
-                if global_step % 10 == 0:
-                    print(f"step {global_step}/{total_steps} loss={float(loss.detach().cpu()):.4f}")
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
-    print(f"✅ Saved seed LoRA to {out_dir}")
+                step_raw_loss = accum_raw_loss / max(1, accum_micro_steps)
+                step_weighted_loss = accum_weighted_loss / max(1, accum_micro_steps)
+                step_weight_mean = accum_weight_mean / max(1, accum_micro_steps)
+                accum_raw_loss = 0.0
+                accum_weighted_loss = 0.0
+                accum_weight_mean = 0.0
+                accum_micro_steps = 0
+
+                if global_step % logging_steps == 0 or is_remainder:
+                    logger.log_step(
+                        {
+                            "epoch": epoch + 1,
+                            "step": global_step,
+                            "num_training_steps": int(total_steps),
+                            "train_loss": step_raw_loss,
+                            "train_loss_weighted": step_weighted_loss,
+                            "train_weight_mean": step_weight_mean,
+                            "grad_norm": grad_norm,
+                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "batch_size": int(args.batch_size),
+                            "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+                            "dataset_size_train": len(train_dataset),
+                            "dataset_size_val": len(val_samples) if val_samples else 0,
+                            "is_remainder_step": bool(is_remainder),
+                        }
+                    )
+                    print(
+                        f"step {global_step}/{total_steps} "
+                        f"train_loss={step_raw_loss:.4f} "
+                        f"val={'enabled' if val_loader else 'disabled'}"
+                    )
+
+                if val_loader and eval_steps and global_step % eval_steps == 0:
+                    val_metrics = _evaluate(
+                        model=model,
+                        val_loader=val_loader,
+                        device=device,
+                        max_batches=max(0, int(args.eval_max_batches)),
+                    )
+                    logger.log_eval(
+                        {
+                            "epoch": epoch + 1,
+                            "step": global_step,
+                            "num_training_steps": int(total_steps),
+                            **val_metrics,
+                        }
+                    )
+                    print(
+                        f"eval step {global_step}/{total_steps} "
+                        f"val_loss={val_metrics['val_loss']:.4f} ppl={val_metrics['val_ppl']:.2f}"
+                    )
+
+                    if args.save_best and math.isfinite(val_metrics["val_loss"]):
+                        if best_val_loss is None or val_metrics["val_loss"] < best_val_loss:
+                            best_val_loss = float(val_metrics["val_loss"])
+                            best_dir = out_dir / "best"
+                            best_dir.mkdir(parents=True, exist_ok=True)
+                            model.save_pretrained(best_dir)
+                            tokenizer.save_pretrained(best_dir)
+                            print(f"🏆 Saved best checkpoint to {best_dir} (val_loss={best_val_loss:.4f})")
+
+            for micro_step, batch in enumerate(train_loader):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                )
+
+                raw_loss = outputs.loss
+                weight_mean = batch["weight"].mean()
+                weighted_loss = raw_loss * weight_mean
+
+                loss_for_backward = weighted_loss / grad_accum
+                if not torch.isfinite(loss_for_backward):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                loss_for_backward.backward()
+
+                accum_raw_loss += float(raw_loss.detach().cpu())
+                accum_weighted_loss += float(weighted_loss.detach().cpu())
+                accum_weight_mean += float(weight_mean.detach().cpu())
+                accum_micro_steps += 1
+
+                if (micro_step + 1) % grad_accum != 0:
+                    continue
+
+                finish_optimizer_step(is_remainder=False)
+
+            # Flush any remainder microbatches so total_steps is accurate.
+            finish_optimizer_step(is_remainder=True)
+
+            if val_loader:
+                val_metrics = _evaluate(
+                    model=model,
+                    val_loader=val_loader,
+                    device=device,
+                    max_batches=max(0, int(args.eval_max_batches)),
+                )
+                logger.log_eval(
+                    {
+                        "epoch": epoch + 1,
+                        "step": global_step,
+                        "num_training_steps": int(total_steps),
+                        "event": "epoch_end",
+                        **val_metrics,
+                    }
+                )
+                print(
+                    f"epoch {epoch + 1} end "
+                    f"val_loss={val_metrics['val_loss']:.4f} ppl={val_metrics['val_ppl']:.2f}"
+                )
+
+                if args.save_best and math.isfinite(val_metrics["val_loss"]):
+                    if best_val_loss is None or val_metrics["val_loss"] < best_val_loss:
+                        best_val_loss = float(val_metrics["val_loss"])
+                        best_dir = out_dir / "best"
+                        best_dir.mkdir(parents=True, exist_ok=True)
+                        model.save_pretrained(best_dir)
+                        tokenizer.save_pretrained(best_dir)
+                        print(f"🏆 Saved best checkpoint to {best_dir} (val_loss={best_val_loss:.4f})")
+
+        model.save_pretrained(out_dir)
+        tokenizer.save_pretrained(out_dir)
+        logger.log_eval(
+            {
+                "event": "training_complete",
+                "step": global_step,
+                "num_training_steps": int(total_steps),
+                "best_val_loss": best_val_loss,
+                "output_dir": str(out_dir),
+            }
+        )
+        print(f"✅ Saved seed LoRA to {out_dir}")
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":
