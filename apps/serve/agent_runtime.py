@@ -495,9 +495,7 @@ class AgentRuntime:
         intensity = reward_intensity_from_s(s)
         r_t = float(delta_phi_used + self.alpha * intensity)
 
-        # Temporarily disabled self-reflection system for personality training
-        # Original: think_gate = bool(abs(raw_delta_phi) > 0.2 or abs(mean_self - mean_self_prev) > 0.2)
-        think_gate = False
+        think_gate = bool(abs(raw_delta_phi) > 0.2 or abs(mean_self - mean_self_prev) > 0.2)
 
         snapshot = TurnMetricsSnapshot(
             s=s,
