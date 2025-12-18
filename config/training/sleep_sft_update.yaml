@@ -1,0 +1,36 @@
+model:
+  base_model_id: "Qwen/Qwen3-1.7B"
+  max_length: 1024
+  enable_thinking: false
+
+data:
+  # Canonical DB (FastAPI server writes sleep_events here)
+  db_path: "/Users/chad/Documents/hominem/conversations.db"
+  clamp_history_turns: 6
+  # Recommended: SFT-only updates should not train on negative r_t samples.
+  require_positive_r_t: true
+
+training:
+  # By default, save sleep versions under the adapter root you pass as --init-adapter.
+  # You can override with --output-dir to write elsewhere.
+  output_dir: null
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  num_epochs: 1
+  learning_rate: 2.0e-5
+  warmup_steps: 50
+  max_grad_norm: 0.3
+  logging_steps: 10
+  logging_dir: "logs/train"
+  # Unified Theory-ish parameters
+  alpha: 0.5
+  w_memory: 1.0
+  w_gravity: 0.8
+  gravity_warmup_steps: 50
+  gravity_warmup_start: 0.0
+  validation_split: 0.0
+  eval_steps: 0
+  eval_max_batches: 0
+  base_memory_weight: 1.0
+  self_fraction_power: 1.0
+  reward_clip: 1.0

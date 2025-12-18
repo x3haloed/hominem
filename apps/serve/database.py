@@ -23,6 +23,23 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
 );
+
+CREATE TABLE IF NOT EXISTS sleep_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    user_message TEXT NOT NULL,
+    assistant TEXT NOT NULL,
+    think TEXT,
+    history_json TEXT,
+    metrics_json TEXT,
+    r_t REAL,
+    reward_intensity REAL,
+    delta_phi_used REAL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    used INTEGER DEFAULT 0,
+    used_at DATETIME,
+    used_in_run TEXT
+);
 """
 
 
@@ -65,13 +82,14 @@ class ConversationDB:
             )
             self.conn.commit()
 
-    def append_message(self, conversation_id: str, role: str, content: str, think: str | None = None) -> None:
+    def append_message(self, conversation_id: str, role: str, content: str, think: str | None = None) -> int:
         with self._lock:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "INSERT INTO messages(conversation_id, role, content, think) VALUES (?,?,?,?)",
                 (conversation_id, role, content, think),
             )
             self.conn.commit()
+            return int(cur.lastrowid)
 
     def list_messages(self, conversation_id: str, limit: int = 50) -> List[Tuple[str, str]]:
         with self._lock:
@@ -80,3 +98,94 @@ class ConversationDB:
                 (conversation_id, limit),
             )
             return list(reversed(cur.fetchall()))
+
+    def insert_sleep_event(
+        self,
+        *,
+        conversation_id: str,
+        user_message: str,
+        assistant: str,
+        think: str | None,
+        history: List[Dict[str, str]] | None,
+        metrics: Dict[str, Any] | None,
+        r_t: float | None,
+        reward_intensity: float | None,
+        delta_phi_used: float | None,
+    ) -> int:
+        history_json = json.dumps(history) if history is not None else None
+        metrics_json = json.dumps(metrics) if metrics is not None else None
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                INSERT INTO sleep_events
+                (conversation_id, user_message, assistant, think, history_json, metrics_json,
+                 r_t, reward_intensity, delta_phi_used)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    conversation_id,
+                    user_message,
+                    assistant,
+                    think,
+                    history_json,
+                    metrics_json,
+                    r_t,
+                    reward_intensity,
+                    delta_phi_used,
+                ),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def list_sleep_events(
+        self,
+        *,
+        only_unused: bool = True,
+        limit: int = 1000,
+        min_r_t: float | None = None,
+        min_reward_intensity: float | None = None,
+        require_positive_r_t: bool = True,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM sleep_events WHERE 1=1"
+        params: List[Any] = []
+        if only_unused:
+            query += " AND used=0"
+        if min_r_t is not None:
+            if require_positive_r_t:
+                query += " AND r_t >= ?"
+                params.append(float(min_r_t))
+            else:
+                query += " AND abs(r_t) >= ?"
+                params.append(float(min_r_t))
+        if min_reward_intensity is not None:
+            query += " AND reward_intensity >= ?"
+            params.append(float(min_reward_intensity))
+        query += " ORDER BY created_at ASC"
+        query += " LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            cur = self.conn.execute(query, params)
+            rows = [dict(row) for row in cur.fetchall()]
+        for row in rows:
+            for key in ("history_json", "metrics_json"):
+                if row.get(key):
+                    try:
+                        row[key] = json.loads(row[key])
+                    except Exception:
+                        pass
+        return rows
+
+    def mark_sleep_events_used(self, *, event_ids: List[int], run_id: str) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join(["?"] * len(event_ids))
+        with self._lock:
+            self.conn.execute(
+                f"""
+                UPDATE sleep_events
+                SET used=1, used_at=CURRENT_TIMESTAMP, used_in_run=?
+                WHERE id IN ({placeholders})
+                """,
+                (run_id, *event_ids),
+            )
+            self.conn.commit()

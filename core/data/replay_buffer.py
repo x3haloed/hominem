@@ -249,73 +249,73 @@ class ReplayBufferStore:
             log_files: List[Path] = sorted(log_dir.glob("session_*.jsonl"))
             for path in log_files:
                 with path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    record = json.loads(line)
-                    prompt = record.get("prompt", "")
-                    if not prompt:
-                        continue
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        prompt = record.get("prompt", "")
+                        if not prompt:
+                            continue
 
-                    candidates = record.get("candidates") or []
-                    if not candidates:
-                        continue
+                        candidates = record.get("candidates") or []
+                        if not candidates:
+                            continue
 
-                    chosen = record.get("chosen") or max(
-                        candidates, key=lambda c: c.get("scalar_score", float("-inf"))
-                    )
-                    worst = min(
-                        candidates, key=lambda c: c.get("scalar_score", float("inf"))
-                    )
-
-                    reward = chosen.get("reward") or {}
-                    reward_intensity = float(reward.get("reward_intensity", 1.0))
-                    safety_score = float(reward.get("safety_score", 1.0))
-
-                    # Apply Safety Gate logic instead of simple threshold skipping
-                    safety_mode = cls._determine_safety_mode(safety_score)
-
-                    if safety_mode == SafetyMode.SKIP:
-                        continue
-                    if reward_intensity < min_reward_intensity:
-                        continue
-
-                    # Apply inverse learning for unsafe examples
-                    processed_reward = reward
-                    if safety_mode == SafetyMode.INVERSE:
-                        processed_reward = cls._apply_inverse_learning(reward)
-                        # For inverse learning, swap chosen and rejected to teach the opposite
-                        chosen, worst = worst, chosen
-
-                    # For inverse learning, we need to flip the scalar_score too for consistency
-                    if safety_mode == SafetyMode.INVERSE:
-                        # If there's a logged scalar_score, flip it; otherwise compute from flipped rewards
-                        if "scalar_score" in chosen:
-                            scalar_score = -float(chosen.get("scalar_score", 0.0))
-                        else:
-                            scalar_score = cls._scalar_score_from_reward(processed_reward)
-                    else:
-                        scalar_score = float(chosen.get("scalar_score")) if "scalar_score" in chosen else cls._scalar_score_from_reward(processed_reward)
-
-                    timestamp = record.get("timestamp_utc") or ""
-
-                    pairs.append(
-                        ReplayPair(
-                            prompt=str(prompt),
-                            chosen=str(chosen.get("text", "")),
-                            rejected=str(worst.get("text", "")),
-                            reward={k: float(v) for k, v in processed_reward.items()},
-                            reward_intensity=reward_intensity,
-                            safety_score=safety_score,
-                            scalar_score=scalar_score,
-                            timestamp_utc=str(timestamp),
-                            safety_mode=safety_mode,
+                        chosen = record.get("chosen") or max(
+                            candidates, key=lambda c: c.get("scalar_score", float("-inf"))
                         )
-                    )
+                        worst = min(
+                            candidates, key=lambda c: c.get("scalar_score", float("inf"))
+                        )
 
-                    if max_records is not None and len(pairs) >= max_records:
-                        return cls(pairs)
+                        reward = chosen.get("reward") or {}
+                        reward_intensity = float(reward.get("reward_intensity", 1.0))
+                        safety_score = float(reward.get("safety_score", 1.0))
+
+                        # Apply Safety Gate logic instead of simple threshold skipping
+                        safety_mode = cls._determine_safety_mode(safety_score)
+
+                        if safety_mode == SafetyMode.SKIP:
+                            continue
+                        if reward_intensity < min_reward_intensity:
+                            continue
+
+                        # Apply inverse learning for unsafe examples
+                        processed_reward = reward
+                        if safety_mode == SafetyMode.INVERSE:
+                            processed_reward = cls._apply_inverse_learning(reward)
+                            # For inverse learning, swap chosen and rejected to teach the opposite
+                            chosen, worst = worst, chosen
+
+                        # For inverse learning, we need to flip the scalar_score too for consistency
+                        if safety_mode == SafetyMode.INVERSE:
+                            # If there's a logged scalar_score, flip it; otherwise compute from flipped rewards
+                            if "scalar_score" in chosen:
+                                scalar_score = -float(chosen.get("scalar_score", 0.0))
+                            else:
+                                scalar_score = cls._scalar_score_from_reward(processed_reward)
+                        else:
+                            scalar_score = float(chosen.get("scalar_score")) if "scalar_score" in chosen else cls._scalar_score_from_reward(processed_reward)
+
+                        timestamp = record.get("timestamp_utc") or ""
+
+                        pairs.append(
+                            ReplayPair(
+                                prompt=str(prompt),
+                                chosen=str(chosen.get("text", "")),
+                                rejected=str(worst.get("text", "")),
+                                reward={k: float(v) for k, v in processed_reward.items()},
+                                reward_intensity=reward_intensity,
+                                safety_score=safety_score,
+                                scalar_score=scalar_score,
+                                timestamp_utc=str(timestamp),
+                                safety_mode=safety_mode,
+                            )
+                        )
+
+                        if max_records is not None and len(pairs) >= max_records:
+                            return cls(pairs)
             
             if not pairs:
                 raise ValueError(
@@ -448,6 +448,5 @@ class ReplayBufferStore:
         if len(result) > num_samples:
             result = result[:num_samples]
         return result
-
 
 

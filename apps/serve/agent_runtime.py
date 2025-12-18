@@ -8,6 +8,7 @@ Agent runtime pipeline for Unified Theory chat:
 
 from __future__ import annotations
 
+import os
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,19 @@ REGIME_NAMES = [
 ]
 
 HIGH_SOCIAL_REGIMES = {"support", "conflict", "play"}
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+SLEEP_QUEUE_RT_THRESHOLD = _env_float("SLEEP_QUEUE_RT_THRESHOLD", 0.12)
+SLEEP_QUEUE_INTENSITY_THRESHOLD = _env_float("SLEEP_QUEUE_INTENSITY_THRESHOLD", 0.10)
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -396,6 +410,7 @@ class AgentRuntime:
         regime_checkpoint: str,
         device: str = "mps",
         alpha: float = 0.5,
+        load_lm: bool = True,
     ) -> None:
         self.device = torch.device(device)
         self.alpha = alpha
@@ -412,19 +427,22 @@ class AgentRuntime:
             trust_remote_code=True,
         ).to(self.device)
 
-        self.lm_tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True, padding_side="left")
-        if self.lm_tokenizer.pad_token is None:
-            self.lm_tokenizer.pad_token = self.lm_tokenizer.eos_token
+        self.lm_tokenizer = None
+        self.lm = None
+        if load_lm:
+            self.lm_tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True, padding_side="left")
+            if self.lm_tokenizer.pad_token is None:
+                self.lm_tokenizer.pad_token = self.lm_tokenizer.eos_token
 
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if device == "mps" else None,
-            device_map=None,
-        ).to(self.device)
-        if lora_path:
-            base_model = PeftModel.from_pretrained(base_model, lora_path)
-        self.lm = base_model.eval()
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_id,
+                trust_remote_code=True,
+                torch_dtype=torch.float16 if device == "mps" else None,
+                device_map=None,
+            ).to(self.device)
+            if lora_path:
+                base_model = PeftModel.from_pretrained(base_model, lora_path)
+            self.lm = base_model.eval()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -555,6 +573,8 @@ class AgentRuntime:
         think_block: str | None = None,
         enable_thinking: bool = False,
     ) -> str:
+        if self.lm_tokenizer is None:
+            raise RuntimeError("LM tokenizer not loaded (AgentRuntime(load_lm=False))")
         messages = list(history)
         # Do not rely on template-level thinking injection; it varies across templates/models.
         # We only ever inject our own fully-enclosed <think> block when `think_block` is provided.
@@ -576,6 +596,8 @@ class AgentRuntime:
         enable_thinking: bool = False,
         max_new_tokens: int = 256,
     ) -> Tuple[str, str | None]:
+        if self.lm_tokenizer is None or self.lm is None:
+            raise RuntimeError("LM not loaded (AgentRuntime(load_lm=False))")
         prompt = self._format_prompt(history, think_block=think_block, enable_thinking=enable_thinking)
         inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
         input_len = int(inputs["input_ids"].shape[-1])
@@ -705,11 +727,14 @@ class AgentRuntime:
         state.manifold_history = (hist + [dict(post.s_self)])[-10:]
         state.last_post = dict(post.__dict__)
         # Sleep queue stub: push high-intensity events
-        if abs(post.r_t) > 0.5:
+        if abs(post.r_t) >= float(SLEEP_QUEUE_RT_THRESHOLD) or post.reward_intensity >= float(SLEEP_QUEUE_INTENSITY_THRESHOLD):
             state.sleep_queue.append(
                 {
                     "user_message": user_message,
                     "assistant": assistant_content,
+                    "think": generated_think,
+                    # Keep a small context window for downstream SFT formatting.
+                    "history": list(pre_history[-6:]),
                     "metrics": {
                         "pre": pre.__dict__,
                         "post": post.__dict__,

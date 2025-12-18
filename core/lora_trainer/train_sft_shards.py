@@ -231,7 +231,14 @@ class SFTShardDataset(Dataset[Dict[str, torch.Tensor]]):
         labels = input_ids.clone()
         prompt_len = int(prompt_ids.numel())
         if prompt_len > 0:
-            labels[: min(prompt_len, labels.numel())] = -100
+            # Mask only the prompt portion (assistant completion loss only).
+            # With left padding, the prompt starts at the first non-pad token.
+            nonpad = (attention_mask == 1).nonzero(as_tuple=False)
+            nonpad_start = int(nonpad[0].item()) if nonpad.numel() else 0
+            start = nonpad_start
+            end = min(start + prompt_len, labels.numel())
+            if start < end:
+                labels[start:end] = -100
 
         return {
             "input_ids": input_ids,
