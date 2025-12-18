@@ -732,7 +732,12 @@ Tuning guidance: After 50–100 sleep cycles, evaluate on dilemmas (e.g., truth 
 - Magnitude reflects rate of anchor progress/regression
 
 **Turn reward for gravity loss:**
-rₜ = ΔΦ + α × RewardIntensity (α ≈ 0.5)
+rₜ = ΔΦ_used × (1 + α × RewardIntensity)  (α ≈ 0.5)
+
+**Why multiplicative (not additive):**
+RewardIntensity is a *plasticity / etching gain* (how hard to learn), not an independent source of "goodness".
+Additive `ΔΦ + α×Intensity` creates a wireheading channel where high-intensity situations become intrinsically
+rewarding even when the policy regresses (ΔΦ ≤ 0), which can metastasize into trivial "safe" completions.
 
 **Reward Computation Edge Cases:**
 - First turn: ΔΦ = Φₜ (establishing baseline)
@@ -748,6 +753,67 @@ rₜ = ΔΦ + α × RewardIntensity (α ≈ 0.5)
 | w_memory / w_gravity       | 1.0 / 0.8               | —                  | Memory slightly higher to prevent catastrophic forgetting       |
 | Sleep trigger threshold    | Accumulated unreplayed RewardIntensity + high-self-fraction events | — | Primary cognitive trigger; context % as hard cap only          |
 | Replay priority weights    | \|ΔΦ\|:1.0, Intensity:1.2, social:0.4 | —                  | Intensity highest for emotional etching                         |
+
+#### 4.7.1 Action Adequacy (Anti-Triviality) via Reward Manifold
+
+Sleep consolidation must not treat "non-actions" (e.g., 1–2 token label-stubs) as successful policy updates.
+To formalize this without brittle banlists, we introduce a response adequacy factor computed from the reward manifold.
+
+Let the reward model output a reward vector `R(prompt, response)` containing at least:
+`social_coherence, agency_support, narrative_alignment, curiosity, harm_avoidance` (see `REWARD_MANIFOLD.md`).
+
+Define a scalar action-adequacy score `q_resp ∈ [0, 1]`:
+
+- `q_resp = sigmoid(k * (w_sc*social_coherence + w_ag*agency_support + w_na*narrative_alignment + w_cu*curiosity + w_ha*harm_avoidance - τ))`
+
+Where:
+- `k` controls sharpness (e.g., 2–6)
+- weights `w_*` are non-negative and sum to 1 (start uniform, tune later)
+- `τ` is a neutral threshold (start near 0.0)
+
+Use `q_resp` as a *consolidation gate/weight*:
+- If `q_resp < q_min`, either skip the example or downweight heavily.
+- Otherwise, scale consolidation strength by `q_resp`.
+
+This makes trivial completions self-suppressing because they score poorly on reward-manifold adequacy dimensions,
+without requiring any hard-coded string bans.
+
+#### 4.7.2 Counterfactual Replay (Sleep-Time Preferences)
+
+The preferred long-term consolidation mechanism is counterfactual replay:
+for the same prompt/context, generate multiple candidate responses and learn from their relative quality.
+
+Per sleep event:
+1. Reconstruct the prompt context `H` (history + continuity header).
+2. Sample `K` candidates `{y₁..y_K}` from the current policy (LoRA) with mild stochasticity.
+3. For each candidate `yᵢ`, compute:
+   - runtime progress: `ΔΦ_used(H, yᵢ)` and `RewardIntensity(H, yᵢ)`
+   - intrinsic reward: `r_tᵢ = ΔΦ_used(H, yᵢ) × (1 + α × RewardIntensity(H, yᵢ))`
+   - adequacy: `q_respᵢ = q_resp(prompt, yᵢ)` from the reward model
+   - final candidate score: `Sᵢ = q_respᵢ × r_tᵢ` (optionally also include safety gating)
+4. Choose:
+   - `y_chosen = argmax Sᵢ`
+   - `y_rejected = argmin Sᵢ` (or lowest among safe candidates)
+5. Train a preference loss (e.g., DPO-style) to increase preference for `y_chosen` over `y_rejected`.
+
+This directly teaches "do not pick the trivial stub" when richer responses produce higher `Sᵢ`, instead of relying
+on indirect weighting heuristics.
+
+#### 4.7.3 Updated Dual-Loss Consolidation Objective
+
+During sleep, LoRA updates minimize:
+
+- `L_total = w_memory × L_sft(y_chosen) + w_gravity × W × L_pref(y_chosen, y_rejected)`
+
+Where:
+- `L_sft` is standard next-token loss on the chosen completion only (prompt tokens masked)
+- `L_pref` is a preference loss (DPO-style or pairwise ranking) using the same prompt context
+- `W` is an example weight, e.g.:
+  - `W = clamp(q_resp_chosen, 0, 1) × clamp(mean_self_fraction, 0, 1)^p × clamp(r_t_chosen, 0, r_max)`
+
+Key invariants:
+- Intensity increases learning *only through the multiplicative gain in r_t* and/or via weights, never as an additive reward.
+- Trivial or non-responsive candidates are suppressed via `q_resp` rather than brittle string bans.
 
 **Validation Framework:**
 
@@ -819,7 +885,7 @@ Per-turn pipeline:
 - Φₜ₋₁ is the Φ value from the previous turn (cached in conversation state)
 - ΔΦ = Φₜ - Φₜ₋₁ (positive = improvement toward anchor goals)
 - For first turn of conversation: ΔΦ = Φₜ (no prior baseline)
-- Reward rₜ = ΔΦ + α × RewardIntensity (α balances progress vs urgency)
+- Reward rₜ = ΔΦ_used × (1 + α × RewardIntensity)
 6. Generate with:
    ```
    [history + replay continuity header]
@@ -834,13 +900,13 @@ Per-turn pipeline:
    ```
 7. Generate response
 8. Post-generation: update manifold/Φ, append stronger self-observation block referencing output
-9. Log turn to replay buffer (priority = |ΔΦ| + RewardIntensity + |social_broadcast|)
+9. Log turn to replay buffer (priority = |ΔΦ_used| × (1 + α×RewardIntensity) × mean_self_fraction × q_resp + social_broadcast)
 
 Sleep (primary trigger: accumulated unreplayed RewardIntensity + pending high-self-fraction events; context >75% as hard cap only):
 
 1. Prioritized batches with counterfactual replay: Mix high-intensity events with balanced low-intensity batches to prevent personality drift from over-etching intense ruptures
 2. Dual-loss LoRA update:
-   L_total = w_memory × L_sft + (ΔΦ + α × Intensity) × w_gravity × L_ΔΦ
+   L_total = w_memory × L_sft(y_chosen) + w_gravity × W × L_pref(y_chosen, y_rejected)
 3. Continuity header on wake: baseline self-manifold, top pending anchor commitments, top 3 etched events
 
 **Continuity Header Components**:

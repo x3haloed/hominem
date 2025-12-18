@@ -90,8 +90,12 @@ Normative runtime constants (must match `unified_theory.md`):
 - Self-observation gating: emit <\|THINK\|> when `abs(raw_ΔΦ) > 0.2` OR `abs(mean_self_fraction_t - mean_self_fraction_{t-1}) > 0.2`.
 - RewardIntensity: `arousal * (abs(valence) ** 1.0 * abs(predictive_discrepancy)) ** 0.5 * (1.8 if valence < 0 else 1.0)`.
 - ΔΦ smoothing: `EMA_ΔΦ_t = 0.8 * EMA_ΔΦ_{t-1} + 0.2 * raw_ΔΦ` and define `ΔΦ_used = EMA_ΔΦ_t` (log both).
-- Gravity reward: `r_t = ΔΦ_used + α * RewardIntensity` with default `α = 0.5`.
+- Gravity reward: `r_t = ΔΦ_used * (1 + α * RewardIntensity)` with default `α = 0.5`.
 - Safety clamps: cap `RewardIntensity` to `3.0`; cap `abs(Φ_t - Φ_{t-1})` to `2.0`; clip `ΔΦ_used` to `[-1.0, 1.0]` for loss weighting.
+
+Additional consolidation invariants:
+- Action adequacy (anti-triviality): compute `q_resp ∈ [0,1]` from the reward manifold model (see `REWARD_MANIFOLD.md`) and use it to gate/downweight consolidation; do not hard-code string banlists.
+- Counterfactual replay: during sleep, generate `K` candidates per event, score each with `S = q_resp * r_t` (plus safety gating), select best/worst, and train a preference loss (DPO-style) instead of single-sample SFT-only consolidation.
 
 ---
 
@@ -114,6 +118,8 @@ Normative runtime constants (must match `unified_theory.md`):
 
 ### Phase 4 – Sleep + LoRA consolidation
 - Build replay buffer prioritization, dual-loss trainer, continuity headers.
+- Add reward-manifold-based action adequacy `q_resp` and integrate into replay selection + training weights.
+- Implement sleep-time counterfactual replay (multi-candidate generation + scoring + DPO-style preference loss).
 - Validate on synthetic conversations; verify ΔΦ-driven updates, w_memory/w_gravity scheduling, gradient clipping.
 
 ### Phase 5 – Evaluation harness
@@ -339,4 +345,3 @@ python -m core.lora_trainer.train_regime \
 3. Stand up CI job to fail if any component missing or logging coverage <100% of required metrics.
 
 Once Phase 1 merges, proceed sequentially; no LoRA training until frozen heads validated.
-
