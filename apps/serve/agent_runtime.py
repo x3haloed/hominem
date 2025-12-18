@@ -601,15 +601,17 @@ class AgentRuntime:
         prompt = self._format_prompt(history, think_block=think_block, enable_thinking=enable_thinking)
         inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
         input_len = int(inputs["input_ids"].shape[-1])
+        temperature = 0.6 if think_block or enable_thinking else 0.7
+        top_p = 0.95 if think_block or enable_thinking else 0.8
         output = self.lm.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.1,  # More deterministic
-            top_p=0.9,
+            temperature=temperature,
+            top_p=top_p,
             top_k=40,
             min_p=0.0,
-            repetition_penalty=1.2,  # Reduce repetition
+            repetition_penalty=1.1,  # Reduce repetition
         )
         # Decode only the newly generated tokens. Using string slicing on the decoded text is brittle
         # because the decoded prompt may not be a byte-for-byte prefix of the decoded output.
@@ -644,6 +646,7 @@ class AgentRuntime:
 
         # Build response (insert think block if gated)
         think_block = None
+        injected_think: str | None = None
         if think_gate:
             prior_post = state.last_post or {}
             prior_assistant = ""
@@ -699,6 +702,14 @@ class AgentRuntime:
                 "- Next move should maximize expected ΔΦ toward the anchors.\n"
                 "</think>\n\n"
             )
+            # Persist the injected self-observation (even when the model doesn't emit <think>).
+            try:
+                start = think_block.lower().find("<think>")
+                end = think_block.lower().rfind("</think>")
+                if start != -1 and end != -1 and end > start:
+                    injected_think = think_block[start + len("<think>"): end].strip()
+            except Exception:
+                injected_think = None
 
         # Update history with user msg and optional think block
         new_history = list(pre_history)
@@ -726,13 +737,23 @@ class AgentRuntime:
         state.mean_self_prev = post.mean_self
         state.manifold_history = (hist + [dict(post.s_self)])[-10:]
         state.last_post = dict(post.__dict__)
+
+        # Prefer persisting the injected self-observation. If the model also emitted its own think,
+        # append it for debugging/analysis.
+        stored_think: str | None = injected_think
+        if generated_think:
+            if stored_think:
+                stored_think = f"{stored_think}\n\n[model_think]\n{generated_think}"
+            else:
+                stored_think = generated_think
+
         # Sleep queue stub: push high-intensity events
         if abs(post.r_t) >= float(SLEEP_QUEUE_RT_THRESHOLD) or post.reward_intensity >= float(SLEEP_QUEUE_INTENSITY_THRESHOLD):
             state.sleep_queue.append(
                 {
                     "user_message": user_message,
                     "assistant": assistant_content,
-                    "think": generated_think,
+                    "think": stored_think,
                     # Keep a small context window for downstream SFT formatting.
                     "history": list(pre_history[-6:]),
                     "metrics": {
@@ -744,4 +765,4 @@ class AgentRuntime:
             )
         state.history = new_history
 
-        return assistant_content, generated_think, metrics, state
+        return assistant_content, stored_think, metrics, state
