@@ -223,7 +223,8 @@ def reward_intensity_from_s(s: Dict[str, float]) -> float:
     base = arousal * math.sqrt((abs(valence) ** 1.0) * abs(discrepancy))
     if valence < 0:
         base *= 1.8
-    return float(clamp(base, 0.0, 3.0))
+    # RewardIntensity is a gain scalar; keep it bounded to avoid domination/reward hacking.
+    return float(clamp(base, 0.0, 1.0))
 
 
 def history_avg_social(history: List[Dict[str, float]], n: int = 3) -> float:
@@ -511,7 +512,8 @@ class AgentRuntime:
         delta_phi_used = float(clamp(ema_delta_phi, -1.0, 1.0))
 
         intensity = reward_intensity_from_s(s)
-        r_t = float(delta_phi_used + self.alpha * intensity)
+        # Unified Theory update: multiplicative gain so RewardIntensity cannot flip the sign of ΔΦ_used.
+        r_t = float(delta_phi_used * (1.0 + self.alpha * intensity))
 
         think_gate = bool(abs(raw_delta_phi) > 0.2 or abs(mean_self - mean_self_prev) > 0.2)
 
