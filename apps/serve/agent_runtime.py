@@ -20,6 +20,8 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
 
 # ---------------------------------------------------------------------------
@@ -624,9 +626,22 @@ class AgentRuntime:
         temperature = 0.6 if think_block or enable_thinking else 0.7
         top_p = 0.95 if think_block or enable_thinking else 0.8
 
-        def run_once(prompt: str) -> str:
+        class _StopOnTokens(StoppingCriteria):
+            def __init__(self, stop_ids: List[int]) -> None:
+                self.stop_ids = stop_ids
+
+            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
+                if input_ids.shape[-1] < len(self.stop_ids):
+                    return False
+                window = input_ids[0, -len(self.stop_ids):].tolist()
+                return window == self.stop_ids
+
+        def run_once(prompt: str, stop_ids: List[int] | None = None) -> str:
             inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
             input_len = int(inputs["input_ids"].shape[-1])
+            stopping_criteria = None
+            if stop_ids:
+                stopping_criteria = StoppingCriteriaList([_StopOnTokens(stop_ids)])
             output = self.lm.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
@@ -636,6 +651,7 @@ class AgentRuntime:
                 top_k=40,
                 min_p=0.0,
                 repetition_penalty=1.2,  # Reduce repetition
+                stopping_criteria=stopping_criteria,
             )
             # Decode only the newly generated tokens. Using string slicing on the decoded text is brittle
             # because the decoded prompt may not be a byte-for-byte prefix of the decoded output.
@@ -654,13 +670,14 @@ class AgentRuntime:
             return text, None
 
         if think_block and enable_thinking:
+            stop_ids = self.lm_tokenizer.encode("</think>", add_special_tokens=False)
             prompt_first = self._format_prompt(
                 history,
                 think_block=None,
                 enable_thinking=True,
                 add_generation_prompt=True,
             )
-            first_generated = run_once(prompt_first)
+            first_generated = run_once(prompt_first, stop_ids=stop_ids)
             _, pass1_think = extract_think(first_generated)
             merged_think_block = self._inject_think_block(think_block, pass1_think)
             prompt_second = self._format_prompt(
