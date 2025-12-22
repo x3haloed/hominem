@@ -574,21 +574,42 @@ class AgentRuntime:
         history: List[Dict[str, str]],
         think_block: str | None = None,
         enable_thinking: bool = False,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         if self.lm_tokenizer is None:
             raise RuntimeError("LM tokenizer not loaded (AgentRuntime(load_lm=False))")
         messages = list(history)
         # Do not rely on template-level thinking injection; it varies across templates/models.
         # We only ever inject our own fully-enclosed <think> block when `think_block` is provided.
+        if add_generation_prompt is None:
+            add_generation_prompt = not think_block
         prompt = self.lm_tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=not think_block,
-            enable_thinking=enable_thinking or bool(think_block),
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
         )
         if think_block:
             prompt += think_block
         return prompt
+
+    @staticmethod
+    def _inject_think_block(base_think_block: str, extra_think: str | None) -> str:
+        if not extra_think:
+            return base_think_block
+        extra = extra_think.strip()
+        if not extra:
+            return base_think_block
+        lower = base_think_block.lower()
+        end = lower.rfind("</think>")
+        if end == -1:
+            return base_think_block
+        prefix = base_think_block[:end]
+        if not prefix.endswith("\n\n"):
+            if not prefix.endswith("\n"):
+                prefix += "\n"
+            prefix += "\n"
+        return f"{prefix}{extra}\n{base_think_block[end:]}"
 
     @torch.no_grad()
     def generate(
@@ -597,40 +618,65 @@ class AgentRuntime:
         think_block: str | None,
         enable_thinking: bool = False,
         max_new_tokens: int = 256,
-    ) -> Tuple[str, str | None]:
+    ) -> Tuple[str, str | None, str | None]:
         if self.lm_tokenizer is None or self.lm is None:
             raise RuntimeError("LM not loaded (AgentRuntime(load_lm=False))")
-        prompt = self._format_prompt(history, think_block=think_block, enable_thinking=enable_thinking)
-        inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_len = int(inputs["input_ids"].shape[-1])
         temperature = 0.6 if think_block or enable_thinking else 0.7
         top_p = 0.95 if think_block or enable_thinking else 0.8
-        output = self.lm.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=40,
-            min_p=0.0,
-            repetition_penalty=1.1,  # Reduce repetition
-        )
-        # Decode only the newly generated tokens. Using string slicing on the decoded text is brittle
-        # because the decoded prompt may not be a byte-for-byte prefix of the decoded output.
-        new_tokens = output[0][input_len:]
-        generated = self.lm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        think_content: str | None = None
 
-        # Extract think content from generated text (regardless of think_block)
-        # The model might generate think tags even when we don't want them
-        generated_lower = generated.lower()
-        start = generated_lower.find("<think>")
-        end = generated_lower.find("</think>")
-        if start != -1 and end != -1 and end > start:
-            think_content = generated[start + len("<think>"): end].strip()
-            # Remove think block from generated output
-            generated = (generated[:start] + generated[end + len("</think>"):]).strip()
-        return generated, think_content
+        def run_once(prompt: str) -> str:
+            inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
+            input_len = int(inputs["input_ids"].shape[-1])
+            output = self.lm.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=40,
+                min_p=0.0,
+                repetition_penalty=1.2,  # Reduce repetition
+            )
+            # Decode only the newly generated tokens. Using string slicing on the decoded text is brittle
+            # because the decoded prompt may not be a byte-for-byte prefix of the decoded output.
+            new_tokens = output[0][input_len:]
+            return self.lm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+        def extract_think(text: str) -> Tuple[str, str | None]:
+            generated_lower = text.lower()
+            start = generated_lower.find("<think>")
+            end = generated_lower.find("</think>")
+            if start != -1 and end != -1 and end > start:
+                think_content = text[start + len("<think>"): end].strip()
+                # Remove think block from generated output
+                text = (text[:start] + text[end + len("</think>"):]).strip()
+                return text, think_content
+            return text, None
+
+        if think_block and enable_thinking:
+            prompt_first = self._format_prompt(
+                history,
+                think_block=None,
+                enable_thinking=True,
+                add_generation_prompt=True,
+            )
+            first_generated = run_once(prompt_first)
+            _, pass1_think = extract_think(first_generated)
+            merged_think_block = self._inject_think_block(think_block, pass1_think)
+            prompt_second = self._format_prompt(
+                history,
+                think_block=merged_think_block,
+                enable_thinking=True,
+                add_generation_prompt=False,
+            )
+            second_generated = run_once(prompt_second)
+            second_generated, think_content = extract_think(second_generated)
+            return second_generated, think_content, pass1_think
+
+        prompt = self._format_prompt(history, think_block=think_block, enable_thinking=enable_thinking)
+        generated = run_once(prompt)
+        generated, think_content = extract_think(generated)
+        return generated, think_content, None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -717,7 +763,7 @@ class AgentRuntime:
         new_history = list(pre_history)
 
         # Generate assistant content
-        assistant_content, generated_think = self.generate(
+        assistant_content, generated_think, pass1_think = self.generate(
             new_history, think_block=think_block, enable_thinking=enable_thinking
         )
         new_history.append({"role": "assistant", "content": assistant_content})
@@ -743,6 +789,11 @@ class AgentRuntime:
         # Prefer persisting the injected self-observation. If the model also emitted its own think,
         # append it for debugging/analysis.
         stored_think: str | None = injected_think
+        if pass1_think:
+            if stored_think:
+                stored_think = f"{stored_think}\n\n[model_think_pass1]\n{pass1_think}"
+            else:
+                stored_think = pass1_think
         if generated_think:
             if stored_think:
                 stored_think = f"{stored_think}\n\n[model_think]\n{generated_think}"
