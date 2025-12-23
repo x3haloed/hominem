@@ -201,6 +201,7 @@ def _sleep_event_score(entry: dict[str, Any]) -> float:
         reward_intensity = float(post.get("reward_intensity", 0.0) or 0.0)
     except Exception:
         reward_intensity = 0.0
+    reward_intensity = float(max(0.0, min(1.0, reward_intensity)))
     try:
         dphi = float(post.get("delta_phi_used", post.get("delta_phi_ema", post.get("delta_phi_raw", 0.0))) or 0.0)
     except Exception:

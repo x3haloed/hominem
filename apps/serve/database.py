@@ -40,6 +40,55 @@ CREATE TABLE IF NOT EXISTS sleep_events (
     used_at DATETIME,
     used_in_run TEXT
 );
+
+-- Counterfactual replay scaffolding (sleep-time candidate generation + preference training).
+CREATE TABLE IF NOT EXISTS sleep_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sleep_event_id INTEGER NOT NULL,
+    candidate_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    model_id TEXT,
+    adapter_path TEXT,
+    temperature REAL,
+    top_p REAL,
+    max_new_tokens INTEGER,
+    seed INTEGER,
+    q_resp REAL,
+    r_t REAL,
+    score REAL,
+    safety_score REAL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (sleep_event_id) REFERENCES sleep_events(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sleep_candidates_event ON sleep_candidates(sleep_event_id);
+
+CREATE TABLE IF NOT EXISTS preference_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sleep_event_id INTEGER,
+    chosen_candidate_id INTEGER NOT NULL,
+    rejected_candidate_id INTEGER NOT NULL,
+    prompt_text TEXT NOT NULL,
+    weight REAL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (sleep_event_id) REFERENCES sleep_events(id),
+    FOREIGN KEY (chosen_candidate_id) REFERENCES sleep_candidates(id),
+    FOREIGN KEY (rejected_candidate_id) REFERENCES sleep_candidates(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_preference_pairs_event ON preference_pairs(sleep_event_id);
+
+CREATE TABLE IF NOT EXISTS reward_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sleep_candidate_id INTEGER NOT NULL,
+    q_resp REAL,
+    unsafe INTEGER DEFAULT 0,
+    notes TEXT,
+    labeled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (sleep_candidate_id) REFERENCES sleep_candidates(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reward_labels_candidate ON reward_labels(sleep_candidate_id);
 """
 
 
