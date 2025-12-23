@@ -28,7 +28,8 @@ This replaces the older WebSocket/hot-swap serving system (removed).
 ## API
 
 - `GET /health` – liveness check
-- `POST /chat` – run one turn (returns assistant + metrics)
+- `POST /chat` – convenience route (single user message, appends to canonical history)
+- `POST /v1/chat/completions` – OpenAI-compatible chat completions (supports streaming)
 - `POST /sleep` – drain `sleep_queue` to JSONL and optionally run online update
 - `GET /messages` – fetch last messages for a conversation
 

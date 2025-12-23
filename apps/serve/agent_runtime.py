@@ -12,7 +12,8 @@ import os
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
+from threading import Thread
 
 import torch
 from peft import PeftModel
@@ -22,6 +23,7 @@ from transformers import (
     AutoTokenizer,
     StoppingCriteria,
     StoppingCriteriaList,
+    TextIteratorStreamer,
 )
 
 # ---------------------------------------------------------------------------
@@ -573,10 +575,11 @@ class AgentRuntime:
 
     def _format_prompt(
         self,
-        history: List[Dict[str, str]],
+        history: List[Dict[str, Any]],
         think_block: str | None = None,
         enable_thinking: bool = False,
         add_generation_prompt: bool | None = None,
+        tools: List[Dict[str, Any]] | None = None,
     ) -> str:
         if self.lm_tokenizer is None:
             raise RuntimeError("LM tokenizer not loaded (AgentRuntime(load_lm=False))")
@@ -587,6 +590,7 @@ class AgentRuntime:
             add_generation_prompt = not think_block
         prompt = self.lm_tokenizer.apply_chat_template(
             messages,
+            tools=tools,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking,
@@ -613,18 +617,21 @@ class AgentRuntime:
             prefix += "\n"
         return f"{prefix}{extra}\n{base_think_block[end:]}"
 
-    @torch.no_grad()
-    def generate(
-        self,
-        history: List[Dict[str, str]],
-        think_block: str | None,
-        enable_thinking: bool = False,
-        max_new_tokens: int = 256,
-    ) -> Tuple[str, str | None, str | None]:
-        if self.lm_tokenizer is None or self.lm is None:
-            raise RuntimeError("LM not loaded (AgentRuntime(load_lm=False))")
-        temperature = 0.6 if think_block or enable_thinking else 0.7
-        top_p = 0.95 if think_block or enable_thinking else 0.8
+    @staticmethod
+    def _extract_think(text: str) -> Tuple[str, str | None]:
+        generated_lower = text.lower()
+        start = generated_lower.find("<think>")
+        end = generated_lower.find("</think>")
+        if start != -1 and end != -1 and end > start:
+            think_content = text[start + len("<think>"): end].strip()
+            text = (text[:start] + text[end + len("</think>"):]).strip()
+            return text, think_content
+        return text, None
+
+    @staticmethod
+    def _build_stop_criteria(stop_ids: List[int] | None) -> StoppingCriteriaList | None:
+        if not stop_ids:
+            return None
 
         class _StopOnTokens(StoppingCriteria):
             def __init__(self, stop_ids: List[int]) -> None:
@@ -636,38 +643,98 @@ class AgentRuntime:
                 window = input_ids[0, -len(self.stop_ids):].tolist()
                 return window == self.stop_ids
 
-        def run_once(prompt: str, stop_ids: List[int] | None = None) -> str:
-            inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
-            input_len = int(inputs["input_ids"].shape[-1])
-            stopping_criteria = None
-            if stop_ids:
-                stopping_criteria = StoppingCriteriaList([_StopOnTokens(stop_ids)])
-            output = self.lm.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=40,
-                min_p=0.0,
-                repetition_penalty=1.2,  # Reduce repetition
-                stopping_criteria=stopping_criteria,
-            )
-            # Decode only the newly generated tokens. Using string slicing on the decoded text is brittle
-            # because the decoded prompt may not be a byte-for-byte prefix of the decoded output.
-            new_tokens = output[0][input_len:]
-            return self.lm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        return StoppingCriteriaList([_StopOnTokens(stop_ids)])
 
-        def extract_think(text: str) -> Tuple[str, str | None]:
-            generated_lower = text.lower()
-            start = generated_lower.find("<think>")
-            end = generated_lower.find("</think>")
-            if start != -1 and end != -1 and end > start:
-                think_content = text[start + len("<think>"): end].strip()
-                # Remove think block from generated output
-                text = (text[:start] + text[end + len("</think>"):]).strip()
-                return text, think_content
-            return text, None
+    @staticmethod
+    def _resolve_sampling(
+        think_block: str | None,
+        enable_thinking: bool,
+        temperature: float | None,
+        top_p: float | None,
+    ) -> Tuple[float, float]:
+        if temperature is None:
+            temperature = 0.6 if think_block or enable_thinking else 0.7
+        if top_p is None:
+            top_p = 0.95 if think_block or enable_thinking else 0.8
+        return float(temperature), float(top_p)
+
+    @torch.no_grad()
+    def _run_once(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop_ids: List[int] | None = None,
+    ) -> str:
+        if self.lm_tokenizer is None or self.lm is None:
+            raise RuntimeError("LM not loaded (AgentRuntime(load_lm=False))")
+        inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_len = int(inputs["input_ids"].shape[-1])
+        stopping_criteria = self._build_stop_criteria(stop_ids)
+        output = self.lm.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=40,
+            min_p=0.0,
+            repetition_penalty=1.3,  # Reduce repetition
+            stopping_criteria=stopping_criteria,
+        )
+        new_tokens = output[0][input_len:]
+        return self.lm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+    @torch.no_grad()
+    def _stream_once(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop_ids: List[int] | None = None,
+    ) -> Iterable[str]:
+        if self.lm_tokenizer is None or self.lm is None:
+            raise RuntimeError("LM not loaded (AgentRuntime(load_lm=False))")
+        inputs = self.lm_tokenizer(prompt, return_tensors="pt").to(self.device)
+        stopping_criteria = self._build_stop_criteria(stop_ids)
+        streamer = TextIteratorStreamer(self.lm_tokenizer, skip_special_tokens=True, skip_prompt=True)
+        generate_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=40,
+            min_p=0.0,
+            repetition_penalty=1.3,
+            stopping_criteria=stopping_criteria,
+            streamer=streamer,
+        )
+        thread = Thread(target=self.lm.generate, kwargs=generate_kwargs)
+        thread.start()
+        for text in streamer:
+            if text:
+                yield text
+        thread.join()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        history: List[Dict[str, Any]],
+        think_block: str | None,
+        enable_thinking: bool = False,
+        max_new_tokens: int = 256,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        tools: List[Dict[str, Any]] | None = None,
+    ) -> Tuple[str, str | None, str | None]:
+        if self.lm_tokenizer is None or self.lm is None:
+            raise RuntimeError("LM not loaded (AgentRuntime(load_lm=False))")
+        temperature, top_p = self._resolve_sampling(think_block, enable_thinking, temperature, top_p)
 
         if think_block and enable_thinking:
             stop_ids = self.lm_tokenizer.encode("</think>", add_special_tokens=False)
@@ -676,29 +743,55 @@ class AgentRuntime:
                 think_block=None,
                 enable_thinking=True,
                 add_generation_prompt=True,
+                tools=tools,
             )
-            first_generated = run_once(prompt_first, stop_ids=stop_ids)
-            _, pass1_think = extract_think(first_generated)
+            first_generated = self._run_once(
+                prompt_first,
+                stop_ids=stop_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            _, pass1_think = self._extract_think(first_generated)
             merged_think_block = self._inject_think_block(think_block, pass1_think)
             prompt_second = self._format_prompt(
                 history,
                 think_block=merged_think_block,
                 enable_thinking=True,
                 add_generation_prompt=False,
+                tools=tools,
             )
-            second_generated = run_once(prompt_second)
-            second_generated, think_content = extract_think(second_generated)
+            second_generated = self._run_once(
+                prompt_second,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            second_generated, think_content = self._extract_think(second_generated)
             return second_generated, think_content, pass1_think
 
-        prompt = self._format_prompt(history, think_block=think_block, enable_thinking=enable_thinking)
-        generated = run_once(prompt)
-        generated, think_content = extract_think(generated)
+        prompt = self._format_prompt(
+            history,
+            think_block=think_block,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
+        generated = self._run_once(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        generated, think_content = self._extract_think(generated)
         return generated, think_content, None
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-    def run_turn(self, state: ConversationState, user_message: str, enable_thinking: bool = False) -> Tuple[str, str | None, TurnMetrics, ConversationState]:
+    def _prepare_turn(
+        self,
+        state: ConversationState,
+        user_message: str,
+        enable_thinking: bool,
+        tools: List[Dict[str, Any]] | None = None,
+    ) -> Tuple[List[Dict[str, Any]], Any, bool, str | None, str | None, List[Dict[str, float]]]:
         hist = state.manifold_history
         pre_history = list(state.history) + [{"role": "user", "content": user_message}]
         pre, think_gate = self._compute_snapshot(
@@ -709,7 +802,6 @@ class AgentRuntime:
             manifold_history=hist,
         )
 
-        # Build response (insert think block if gated)
         think_block = None
         injected_think: str | None = None
         if think_gate:
@@ -767,7 +859,6 @@ class AgentRuntime:
                 "- Next move should maximize expected ΔΦ toward the anchors.\n"
                 "</think>\n\n"
             )
-            # Persist the injected self-observation (even when the model doesn't emit <think>).
             try:
                 start = think_block.lower().find("<think>")
                 end = think_block.lower().rfind("</think>")
@@ -776,16 +867,24 @@ class AgentRuntime:
             except Exception:
                 injected_think = None
 
-        # Update history with user msg and optional think block
-        new_history = list(pre_history)
+        return pre_history, pre, think_gate, think_block, injected_think, hist
 
-        # Generate assistant content
-        assistant_content, generated_think, pass1_think = self.generate(
-            new_history, think_block=think_block, enable_thinking=enable_thinking
-        )
+    def _finalize_turn(
+        self,
+        state: ConversationState,
+        user_message: str,
+        pre_history: List[Dict[str, Any]],
+        pre: Any,
+        think_gate: bool,
+        hist: List[Dict[str, float]],
+        assistant_content: str,
+        think_block: str | None,
+        pass1_think: str | None,
+        injected_think: str | None,
+    ) -> Tuple[TurnMetrics, ConversationState, str | None]:
+        new_history = list(pre_history)
         new_history.append({"role": "assistant", "content": assistant_content})
 
-        # Post-generation metrics are computed on the assistant message (with user context).
         post, _ = self._compute_snapshot(
             history=new_history,
             phi_prev=state.phi_prev,
@@ -796,18 +895,13 @@ class AgentRuntime:
 
         metrics = TurnMetrics(pre=pre, post=post, think_gate=think_gate)
 
-        # Update state
         state.phi_prev = post.phi_value
         state.ema_delta_phi = post.delta_phi_ema
         state.mean_self_prev = post.mean_self
         state.manifold_history = (hist + [dict(post.s_self)])[-10:]
         state.last_post = dict(post.__dict__)
 
-        # Store exactly the content that was inside the <think> block handed to the model.
-        # If we had a second pass, save the merged content that was inside the <think> tags.
-        # If we did not have a second pass, store the original think content.
-        if pass1_think:
-            # There was a second pass, extract the merged content from inside the tags
+        if pass1_think and think_block:
             merged_block = self._inject_think_block(think_block, pass1_think)
             try:
                 start = merged_block.lower().find("<think>")
@@ -815,21 +909,18 @@ class AgentRuntime:
                 if start != -1 and end != -1 and end > start:
                     stored_think = merged_block[start + len("<think>"): end].strip()
                 else:
-                    stored_think = injected_think  # Fallback to original
+                    stored_think = injected_think
             except Exception:
-                stored_think = injected_think  # Fallback to original
+                stored_think = injected_think
         else:
-            # No second pass, store the original think content
             stored_think = injected_think
 
-        # Sleep queue stub: push high-intensity events
         if abs(post.r_t) >= float(SLEEP_QUEUE_RT_THRESHOLD) or post.reward_intensity >= float(SLEEP_QUEUE_INTENSITY_THRESHOLD):
             state.sleep_queue.append(
                 {
                     "user_message": user_message,
                     "assistant": assistant_content,
                     "think": stored_think,
-                    # Keep a small context window for downstream SFT formatting.
                     "history": list(pre_history[-6:]),
                     "metrics": {
                         "pre": pre.__dict__,
@@ -840,4 +931,48 @@ class AgentRuntime:
             )
         state.history = new_history
 
-        return assistant_content, stored_think, metrics, state
+        return metrics, state, stored_think
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+    def run_turn(
+        self,
+        state: ConversationState,
+        user_message: str,
+        enable_thinking: bool = False,
+        max_new_tokens: int = 256,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        tools: List[Dict[str, Any]] | None = None,
+    ) -> Tuple[str, str | None, TurnMetrics, ConversationState, str | None, str | None]:
+        pre_history, pre, think_gate, think_block, injected_think, hist = self._prepare_turn(
+            state,
+            user_message,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
+
+        assistant_content, generated_think, pass1_think = self.generate(
+            pre_history,
+            think_block=think_block,
+            enable_thinking=enable_thinking,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+        )
+        metrics, state, stored_think = self._finalize_turn(
+            state=state,
+            user_message=user_message,
+            pre_history=pre_history,
+            pre=pre,
+            think_gate=think_gate,
+            hist=hist,
+            assistant_content=assistant_content,
+            think_block=think_block,
+            pass1_think=pass1_think,
+            injected_think=injected_think,
+        )
+
+        return assistant_content, stored_think, metrics, state, think_block, pass1_think

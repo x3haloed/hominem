@@ -6,26 +6,29 @@ Features:
 - Loads base LM (Qwen3-1.7B) + optional LoRA adapter
 - Loads frozen manifold/regime heads
 - Runs agent loop with self-tagging, anchors, Φ/ΔΦ, RewardIntensity
-- Provides simple FastAPI with /chat and /sleep endpoints
+- Provides OpenAI-compatible /v1/chat/completions endpoint
 """
 
 from __future__ import annotations
 
 import os
 import json
+import re
+import time
+import uuid
 import subprocess
 import sys
-import math
-from pathlib import Path
-from typing import Any, Dict
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, Tuple
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from dotenv import load_dotenv
 
 from apps.serve.agent_runtime import AgentRuntime, ConversationState, TurnMetrics
@@ -134,12 +137,18 @@ def metrics_to_dict(m: TurnMetrics) -> Dict[str, Any]:
         "think_gate": m.think_gate,
     }
 
-def _prompt_token_count(history: list[dict[str, str]]) -> int:
+
+def _prompt_token_count(history: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
     # Count tokens for the actual model prompt after applying the model's chat template.
     if not history:
         return 0
     try:
-        prompt = runtime._format_prompt(history, think_block=None, enable_thinking=False)  # type: ignore[attr-defined]
+        prompt = runtime._format_prompt(  # type: ignore[attr-defined]
+            history,
+            think_block=None,
+            enable_thinking=False,
+            tools=tools,
+        )
         encoded = runtime.lm_tokenizer(prompt, return_tensors="pt")  # type: ignore[union-attr]
         return int(encoded["input_ids"].shape[-1])
     except Exception:
@@ -154,6 +163,127 @@ def _prompt_token_count(history: list[dict[str, str]]) -> int:
         prompt = "\n".join(parts)
         encoded = runtime.lm_tokenizer(prompt, return_tensors="pt")  # type: ignore[union-attr]
         return int(encoded["input_ids"].shape[-1])
+
+def _extract_message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(p for p in parts if p)
+    return str(content or "")
+
+
+def _normalize_messages(messages: list[dict[str, Any]]) -> Tuple[list[dict[str, Any]], str]:
+    normalized: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = (msg.get("role") or "user").lower()
+        if role == "developer":
+            role = "system"
+        if role not in {"system", "user", "assistant", "tool"}:
+            role = "assistant"
+        content = _extract_message_text(msg.get("content"))
+        normalized_msg: dict[str, Any] = {"role": role, "content": content}
+        tool_calls = msg.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            normalized_msg["tool_calls"] = tool_calls
+        tool_call_id = msg.get("tool_call_id") or msg.get("toolCallId")
+        if role == "tool" and tool_call_id:
+            normalized_msg["tool_call_id"] = tool_call_id
+        normalized.append(normalized_msg)
+    for idx in range(len(normalized) - 1, -1, -1):
+        if normalized[idx]["role"] == "user":
+            user_message = normalized[idx]["content"]
+            return normalized[:idx], user_message
+    raise HTTPException(status_code=400, detail="No user message found in messages.")
+
+
+def _merge_canonical_history(
+    canonical: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+) -> Tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not incoming:
+        return list(canonical), []
+    if not canonical:
+        return list(incoming), list(incoming)
+    max_k = min(len(canonical), len(incoming))
+
+    def message_key(msg: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+        role = msg.get("role")
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        tool_call_id = msg.get("tool_call_id")
+        tool_calls_key = None
+        if tool_calls is not None:
+            try:
+                tool_calls_key = json.dumps(tool_calls, sort_keys=True)
+            except Exception:
+                tool_calls_key = str(tool_calls)
+        return (role, content, tool_calls_key, tool_call_id)
+
+    canonical_keys = [message_key(m) for m in canonical]
+    incoming_keys = [message_key(m) for m in incoming]
+    for k in range(max_k, 0, -1):
+        if canonical_keys[-k:] == incoming_keys[:k]:
+            appended = list(incoming[k:])
+            return list(canonical) + appended, appended
+    appended = list(incoming)
+    return list(canonical) + appended, appended
+
+
+def _extract_tool_calls_from_content(content: str) -> Tuple[str, list[dict[str, Any]]]:
+    if not content:
+        return "", []
+    tool_calls: list[dict[str, Any]] = []
+    pattern = re.compile(r"<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>", re.DOTALL)
+    matches = list(pattern.finditer(content))
+    if not matches:
+        return content, []
+    cleaned = content
+    for match in matches:
+        raw = match.group(1)
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        name = payload.get("name")
+        arguments = payload.get("arguments")
+        if name:
+            if not isinstance(arguments, str):
+                try:
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                except Exception:
+                    arguments = str(arguments)
+            tool_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments or "{}"},
+                }
+            )
+    cleaned = pattern.sub("", cleaned).strip()
+    return cleaned, tool_calls
+
+
+def _strip_assistant_prefix(text: str | None) -> str:
+    if not text:
+        return ""
+    prefix = "<|im_start|>assistant\n"
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+
+def _count_tokens_text(text: str) -> int:
+    if not text:
+        return 0
+    encoded = runtime.lm_tokenizer(text, return_tensors="pt")  # type: ignore[union-attr]
+    return int(encoded["input_ids"].shape[-1])
+
 
 def _excerpt(text: str, limit: int) -> str:
     t = (text or "").replace("\n", " ").strip()
@@ -266,6 +396,23 @@ def _build_continuity_header(state: ConversationState, drained: list[dict[str, A
 # API models
 # ---------------------------------------------------------------------------
 
+class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    model: str
+    messages: list[dict[str, Any]]
+    stream: bool | None = False
+    max_completion_tokens: int | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    metadata: Dict[str, Any] | None = None
+    reasoning_effort: str | None = None
+    stream_options: Dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    parallel_tool_calls: bool | None = None
+
+
 class ChatRequest(BaseModel):
     conversation_id: str = "canonical"
     user_message: str
@@ -297,7 +444,7 @@ class SleepResponse(BaseModel):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Unified Theory Chat")
+app = FastAPI(title="OpenAI Chat Completions")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -389,7 +536,6 @@ def chat(req: ChatRequest):
     st_dict = db.get_state(req.conversation_id)
     state = state_from_dict(st_dict)
 
-    # Hard guard against OOM: compute prompt token count for this turn and refuse if too large.
     projected_history = list(state.history) + [{"role": "user", "content": req.user_message}]
     projected_tokens = _prompt_token_count(projected_history)
     if projected_tokens >= int(MAX_CONTEXT_TOKENS):
@@ -398,8 +544,10 @@ def chat(req: ChatRequest):
             detail=f"Context too large ({projected_tokens} tokens). Call /sleep to trim history (trigger at {SLEEP_TRIGGER_TOKENS}).",
         )
 
-    assistant, think_content, metrics, new_state = runtime.run_turn(
-        state, req.user_message, enable_thinking=req.enable_thinking
+    assistant, think_content, metrics, new_state, _think_block, _pass1_think = runtime.run_turn(
+        state,
+        req.user_message,
+        enable_thinking=req.enable_thinking,
     )
 
     db.append_message(req.conversation_id, "user", req.user_message)
@@ -415,6 +563,273 @@ def chat(req: ChatRequest):
     )
 
 
+@app.post("/v1/chat/completions")
+def chat_completions(req: ChatCompletionRequest):
+    history, user_message = _normalize_messages(req.messages)
+    conversation_id = (req.metadata or {}).get("conversation_id") or "canonical"
+    enable_thinking = bool((req.metadata or {}).get("enable_thinking"))
+    if req.reasoning_effort and req.reasoning_effort not in {"none", "minimal"}:
+        enable_thinking = True
+
+    tools = req.tools
+    if req.tool_choice == "none":
+        tools = None
+    elif isinstance(req.tool_choice, dict):
+        tool_name = ((req.tool_choice.get("function") or {}).get("name"))
+        if tool_name and tools:
+            tools = [t for t in tools if (t.get("function") or {}).get("name") == tool_name]
+            if not tools:
+                raise HTTPException(status_code=400, detail=f"tool_choice requested unknown tool '{tool_name}'.")
+
+    st_dict = db.get_state(conversation_id)
+    state = state_from_dict(st_dict)
+    state.history, appended_history = _merge_canonical_history(state.history, history)
+    for msg in appended_history:
+        db.append_message(conversation_id, msg.get("role", "user"), msg.get("content", ""))
+
+    projected_history = list(state.history) + [{"role": "user", "content": user_message}]
+    projected_tokens = _prompt_token_count(projected_history, tools=tools)
+    if projected_tokens >= int(MAX_CONTEXT_TOKENS):
+        raise HTTPException(
+            status_code=413,
+            detail=f"Context too large ({projected_tokens} tokens). Reduce messages or truncate history.",
+        )
+
+    max_new_tokens = max(1, int(req.max_completion_tokens or req.max_tokens or 256))
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    def build_response(
+        assistant_text: str | None,
+        output_think_block: str,
+        model_name: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+        finish_reason: str = "stop",
+    ) -> Dict[str, Any]:
+        output_content = f"{output_think_block}{assistant_text or ''}"
+        prompt_tokens = _prompt_token_count(projected_history, tools=tools)
+        completion_tokens = _count_tokens_text(output_content)
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": output_content if output_content else None,
+                        "tool_calls": tool_calls,
+                        "refusal": None,
+                        "annotations": [],
+                    },
+                    "logprobs": None,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0,
+                    "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0,
+                },
+            },
+            "service_tier": "default",
+        }
+
+    if req.stream:
+        def event_stream() -> Iterable[str]:
+            think_block = None
+            merged_think_block = None
+            pass1_think = None
+            pre_history, pre, think_gate, think_block, injected_think, hist = runtime._prepare_turn(
+                state,
+                user_message,
+                enable_thinking=enable_thinking,
+                tools=tools,
+            )
+            temperature, top_p = runtime._resolve_sampling(think_block, enable_thinking, req.temperature, req.top_p)
+
+            merged_think_block = think_block
+            if think_block and enable_thinking:
+                stop_ids = runtime.lm_tokenizer.encode("</think>", add_special_tokens=False)  # type: ignore[union-attr]
+                prompt_first = runtime._format_prompt(
+                    pre_history,
+                    think_block=None,
+                    enable_thinking=True,
+                    add_generation_prompt=True,
+                )
+                first_generated = runtime._run_once(
+                    prompt_first,
+                    stop_ids=stop_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                _, pass1_think = runtime._extract_think(first_generated)
+                merged_think_block = runtime._inject_think_block(think_block, pass1_think)
+
+            output_think_block = _strip_assistant_prefix(merged_think_block)
+
+            def send_chunk(
+                delta_content: str | None = None,
+                delta_role: str | None = None,
+                finish_reason: str | None = None,
+                delta_tool_calls: list[dict[str, Any]] | None = None,
+            ) -> str:
+                delta: Dict[str, Any] = {}
+                if delta_role:
+                    delta["role"] = delta_role
+                if delta_content is not None:
+                    delta["content"] = delta_content
+                if delta_tool_calls is not None:
+                    delta["tool_calls"] = delta_tool_calls
+                payload = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                }
+                return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            if tools:
+                assistant, think_content, _metrics, new_state, think_block, pass1_think = runtime.run_turn(
+                    state,
+                    user_message,
+                    enable_thinking=enable_thinking,
+                    max_new_tokens=max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    tools=tools,
+                )
+                output_think_block = think_block
+                if pass1_think:
+                    output_think_block = runtime._inject_think_block(think_block, pass1_think) if think_block else None
+                output_think_block = _strip_assistant_prefix(output_think_block)
+                cleaned, tool_calls = _extract_tool_calls_from_content(assistant)
+                output_content = f"{output_think_block}{cleaned}"
+                content_delta = output_content if output_content else None
+                yield send_chunk(delta_role="assistant")
+                if content_delta:
+                    yield send_chunk(delta_content=content_delta)
+                if tool_calls:
+                    yield send_chunk(delta_tool_calls=tool_calls)
+                db.append_message(conversation_id, "user", user_message)
+                db.append_message(conversation_id, "assistant", assistant, think=think_content)
+                merged_state = dict(st_dict or {})
+                merged_state.update(state_to_dict(new_state))
+                db.save_state(conversation_id, merged_state)
+                yield send_chunk(
+                    delta_content=None,
+                    finish_reason="tool_calls" if tool_calls else "stop",
+                )
+                yield "data: [DONE]\n\n"
+                return
+
+            yield send_chunk(delta_role="assistant")
+            if output_think_block:
+                yield send_chunk(delta_content=output_think_block)
+
+            if think_block and enable_thinking:
+                prompt_second = runtime._format_prompt(
+                    pre_history,
+                    think_block=merged_think_block,
+                    enable_thinking=True,
+                    add_generation_prompt=False,
+                    tools=tools,
+                )
+                stream_iter = runtime._stream_once(
+                    prompt_second,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+            else:
+                prompt = runtime._format_prompt(
+                    pre_history,
+                    think_block=think_block,
+                    enable_thinking=enable_thinking,
+                    add_generation_prompt=None,
+                    tools=tools,
+                )
+                stream_iter = runtime._stream_once(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+
+            generated_parts: list[str] = []
+            for chunk in stream_iter:
+                generated_parts.append(chunk)
+                yield send_chunk(delta_content=chunk)
+
+            generated = "".join(generated_parts)
+            assistant_content, generated_think = runtime._extract_think(generated)
+
+            _metrics, new_state, stored_think = runtime._finalize_turn(
+                state=state,
+                user_message=user_message,
+                pre_history=pre_history,
+                pre=pre,
+                think_gate=think_gate,
+                hist=hist,
+                assistant_content=assistant_content,
+                think_block=think_block,
+                pass1_think=pass1_think,
+                injected_think=injected_think,
+            )
+
+            db.append_message(conversation_id, "user", user_message)
+            db.append_message(conversation_id, "assistant", assistant_content, think=stored_think)
+            merged_state = dict(st_dict or {})
+            merged_state.update(state_to_dict(new_state))
+            db.save_state(conversation_id, merged_state)
+
+            yield send_chunk(delta_content=None, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    assistant, think_content, _metrics, new_state, think_block, pass1_think = runtime.run_turn(
+        state,
+        user_message,
+        enable_thinking=enable_thinking,
+        max_new_tokens=max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        tools=tools,
+    )
+
+    output_think_block = think_block
+    if pass1_think:
+        output_think_block = runtime._inject_think_block(think_block, pass1_think) if think_block else None
+    output_think_block = _strip_assistant_prefix(output_think_block)
+
+    cleaned, tool_calls = _extract_tool_calls_from_content(assistant)
+
+    db.append_message(conversation_id, "user", user_message)
+    db.append_message(conversation_id, "assistant", assistant, think=think_content)
+    merged_state = dict(st_dict or {})
+    merged_state.update(state_to_dict(new_state))
+    db.save_state(conversation_id, merged_state)
+
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    return build_response(cleaned, output_think_block, req.model, tool_calls=tool_calls or None, finish_reason=finish_reason)
+
+
+@app.post("/chat/completions")
+def chat_completions_alias(req: ChatCompletionRequest):
+    return chat_completions(req)
+
+
 @app.post("/sleep", response_model=SleepResponse)
 def sleep(req: SleepRequest):
     st_dict = db.get_state(req.conversation_id)
@@ -427,7 +842,7 @@ def sleep(req: SleepRequest):
 
     to_process = state.sleep_queue if should_sleep else state.sleep_queue[: req.max_items]
     if to_process:
-        log_path = _write_sleep_logs(req.conversation_id, to_process)
+        _write_sleep_logs(req.conversation_id, to_process)
         for entry in to_process:
             metrics = entry.get("metrics") or {}
             post = (metrics.get("post") or {}) if isinstance(metrics, dict) else {}
