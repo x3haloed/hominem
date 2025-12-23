@@ -149,7 +149,8 @@ def _reward_intensity_from_s(s: Dict[str, Any]) -> float:
     base = arousal * math.sqrt((abs(valence) ** 1.0) * abs(discrepancy))
     if valence < 0:
         base *= 1.8
-    return float(_clamp(base, 0.0, 3.0))
+    # RewardIntensity is a gain scalar; keep it bounded to avoid domination/reward hacking.
+    return float(_clamp(base, 0.0, 1.0))
 
 
 def _mean_self_fraction_from_metrics(post: Dict[str, Any]) -> float:
@@ -192,6 +193,8 @@ def _derive_values(ev: Dict[str, Any], *, alpha: float) -> Tuple[float, float, f
         reward_intensity_f = float(reward_intensity) if reward_intensity is not None else 0.0
     except Exception:
         reward_intensity_f = 0.0
+    # Clamp even if the DB stored an out-of-range intensity from older runs.
+    reward_intensity_f = float(_clamp(reward_intensity_f, 0.0, 1.0))
 
     delta_phi_used = ev.get("delta_phi_used")
     if delta_phi_used is None:
@@ -201,15 +204,8 @@ def _derive_values(ev: Dict[str, Any], *, alpha: float) -> Tuple[float, float, f
     except Exception:
         delta_phi_used_f = 0.0
 
-    r_t = ev.get("r_t")
-    if r_t is None:
-        r_t = post.get("r_t")
-    if r_t is None:
-        r_t = delta_phi_used_f + float(alpha) * reward_intensity_f
-    try:
-        r_t_f = float(r_t) if r_t is not None else 0.0
-    except Exception:
-        r_t_f = 0.0
+    # Unified Theory update: multiplicative gain so RewardIntensity cannot flip the sign of ΔΦ_used.
+    r_t_f = float(delta_phi_used_f * (1.0 + float(alpha) * reward_intensity_f))
 
     return float(r_t_f), float(reward_intensity_f), float(delta_phi_used_f)
 
@@ -318,6 +314,7 @@ def load_sleep_events(
     only_unused: bool,
     limit: int,
     conversation_id: Optional[str],
+    order: str = "asc",
 ) -> List[Dict[str, Any]]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -329,7 +326,10 @@ def load_sleep_events(
         if conversation_id:
             query += " AND conversation_id=?"
             params.append(conversation_id)
-        query += " ORDER BY created_at ASC"
+        order_norm = str(order or "asc").strip().lower()
+        if order_norm not in ("asc", "desc"):
+            raise ValueError("order must be 'asc' or 'desc'")
+        query += f" ORDER BY created_at {order_norm.upper()}"
         query += " LIMIT ?"
         params.append(int(limit))
         cur = con.execute(query, params)
@@ -348,6 +348,45 @@ def load_sleep_events(
                 row["metrics_json"] = json.loads(row["metrics_json"])
             except Exception:
                 pass
+    return rows
+
+
+def load_eval_jsonl(path: str) -> List[Dict[str, Any]]:
+    eval_path = Path(path)
+    if not eval_path.exists():
+        raise FileNotFoundError(f"Eval JSONL not found: {eval_path}")
+    rows: List[Dict[str, Any]] = []
+    next_fallback_id = -1
+    with eval_path.open("r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"⚠️  Skipping invalid JSONL line {line_num} in {eval_path}")
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("history_json") is None and isinstance(row.get("messages"), list):
+                row["history_json"] = row.get("messages")
+            if row.get("assistant") is None and row.get("response") is not None:
+                row["assistant"] = row.get("response")
+            if row.get("history_json") and isinstance(row["history_json"], str):
+                try:
+                    row["history_json"] = json.loads(row["history_json"])
+                except Exception:
+                    pass
+            if row.get("metrics_json") and isinstance(row["metrics_json"], str):
+                try:
+                    row["metrics_json"] = json.loads(row["metrics_json"])
+                except Exception:
+                    pass
+            if row.get("id") is None:
+                row["id"] = next_fallback_id
+                next_fallback_id -= 1
+            rows.append(row)
     return rows
 
 
@@ -530,6 +569,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--only-unused", action="store_true", help="Only use sleep_events.used=0 (default).")
     parser.add_argument("--include-used", action="store_true", help="If set, allows using already-used events.")
     parser.add_argument("--limit", type=int, default=2000)
+    parser.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        default="asc",
+        help="Order sleep_events by created_at (asc=oldest-first, desc=newest-first).",
+    )
     parser.add_argument("--min-r-t", type=float, default=0.3)
     parser.add_argument("--min-reward-intensity", type=float, default=0.0)
     parser.add_argument(
@@ -537,6 +582,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="If set, drop non-positive r_t examples (recommended for SFT-only updates).",
     )
+    parser.add_argument("--eval-jsonl", default=None, help="Optional fixed eval JSONL file (overrides validation_split).")
 
     parser.add_argument("--init-adapter", default="artifacts/lora/qwen3-1.7b-seed-sft-v3")
     parser.add_argument("--output-dir", default=None)
@@ -609,6 +655,7 @@ def main(argv: List[str] | None = None) -> None:
     data_cfg = cfg["data"]
 
     db_path = args.db_path or data_cfg.get("db_path") or _default_db_path()
+    eval_jsonl = args.eval_jsonl or data_cfg.get("eval_jsonl")
     init_adapter = args.init_adapter or model_cfg.get("init_adapter") or "artifacts/lora/qwen3-1.7b-seed-sft-v3"
 
     output_dir = args.output_dir or train_cfg.get("output_dir") or init_adapter
@@ -668,6 +715,7 @@ def main(argv: List[str] | None = None) -> None:
         only_unused=only_unused,
         limit=int(args.limit),
         conversation_id=str(args.conversation_id) if args.conversation_id else None,
+        order=str(args.order),
     )
     # Build samples + compute priorities for replay selection.
     raw_samples = build_sleep_sft_samples(
@@ -686,10 +734,35 @@ def main(argv: List[str] | None = None) -> None:
         print("No usable sleep_events for training (filters removed everything).")
         return
 
-    # Train/val split before prioritization to keep eval "unseen" by construction.
-    train_idx, val_idx = _split_train_val_indices(len(raw_samples), validation_split=validation_split, seed=seed)
-    train_pool = [raw_samples[i] for i in train_idx]
-    val_pool = [raw_samples[i] for i in val_idx]
+    val_samples_from_db = True
+    if eval_jsonl:
+        eval_events = load_eval_jsonl(str(eval_jsonl))
+        eval_samples = build_sleep_sft_samples(
+            eval_events,
+            clamp_history_turns=clamp_history_turns,
+            require_positive_r_t=require_positive_r_t,
+            min_r_t=float(args.min_r_t or 0.0),
+            min_reward_intensity=float(args.min_reward_intensity or 0.0),
+            alpha=alpha,
+            base_memory_weight=base_memory_weight,
+            self_fraction_power=self_fraction_power,
+            reward_clip=reward_clip,
+            max_events=None,
+        )
+        if eval_samples:
+            train_pool = list(raw_samples)
+            val_samples = list(eval_samples)
+            val_samples_from_db = False
+        else:
+            print(f"⚠️  No usable eval samples in {eval_jsonl}; falling back to validation_split.")
+            train_idx, val_idx = _split_train_val_indices(len(raw_samples), validation_split=validation_split, seed=seed)
+            train_pool = [raw_samples[i] for i in train_idx]
+            val_samples = [raw_samples[i] for i in val_idx]
+    else:
+        # Train/val split before prioritization to keep eval "unseen" by construction.
+        train_idx, val_idx = _split_train_val_indices(len(raw_samples), validation_split=validation_split, seed=seed)
+        train_pool = [raw_samples[i] for i in train_idx]
+        val_samples = [raw_samples[i] for i in val_idx]
 
     # Prioritized mixing (spec-inspired): top-K by priority + random mix from remainder (train pool only).
     events_by_id: Dict[int, Dict[str, Any]] = {}
@@ -737,8 +810,6 @@ def main(argv: List[str] | None = None) -> None:
         import random as _random
         random_part = _random.sample(remaining, min(k_random, len(remaining)))
     samples = (high + random_part)[:num_samples]
-    val_samples = list(val_pool)
-
     device = _device()
     torch_dtype = _torch_dtype_for_device(device)
 
@@ -842,6 +913,7 @@ def main(argv: List[str] | None = None) -> None:
             "balanced_mix": {"high": mix_high, "low": mix_low, "rest": max(0.0, 1.0 - mix_high - mix_low)},
             "balanced_low_thresholds": {"reward_intensity": low_intensity_threshold, "abs_delta_phi_used": low_delta_phi_threshold},
             "validation_split": validation_split,
+            "eval_jsonl": str(eval_jsonl) if eval_jsonl else None,
             "eval_steps": eval_steps,
             "eval_max_batches": eval_max_batches,
             "save_best": save_best,
@@ -878,6 +950,7 @@ def main(argv: List[str] | None = None) -> None:
         mem_losses: List[float] = []
         grav_losses: List[float] = []
         tot_losses: List[float] = []
+        ce_losses: List[float] = []
         reward_means: List[float] = []
         self_means: List[float] = []
 
@@ -910,6 +983,7 @@ def main(argv: List[str] | None = None) -> None:
             mem_losses.append(float(memory_loss.detach().cpu()))
             grav_losses.append(float(gravity_loss.detach().cpu()))
             tot_losses.append(float(total_loss.detach().cpu()))
+            ce_losses.append(float(seq_losses.mean().detach().cpu()))
             reward_means.append(float(gravity_r.mean().detach().cpu()))
             self_means.append(float(batch["mean_self_fraction"].mean().detach().cpu()))
 
@@ -920,6 +994,7 @@ def main(argv: List[str] | None = None) -> None:
                 "val_loss_total": float("nan"),
                 "val_loss_memory": float("nan"),
                 "val_loss_gravity": float("nan"),
+                "val_loss_ce": float("nan"),
                 "val_reward_mean": float("nan"),
                 "val_mean_self_fraction": float("nan"),
                 "val_w_gravity": float(w_gravity_eval),
@@ -929,6 +1004,7 @@ def main(argv: List[str] | None = None) -> None:
             "val_loss_total": float(sum(tot_losses) / len(tot_losses)),
             "val_loss_memory": float(sum(mem_losses) / len(mem_losses)),
             "val_loss_gravity": float(sum(grav_losses) / len(grav_losses)),
+            "val_loss_ce": float(sum(ce_losses) / len(ce_losses)),
             "val_reward_mean": float(sum(reward_means) / len(reward_means)),
             "val_mean_self_fraction": float(sum(self_means) / len(self_means)),
             "val_w_gravity": float(w_gravity_eval),
@@ -1125,7 +1201,9 @@ def main(argv: List[str] | None = None) -> None:
         print(f"✅ Saved sleep LoRA update to {out_dir}")
 
         if not args.no_mark_used:
-            used_ids = [s.event_id for s in samples] + [s.event_id for s in val_samples]
+            used_ids = [s.event_id for s in samples]
+            if val_samples_from_db:
+                used_ids += [s.event_id for s in val_samples]
             mark_events_used(db_path=str(db_path), event_ids=used_ids, run_id=run_id)
             print(f"🧾 Marked {len(used_ids)} sleep_events as used (run_id={run_id})")
     finally:

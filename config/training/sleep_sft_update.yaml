@@ -6,6 +6,8 @@ model:
 data:
   # Canonical DB (FastAPI server writes sleep_events here)
   db_path: "/Users/chad/Documents/hominem/conversations.db"
+  # Optional fixed eval JSONL for stable metrics across runs.
+  eval_jsonl: null
   clamp_history_turns: 6
   # Recommended: SFT-only updates should not train on negative r_t samples.
   require_positive_r_t: true
