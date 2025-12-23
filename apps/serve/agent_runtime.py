@@ -803,19 +803,24 @@ class AgentRuntime:
         state.manifold_history = (hist + [dict(post.s_self)])[-10:]
         state.last_post = dict(post.__dict__)
 
-        # Prefer persisting the injected self-observation. If the model also emitted its own think,
-        # append it for debugging/analysis.
-        stored_think: str | None = injected_think
+        # Store exactly the content that was inside the <think> block handed to the model.
+        # If we had a second pass, save the merged content that was inside the <think> tags.
+        # If we did not have a second pass, store the original think content.
         if pass1_think:
-            if stored_think:
-                stored_think = f"{stored_think}\n\n[model_think_pass1]\n{pass1_think}"
-            else:
-                stored_think = pass1_think
-        if generated_think:
-            if stored_think:
-                stored_think = f"{stored_think}\n\n[model_think]\n{generated_think}"
-            else:
-                stored_think = generated_think
+            # There was a second pass, extract the merged content from inside the tags
+            merged_block = self._inject_think_block(think_block, pass1_think)
+            try:
+                start = merged_block.lower().find("<think>")
+                end = merged_block.lower().rfind("</think>")
+                if start != -1 and end != -1 and end > start:
+                    stored_think = merged_block[start + len("<think>"): end].strip()
+                else:
+                    stored_think = injected_think  # Fallback to original
+            except Exception:
+                stored_think = injected_think  # Fallback to original
+        else:
+            # No second pass, store the original think content
+            stored_think = injected_think
 
         # Sleep queue stub: push high-intensity events
         if abs(post.r_t) >= float(SLEEP_QUEUE_RT_THRESHOLD) or post.reward_intensity >= float(SLEEP_QUEUE_INTENSITY_THRESHOLD):
