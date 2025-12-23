@@ -681,7 +681,7 @@ class AgentRuntime:
             top_p=top_p,
             top_k=40,
             min_p=0.0,
-            repetition_penalty=1.3,  # Reduce repetition
+            repetition_penalty=1.1,  # Reduce repetition
             stopping_criteria=stopping_criteria,
         )
         new_tokens = output[0][input_len:]
@@ -710,7 +710,7 @@ class AgentRuntime:
             top_p=top_p,
             top_k=40,
             min_p=0.0,
-            repetition_penalty=1.3,
+            repetition_penalty=1.1,
             stopping_criteria=stopping_criteria,
             streamer=streamer,
         )
