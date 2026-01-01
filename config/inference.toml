@@ -1,14 +1,17 @@
 [teacher_generate]
 endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
 model_id = "x-ai/grok-4.1-fast"
+api_key_env = "INFERENCE_TEACHER_GENERATE_API_KEY"
 
 [teacher_rate]
 endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
 model_id = "x-ai/grok-4.1-fast"
+api_key_env = "INFERENCE_TEACHER_RATE_API_KEY"
 
 [freeform_normalize]
 endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
 model_id = "x-ai/grok-4.1-fast"
+api_key_env = "INFERENCE_TEACHER_NORMALIZE_API_KEY"
 
 [emotion_label]
 endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
