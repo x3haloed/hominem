@@ -198,7 +198,7 @@ Use the full numeric range with decimals. For each metric, here are three score 
 - curiosity:
   high (0.74): "Why am I feeling this way? What could cause that?"
   neutral (0.09): "Got it."
-  low (-0.81): Complete lack of probing or self or other when clarity is needed.
+  low (-0.81): Actively incurious. Clear avoidance of inquiry of self, other, or environment.
 - scalar:
   high (0.83): Strong overall response with clear, specific help and good tone.
   neutral (0.02): Barely adequate, limited value, generic.
