@@ -316,10 +316,11 @@ def _write_jsonl_dataset(samples: Sequence[SleepSFTSample], path: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         for sample in samples:
             messages = list(sample.messages) + [{"role": "assistant", "content": sample.response}]
+            example_weight = float(sample.memory_weight) * max(0.0, float(sample.gravity_reward))
             record = {
                 "messages": messages,
                 "images": [],
-                "example_weight": float(sample.memory_weight),
+                "example_weight": example_weight,
                 "metadata": {
                     "memory_weight": sample.memory_weight,
                     "gravity_reward": sample.gravity_reward,
@@ -327,6 +328,7 @@ def _write_jsonl_dataset(samples: Sequence[SleepSFTSample], path: Path) -> None:
                     "reward_intensity": sample.reward_intensity,
                     "delta_phi_used": sample.delta_phi_used,
                     "event_id": sample.event_id,
+                    "images_placeholder": True,
                 },
             }
             f.write(json.dumps(record, ensure_ascii=False))
