@@ -16,6 +16,7 @@ setup(
             "pydantic>=2.0.0",
             "mlx",
             "mlx-vlm @ git+https://github.com/x3haloed/mlx-vlm.git@weighted-loss",
+            "torchvision"
         ],
     },
 )

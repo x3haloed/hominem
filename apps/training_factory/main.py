@@ -4,6 +4,8 @@ import json
 import os
 import threading
 import uuid
+import subprocess
+import sys
 from datetime import datetime, timezone
 import gc
 import math
@@ -39,6 +41,10 @@ LABEL_MAX_LENGTH = int(os.getenv("TRAINING_FACTORY_LABEL_MAX_LENGTH", "512"))
 Q_RESP_K = float(os.getenv("Q_RESP_K", "0.6"))
 Q_RESP_TAU = float(os.getenv("Q_RESP_TAU", "0.0"))
 RELABEL_EXISTING = os.getenv("TRAINING_FACTORY_RELABEL", "false").lower() == "true"
+SLEEP_UPDATE_CONFIG = os.getenv(
+    "TRAINING_FACTORY_SLEEP_CONFIG",
+    str(BASE_DIR / "config" / "training" / "sleep_sft_update.yaml"),
+)
 
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -329,6 +335,127 @@ def _label_events_serial(events: List[Dict[str, Any]]) -> None:
     _apply_reward_labels(events, relabel=RELABEL_EXISTING)
 
 
+def _write_sleep_events_db(events: List[Dict[str, Any]], path: Path) -> None:
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path))
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sleep_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                user_message TEXT,
+                assistant TEXT,
+                history_json TEXT,
+                metrics_json TEXT,
+                reward_intensity REAL,
+                delta_phi_used REAL,
+                used INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        rows = []
+        for ev in events:
+            rows.append(
+                (
+                    ev.get("conversation_id"),
+                    ev.get("user_message"),
+                    ev.get("assistant"),
+                    json.dumps(ev.get("history") or []),
+                    json.dumps(ev.get("metrics") or {}),
+                    ev.get("reward_intensity"),
+                    ev.get("delta_phi_used"),
+                )
+            )
+        con.executemany(
+            """
+            INSERT INTO sleep_events(
+                conversation_id,
+                user_message,
+                assistant,
+                history_json,
+                metrics_json,
+                reward_intensity,
+                delta_phi_used
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _run_mlx_training(
+    *,
+    db_path: Path,
+    output_dir: Path,
+    base_model_id: Optional[str],
+    lora_config: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "core.lora_trainer.sleep_sft_update_mlx",
+        "--config",
+        str(SLEEP_UPDATE_CONFIG),
+        "--db-path",
+        str(db_path),
+        "--output-dir",
+        str(output_dir),
+        "--log-dir",
+        str(output_dir / "logs"),
+    ]
+    if base_model_id:
+        cmd.extend(["--base-model-id", str(base_model_id)])
+    if lora_config:
+        for key, flag in (
+            ("iters", "--iters"),
+            ("epochs", "--epochs"),
+            ("batch_size", "--batch-size"),
+            ("min_r_t", "--min-r-t"),
+            ("min_reward_intensity", "--min-reward-intensity"),
+            ("alpha", "--alpha"),
+            ("base_memory_weight", "--base-memory-weight"),
+            ("self_fraction_power", "--self-fraction-power"),
+            ("reward_clip", "--reward-clip"),
+            ("num_samples", "--num-samples"),
+            ("priority_w_delta_phi", "--priority-w-delta-phi"),
+            ("priority_w_intensity", "--priority-w-intensity"),
+            ("priority_w_social", "--priority-w-social"),
+            ("priority_w_self", "--priority-w-self"),
+            ("high_priority_fraction", "--high-priority-fraction"),
+        ):
+            if key in lora_config and lora_config[key] is not None:
+                cmd.extend([flag, str(lora_config[key])])
+        if lora_config.get("require_positive_r_t"):
+            cmd.append("--require-positive-r-t")
+        if lora_config.get("include_used"):
+            cmd.append("--include-used")
+        if lora_config.get("order"):
+            cmd.extend(["--order", str(lora_config["order"])])
+        if lora_config.get("limit"):
+            cmd.extend(["--limit", str(lora_config["limit"])])
+        if lora_config.get("mlx_args"):
+            cmd.append("--mlx-args")
+            cmd.extend([str(v) for v in lora_config["mlx_args"]])
+
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"sleep_sft_update_mlx failed with return code {result.returncode}")
+
+    current_path = output_dir / "current.json"
+    if current_path.exists():
+        try:
+            return json.loads(current_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
 def _write_dataset(events: List[Dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -386,34 +513,22 @@ def _run_job(job_id: str, batch_id: str, output_dir: Path, base_model_id: Option
         _label_events_serial(events)
         db.replace_events(batch_id=batch_id, events=events)
 
-        dataset_path = output_dir / "sleep_events.jsonl"
-        adapter_path = output_dir / "lora_adapter"
-        manifest_path = output_dir / "manifest.json"
-        logs_path = output_dir / "training.log"
-
-        _write_dataset(events, dataset_path)
-        adapter_path.mkdir(parents=True, exist_ok=True)
-        logs_path.parent.mkdir(parents=True, exist_ok=True)
-        logs_path.write_text("Training stub: no MLX run executed.\n", encoding="utf-8")
-        _write_manifest(
-            path=manifest_path,
-            job_id=job_id,
-            batch_id=batch_id,
+        db_path = output_dir / "sleep_events.db"
+        _write_sleep_events_db(events, db_path)
+        manifest = _run_mlx_training(
+            db_path=db_path,
+            output_dir=output_dir,
             base_model_id=base_model_id,
             lora_config=lora_config,
-            dataset_path=dataset_path,
-            adapter_path=adapter_path,
-            logs_path=logs_path,
-            event_count=len(events),
         )
 
         db.update_job(
             job_id=job_id,
             status="succeeded",
-            dataset_path=str(dataset_path),
-            adapter_path=str(adapter_path),
-            manifest_path=str(manifest_path),
-            logs_path=str(logs_path),
+            dataset_path=manifest.get("train_jsonl"),
+            adapter_path=manifest.get("adapter_path"),
+            manifest_path=manifest.get("output_dir") and str(Path(manifest.get("output_dir")) / "manifest.json"),
+            logs_path=str(output_dir / "logs"),
         )
     except Exception as exc:
         db.update_job(job_id=job_id, status="failed", error=str(exc))
