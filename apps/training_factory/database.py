@@ -105,6 +105,15 @@ class TrainingFactoryDB:
                 out.append({"raw": raw})
         return out
 
+    def replace_events(self, *, batch_id: str, events: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM sleep_events WHERE batch_id=?", (batch_id,))
+            self.conn.executemany(
+                "INSERT INTO sleep_events(batch_id, event_json) VALUES (?, ?)",
+                [(batch_id, json.dumps(ev)) for ev in events],
+            )
+            self.conn.commit()
+
     def create_job(
         self,
         *,
