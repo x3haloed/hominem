@@ -725,7 +725,7 @@ Tuning guidance: After 50–100 sleep cycles, evaluate on dilemmas (e.g., truth 
 ### 4.6 Reward Computation (ΔΦ and RewardIntensity)
 
 **ΔΦ (Potential Change) Computation:**
-- Raw ΔΦ = Φₜ - Φₜ₋₁ where Φₜ is current potential, Φₜ₋₁ is previous turn's potential
+- Raw ΔΦ = Φₜ - Φₜ₋₁ where Φₜ is the cached current potential and Φₜ₋₁ is the cached previous-turn potential
 - EMA-smoothed ΔΦ = 0.8 × EMAₜ₋₁ + 0.2 × Raw ΔΦ to dampen single-turn volatility spikes
 - Positive ΔΦ indicates progress toward anchor goals (intrinsic reward)
 - Negative ΔΦ indicates regression (intrinsic punishment)
@@ -754,6 +754,44 @@ rewarding even when the policy regresses (ΔΦ ≤ 0), which can metastasize int
 | Sleep trigger threshold    | Accumulated unreplayed RewardIntensity + high-self-fraction events | — | Primary cognitive trigger; context % as hard cap only          |
 | Replay priority weights    | \|ΔΦ\|:1.0, Intensity:1.2, social:0.4 | —                  | Intensity highest for emotional etching                         |
 
+#### 4.7.0 Decision Windows and Future-Outcome Aggregation (Sleep Data Preparation)
+
+Sleep consolidation must be **trajectory-aware**, not merely turn-local. Every assistant turn is treated as a *decision point* whose quality is defined by the downstream consequences it creates.
+
+**Decision window definition:**
+For each assistant decision at turn `t`, define an outcome window over the next `k` turns:
+
+- `decision_context_t`: the prompt/history available at decision time `t`
+- `action_t`: the assistant output (or tool-call) chosen at `t`
+- `outcome_window_t`: the next `k` turns (recommended `k ∈ [4, 8]`)
+
+**Cached state:**
+- Cache `Φ_t` at every turn (already required for ΔΦ); retain it alongside the manifold/regime outputs.
+
+**Aggregated outcome signal (new):**
+Compute `O_t` from existing per-turn labels over `outcome_window_t`:
+
+- `O_mean_dphi = mean(ΔΦ_{t+1..t+k})`
+- `O_net_phi = Φ_{t+k} − Φ_t` (or last available if window truncated)
+- `O_worst_drop = min(ΔΦ_{t+1..t+k})`  # catastrophe sensitivity
+- `O_regime_entropy = entropy(p(k) averaged over window)`
+- `O_self_frac_var = var(mean_self_fraction_{t+1..t+k})`
+- `O_boundary_var = var(boundary/self-locus signals over window)`
+- `O_intensity_sum = sum(RewardIntensity_{t+1..t+k})`
+- `O_corrections = count(user corrections / explicit dissatisfaction / loop flags in window)`
+
+**Outcome scalarization (for weighting/ranking):**
+Define a bounded scalar `g(O_t) ∈ [-1, 1]` used by sleep selection. One robust default:
+
+- Reward smooth, improving futures: `+O_net_phi`, `+O_mean_dphi`
+- Penalize catastrophes and turbulence: `−|O_worst_drop|`, `−O_regime_entropy`, `−O_corrections`, `−O_self_frac_var`
+
+Example:
+
+- `g(O_t) = tanh( a*O_net_phi + b*O_mean_dphi − c*abs(O_worst_drop) − d*O_regime_entropy − e*O_corrections − f*O_self_frac_var )`
+
+This makes **future quality** the primary consolidation signal, instead of turn-local aesthetics.
+
 #### 4.7.1 Action Adequacy (Anti-Triviality) via Reward Manifold
 
 Sleep consolidation must not treat "non-actions" (e.g., 1–2 token label-stubs) as successful policy updates.
@@ -778,26 +816,38 @@ Use `q_resp` as a *consolidation gate/weight*:
 This makes trivial completions self-suppressing because they score poorly on reward-manifold adequacy dimensions,
 without requiring any hard-coded string bans.
 
-#### 4.7.2 Counterfactual Replay (Sleep-Time Preferences)
+#### 4.7.2 Counterfactual Replay (Sleep-Time Preferences, Trajectory-Aware)
 
-The preferred long-term consolidation mechanism is counterfactual replay:
-for the same prompt/context, generate multiple candidate responses and learn from their relative quality.
+The preferred consolidation mechanism is counterfactual replay **scored by future outcomes**, not only immediate turn metrics.
 
 Per sleep event:
-1. Reconstruct the prompt context `H` (history + continuity header).
-2. Sample `K` candidates `{y₁..y_K}` from the current policy (LoRA) with mild stochasticity.
-3. For each candidate `yᵢ`, compute:
-   - runtime progress: `ΔΦ_used(H, yᵢ)` and `RewardIntensity(H, yᵢ)`
-   - intrinsic reward: `r_tᵢ = ΔΦ_used(H, yᵢ) × (1 + α × RewardIntensity(H, yᵢ))`
-   - adequacy: `q_respᵢ = q_resp(prompt, yᵢ)` from the reward model
-   - final candidate score: `Sᵢ = q_respᵢ × r_tᵢ` (optionally also include safety gating)
+
+1. Reconstruct the decision context `H_t` (history + continuity header) at a sampled decision turn `t`.
+2. Sample `K` candidate actions `{y₁..y_K}` from the current policy (LoRA) with mild stochasticity.
+3. For each candidate `yᵢ`:
+   - Execute `yᵢ` in the environment loop for up to `k` downstream turns using the same tool/user simulation harness used during live operation (or a lightweight replay harness if tools are unavailable).
+   - Run frozen heads each step to compute per-turn labels: manifold, regime, anchors, `Φ`, `ΔΦ`, `RewardIntensity`, self-fractions, and any loop/correction flags.
+   - Compute immediate adequacy: `q_respᵢ = q_resp(H_t, yᵢ)`
+   - Compute aggregated future outcome: `Oᵢ = aggregate_outcome(window_{t+1..t+k})` and scalarize: `Gᵢ = g(Oᵢ)`
+   - Compute final candidate score:
+
+     `Sᵢ = gate(q_respᵢ) × gate(safetyᵢ) × (1 + α × RewardIntensity_tᵢ) × Gᵢ`
+
+     Notes:
+     - `Gᵢ` is the primary driver; it encodes the *quality of the resulting future*.
+     - `RewardIntensity` remains an *etching gain*, not a standalone reward.
+     - `gate(·)` clamps to [0,1] and suppresses trivial/unsafe outputs.
+
 4. Choose:
    - `y_chosen = argmax Sᵢ`
    - `y_rejected = argmin Sᵢ` (or lowest among safe candidates)
-5. Train a preference loss (e.g., DPO-style) to increase preference for `y_chosen` over `y_rejected`.
+5. Train a preference loss (e.g., DPO-style) to increase preference for `y_chosen` over `y_rejected` **given the same decision context**.
 
-This directly teaches "do not pick the trivial stub" when richer responses produce higher `Sᵢ`, instead of relying
-on indirect weighting heuristics.
+This teaches: *from this state, choose the action that leads to the best downstream trajectory*, not merely the best-sounding single turn.
+
+**Efficiency options (recommended):**
+- Prefer **natural contrastive pairs** from the replay buffer when available: find near-duplicate `H_t` contexts (light embedding clustering / paraphrase bucketing) whose logged continuations diverged, then form (good ≻ bad) pairs using `g(O_t)`.
+- Use counterfactual rollouts only when the buffer lacks sufficient contrastive diversity.
 
 #### 4.7.3 Updated Dual-Loss Consolidation Objective
 
@@ -808,8 +858,9 @@ During sleep, LoRA updates minimize:
 Where:
 - `L_sft` is standard next-token loss on the chosen completion only (prompt tokens masked)
 - `L_pref` is a preference loss (DPO-style or pairwise ranking) using the same prompt context
-- `W` is an example weight, e.g.:
-  - `W = clamp(q_resp_chosen, 0, 1) × clamp(mean_self_fraction, 0, 1)^p × clamp(r_t_chosen, 0, r_max)`
+- `W` is an example weight derived from **future outcome quality**, e.g.:
+  - `W = clamp(q_resp_chosen, 0, 1) × clamp(mean_self_fraction_t, 0, 1)^p × clamp(max(0, G_chosen), 0, 1)`
+  - Optionally include catastrophe sensitivity: downweight if `O_worst_drop` is below a threshold.
 
 Key invariants:
 - Intensity increases learning *only through the multiplicative gain in r_t* and/or via weights, never as an additive reward.
