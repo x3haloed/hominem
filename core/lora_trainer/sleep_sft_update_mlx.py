@@ -379,9 +379,9 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
         "--mlx-args",
-        nargs="*",
+        nargs=argparse.REMAINDER,
         default=None,
-        help="Extra args passed to mlx_vlm.lora (space-separated).",
+        help="Extra args passed to mlx_vlm.lora (prefix with --mlx-args).",
     )
 
     parser.add_argument("--num-samples", type=int, default=0, help="0 = use all usable sleep events.")
@@ -491,9 +491,32 @@ def main(argv: List[str] | None = None) -> None:
         conversation_id=str(args.conversation_id) if args.conversation_id else None,
         order=str(args.order),
     )
+    invalid_events: List[Dict[str, Any]] = []
+    clamp_history_turns = int(data_cfg.get("clamp_history_turns", 6))
+    for ev in events:
+        history = ev.get("history_json")
+        messages = _coerce_messages(history, clamp_history_turns=clamp_history_turns)
+        response = str(ev.get("assistant") or "").strip()
+        if not messages or not response:
+            invalid_events.append(
+                {
+                    "event_id": ev.get("id"),
+                    "conversation_id": ev.get("conversation_id"),
+                    "has_messages": bool(messages),
+                    "has_response": bool(response),
+                    "history_len": len(messages) if messages else 0,
+                }
+            )
+    if invalid_events:
+        invalid_path = run_dir / "invalid_events.jsonl"
+        with invalid_path.open("w", encoding="utf-8") as f:
+            for row in invalid_events:
+                f.write(json.dumps(row, ensure_ascii=False))
+                f.write("\n")
+        print(f"⚠️  Found {len(invalid_events)} invalid events. See {invalid_path}")
     raw_samples = build_sleep_sft_samples(
         events,
-        clamp_history_turns=int(data_cfg.get("clamp_history_turns", 6)),
+        clamp_history_turns=clamp_history_turns,
         require_positive_r_t=require_positive_r_t,
         min_r_t=float(args.min_r_t or 0.0),
         min_reward_intensity=float(args.min_reward_intensity or 0.0),

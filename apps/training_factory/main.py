@@ -353,6 +353,8 @@ def _write_sleep_events_db(events: List[Dict[str, Any]], path: Path) -> None:
                 reward_intensity REAL,
                 delta_phi_used REAL,
                 used INTEGER DEFAULT 0,
+                used_at DATETIME,
+                used_in_run TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -443,7 +445,11 @@ def _run_mlx_training(
             cmd.append("--mlx-args")
             cmd.extend([str(v) for v in lora_config["mlx_args"]])
 
-    result = subprocess.run(cmd, check=False)
+    env = os.environ.copy()
+    local_mlx = str(BASE_DIR / "third_party" / "mlx_vlm")
+    env["PYTHONPATH"] = f"{local_mlx}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    result = subprocess.run(cmd, check=False, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"sleep_sft_update_mlx failed with return code {result.returncode}")
 
@@ -513,8 +519,38 @@ def _run_job(job_id: str, batch_id: str, output_dir: Path, base_model_id: Option
         _label_events_serial(events)
         db.replace_events(batch_id=batch_id, events=events)
 
+        valid_events: List[Dict[str, Any]] = []
+        invalid_events: List[Dict[str, Any]] = []
+        for idx, ev in enumerate(events):
+            history = ev.get("history") or []
+            has_history = isinstance(history, list) and any(
+                isinstance(m, dict) and str(m.get("content") or "").strip() for m in history
+            )
+            has_user = bool(str(ev.get("user_message") or "").strip())
+            has_assistant = bool(str(ev.get("assistant") or "").strip())
+            if has_assistant and (has_user or has_history):
+                valid_events.append(ev)
+            else:
+                invalid_events.append(
+                    {
+                        "index": idx,
+                        "conversation_id": ev.get("conversation_id"),
+                        "has_history": has_history,
+                        "has_user_message": has_user,
+                        "has_assistant": has_assistant,
+                    }
+                )
+        if invalid_events:
+            invalid_path = output_dir / "invalid_events.jsonl"
+            invalid_path.parent.mkdir(parents=True, exist_ok=True)
+            with invalid_path.open("w", encoding="utf-8") as f:
+                for row in invalid_events:
+                    f.write(json.dumps(row, ensure_ascii=False))
+                    f.write("\n")
+            print(f"⚠️  Skipped {len(invalid_events)} invalid events; details in {invalid_path}")
+
         db_path = output_dir / "sleep_events.db"
-        _write_sleep_events_db(events, db_path)
+        _write_sleep_events_db(valid_events, db_path)
         manifest = _run_mlx_training(
             db_path=db_path,
             output_dir=output_dir,
