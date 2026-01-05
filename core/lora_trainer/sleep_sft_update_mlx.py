@@ -31,6 +31,15 @@ import yaml
 
 from core.training_logger import TrainingJSONLogger
 
+HOMINEM_TRAINER_CLASS = "core.lora_trainer.hominem_trainer:HominemTrainer"
+HOMINEM_DATASET_CLASS = "core.lora_trainer.hominem_trainer:HominemDataset"
+
+
+def _inject_default_arg(args: List[str], flag: str, value: str) -> List[str]:
+    if flag in args:
+        return args
+    return args + [flag, value]
+
 
 def _default_db_path() -> str:
     return os.getenv(
@@ -439,8 +448,11 @@ def _build_mlx_command(
         "--output-path",
         str(adapter_path),
     ]
-    if extra_args:
-        cmd.extend(list(extra_args))
+    extra = list(extra_args) if extra_args else []
+    extra = _inject_default_arg(extra, "--trainer-class", HOMINEM_TRAINER_CLASS)
+    extra = _inject_default_arg(extra, "--dataset-class", HOMINEM_DATASET_CLASS)
+    if extra:
+        cmd.extend(extra)
     return cmd
 
 
