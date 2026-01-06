@@ -11,7 +11,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        help="Training command (manifold, regime)",
+        help="Training command (manifold, regime, reward)",
     )
     parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser
@@ -32,13 +32,19 @@ def main() -> None:
 
         regime_main(ns.args)
         return
+    if command == "reward":
+        from hominem_train.reward_train import main as reward_main
+
+        reward_main(ns.args)
+        return
 
     raise SystemExit(
         "Usage: python -m hominem_train <command> [args]\n"
-        "Commands: manifold, regime\n"
+        "Commands: manifold, regime, reward\n"
         "Examples:\n"
         "  python -m hominem_train manifold --dataset-path data/manifold.jsonl\n"
         "  python -m hominem_train regime --dataset-path data/regime.jsonl\n"
+        "  python -m hominem_train reward --dataset-path data/reward.jsonl\n"
     )
 
 
