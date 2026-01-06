@@ -113,6 +113,7 @@ Event-driven wrapper
  
 ## Qwen-Agent Integration (Tool Loop)
 - Qwen-Agent talks to hominem-infer via OpenAI-compatible `/v1/chat/completions` and/or `/v1/responses`.
+- Consider possibly swapping out for [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)
 - Tool calling lives inside the Qwen-Agent process (MetaboliqAgent loop), not in infer.
 - Tool invocations/results should emit events for replay/audit:
   - ToolInvocationRequested (tool name, args, parent turn)
