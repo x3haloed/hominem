@@ -18,9 +18,10 @@ Top level
 - docs/ : architecture and operations
 
 apps/
-- apps/hominem-infer/ (Python): OpenAI-style API, event emission only, minimal state.
+- apps/hominem-infer/ (Python): OpenAI-style inference only (MLX-VLM backend), no tools.
+- apps/hominem-agent/ (Python, Qwen-Agent): owns planning + tool calling loop, emits tool events.
 - apps/hominem-core/ (Rust): log writer/reader, rotation, indexing, scheduling.
-- apps/hominem-tools/ (Rust or Python): tool execution sandbox, result events.
+- apps/hominem-tools/ (Rust or Python): optional tool execution sandbox if not using Qwen-Agent tools directly.
 - apps/hominem-ui/ (optional): UI/CLI client.
 
 crates/
@@ -45,7 +46,7 @@ configs/
 - infer.toml, core.toml, tools.toml, *.yaml.
 
 ## Training System Design (Log-First)
-- All training signals are written as events (TurnEvent, SleepEvent, LabelEvent/DerivedTarget).
+- All training signals are written as events (TurnEvent, ToolInvocationRequested/Result, SleepEvent, LabelEvent/DerivedTarget).
 - Derived SQLite/DuckDB indexes enable fast dataset queries; they are rebuildable.
 - Training runs are separate processes that only read from the log/index and emit events.
 - Model artifacts are content-addressed and recorded with config and dataset hashes.
@@ -98,7 +99,8 @@ Event-driven wrapper
 - The wrapper is optional; the CLI must be sufficient by itself.
 
 ## Migration Notes (Current Codebase to Target)
-- apps/serve/ becomes apps/hominem-infer/ (inference + event emission only).
+- apps/serve/ becomes apps/hominem-infer/ (OpenAI-compatible inference only).
+- Qwen-Agent (metaboliq fork) becomes apps/hominem-agent/ (planning + tool calling).
 - apps/training_factory/ becomes a training binary or python/hominem_train/ (no canonical storage).
 - database.py becomes a derived index or is replaced by log consumers.
 - training_logger.py JSONL legacy mode is removed or updated to log format.
@@ -108,3 +110,11 @@ Event-driven wrapper
 - Map current write sites to event types and owners.
 - Decide whether SQLite tables become first derived index implementation.
 - Sketch a phased refactor plan for training modules (manifold, reward, regime).
+ 
+## Qwen-Agent Integration (Tool Loop)
+- Qwen-Agent talks to hominem-infer via OpenAI-compatible `/v1/chat/completions` and/or `/v1/responses`.
+- Tool calling lives inside the Qwen-Agent process (MetaboliqAgent loop), not in infer.
+- Tool invocations/results should emit events for replay/audit:
+  - ToolInvocationRequested (tool name, args, parent turn)
+  - ToolInvocationResult (tool name, result, status, timing)
+- hominem-infer remains stateless and does not execute tools.
