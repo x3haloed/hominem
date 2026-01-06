@@ -1,4 +1,4 @@
-"""CLI entry point for manifold model training."""
+"""CLI entry point for regime classifier training."""
 
 from __future__ import annotations
 
@@ -19,27 +19,20 @@ from hominem_train.trainer_utils import (
 )
 
 
-DEFAULT_MANIFOLD_MODEL_ID = "bert-base-uncased"
+DEFAULT_REGIME_MODEL_ID = "bert-base-uncased"
 
-MANIFOLD_KEYS = [
-    "valence",
-    "arousal",
-    "dominance",
-    "predictive_discrepancy",
-    "temporal_directionality",
-    "social_broadcast",
+REGIME_KEYS = [
+    "regime_support",
+    "regime_conflict",
+    "regime_problem_solving",
+    "regime_truth_seeking",
+    "regime_crisis",
+    "regime_play",
+    "regime_boundary",
 ]
-LABEL_BOUNDS = {
-    "valence": (-1.0, 1.0),
-    "arousal": (0.0, 1.0),
-    "dominance": (-1.0, 1.0),
-    "predictive_discrepancy": (-1.0, 1.0),
-    "temporal_directionality": (-1.0, 1.0),
-    "social_broadcast": (0.0, 1.0),
-}
+LABEL_BOUNDS = {key: (0.0, 1.0) for key in REGIME_KEYS}
 
-
-def _train_manifold(
+def _train_regime(
     *,
     dataset: List[Dict[str, Any]],
     run_config: TrainingRunConfig,
@@ -68,7 +61,7 @@ def _train_manifold(
         "TrainingRunStarted",
         {
             "run_id": run_id,
-            "model_type": "manifold",
+            "model_type": "regime",
             "dataset_id": dataset_spec.dataset_id,
             "dataset_path": str(dataset_spec.dataset_path) if dataset_spec.dataset_path else None,
             "row_count": len(dataset),
@@ -77,12 +70,12 @@ def _train_manifold(
 
     texts, labels = build_text_label_dataset(
         dataset,
-        label_keys=MANIFOLD_KEYS,
+        label_keys=REGIME_KEYS,
         label_bounds=LABEL_BOUNDS,
         max_history_turns=args.max_history_turns,
         record_limit=args.record_limit,
         min_records=args.min_records,
-        empty_message_error="No usable records with manifold labels.",
+        empty_message_error="No usable records with regime labels.",
     )
     hf_dataset = Dataset.from_dict({"text": texts, "labels": labels})
 
@@ -92,7 +85,7 @@ def _train_manifold(
 
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_id,
-        num_labels=len(MANIFOLD_KEYS),
+        num_labels=len(REGIME_KEYS),
         problem_type="regression",
         trust_remote_code=True,
     )
@@ -155,7 +148,7 @@ def _train_manifold(
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[MetricsCallback(events=events, run_id=run_id, model_type="manifold")],
+        callbacks=[MetricsCallback(events=events, run_id=run_id, model_type="regime")],
     )
 
     trainer.train()
@@ -166,13 +159,13 @@ def _train_manifold(
         "TrainingRunCompleted",
         {
             "run_id": run_id,
-            "model_type": "manifold",
+            "model_type": "regime",
             "status": "success",
         },
     )
     manifest_path = write_manifest(
         output_dir,
-        model_type="manifold",
+        model_type="regime",
         dataset_spec=dataset_spec,
         row_count=len(texts),
         config=run_config.config,
@@ -194,14 +187,14 @@ def _train_manifold(
         "ModelArtifactProduced",
         {
             "run_id": run_id,
-            "model_type": "manifold",
+            "model_type": "regime",
             "manifest_path": str(manifest_path),
         },
     )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train manifold classifier.")
+    parser = argparse.ArgumentParser(description="Train regime classifier.")
     parser.add_argument("--dataset-id", type=str, default=None, help="Dataset ID from the index/log.")
     parser.add_argument("--dataset-path", type=Path, default=None, help="Path to JSONL dataset.")
     parser.add_argument("--query-json", type=str, default=None, help="Inline dataset query JSON.")
@@ -237,8 +230,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model-id",
-        default=DEFAULT_MANIFOLD_MODEL_ID,
-        help="Base model ID for regression head",
+        default=DEFAULT_REGIME_MODEL_ID,
+        help="Base model ID for regime classification head",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
@@ -247,7 +240,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of steps to accumulate gradients",
     )
-    parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--num-epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-history-turns", type=int, default=3)
@@ -282,9 +275,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             dataset_index_path=spec.dataset_index_path,
         )
     dataset = load_dataset(spec)
-    run_config = build_run_config(args, run_prefix="manifold")
+    run_config = build_run_config(args, run_prefix="regime")
     events = EventWriter(enabled=run_config.emit_events, log_path=run_config.event_log_path)
-    _train_manifold(
+    _train_regime(
         dataset=dataset,
         run_config=run_config,
         events=events,

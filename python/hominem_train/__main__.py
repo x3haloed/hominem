@@ -1,9 +1,44 @@
 """Entry point for hominem_train."""
 
+from __future__ import annotations
+
+import argparse
+import sys
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="hominem_train entry point")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        help="Training command (manifold, regime)",
+    )
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    return parser
+
+
 def main() -> None:
+    parser = _build_parser()
+    ns = parser.parse_args()
+
+    command = (ns.command or "").strip().lower()
+    if command == "manifold":
+        from hominem_train.manifold_train import main as manifold_main
+
+        manifold_main(ns.args)
+        return
+    if command == "regime":
+        from hominem_train.regime_train import main as regime_main
+
+        regime_main(ns.args)
+        return
+
     raise SystemExit(
-        "hominem_train is a package. "
-        "Invoke a specific module, e.g. `python -m hominem_train.manifold_train`."
+        "Usage: python -m hominem_train <command> [args]\n"
+        "Commands: manifold, regime\n"
+        "Examples:\n"
+        "  python -m hominem_train manifold --dataset-path data/manifold.jsonl\n"
+        "  python -m hominem_train regime --dataset-path data/regime.jsonl\n"
     )
 
 
