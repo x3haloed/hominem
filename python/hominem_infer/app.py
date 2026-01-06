@@ -42,6 +42,18 @@ class ChatCompletionRequest(BaseModel):
     resize_shape: Optional[List[int]] = None
 
 
+class ResponsesRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    input: Any
+    model: str = DEFAULT_MODEL_ID
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    stream: bool | None = False
+    adapter_path: Optional[str] = None
+    resize_shape: Optional[List[int]] = None
+
+
 class ModelList(BaseModel):
     object: str = "list"
     data: List[Dict[str, Any]]
@@ -187,6 +199,20 @@ def _extract_media(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[str]
     return images, audio
 
 
+def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, Any]]:
+    raw = payload.input
+    if isinstance(raw, str):
+        return [{"role": "user", "content": raw}]
+    if isinstance(raw, list):
+        messages: List[Dict[str, Any]] = []
+        for item in raw:
+            if isinstance(item, dict) and "role" in item:
+                messages.append(item)
+        if messages:
+            return messages
+    raise HTTPException(status_code=400, detail="Unsupported responses input format.")
+
+
 @app.get("/v1/models")
 def list_models() -> ModelList:
     return ModelList(data=[{"id": DEFAULT_MODEL_ID, "object": "model"}])
@@ -322,3 +348,198 @@ def chat_completions(payload: ChatCompletionRequest):
         },
     )
     return JSONResponse(_make_response(model_id, content))
+
+
+@app.post("/v1/responses")
+def responses(payload: ResponsesRequest):
+    if BACKEND == "stub":
+        messages = _responses_input_to_messages(payload)
+        content = _stub_completion(messages)
+        created_at = int(time.time())
+        response_id = f"resp_{uuid.uuid4().hex}"
+        message_id = f"msg_{uuid.uuid4().hex}"
+        response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "completed",
+            "instructions": None,
+            "max_output_tokens": payload.max_output_tokens,
+            "model": payload.model or DEFAULT_MODEL_ID,
+            "output": [
+                {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content, "annotations": []}],
+                }
+            ],
+            "output_text": content,
+            "temperature": payload.temperature,
+            "top_p": payload.top_p,
+            "usage": _usage_stub(),
+        }
+        return JSONResponse(response)
+
+    if BACKEND != "mlx_vlm":
+        raise HTTPException(status_code=501, detail=f"Unknown backend: {BACKEND}")
+
+    model_id = payload.model or DEFAULT_MODEL_ID
+    model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
+    messages = _responses_input_to_messages(payload)
+    images, audio = _extract_media(messages)
+
+    try:
+        from mlx_vlm.generate import generate, stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail=f"mlx_vlm not installed: {exc}") from exc
+
+    kwargs: Dict[str, Any] = {}
+    if payload.resize_shape:
+        if len(payload.resize_shape) not in (1, 2):
+            raise HTTPException(status_code=400, detail="resize_shape must have 1 or 2 integers")
+        if len(payload.resize_shape) == 1:
+            kwargs["resize_shape"] = (payload.resize_shape[0], payload.resize_shape[0])
+        else:
+            kwargs["resize_shape"] = (payload.resize_shape[0], payload.resize_shape[1])
+
+    prompt = apply_chat_template(
+        processor,
+        config,
+        messages,
+        num_images=len(images),
+        num_audios=len(audio),
+    )
+    max_tokens = payload.max_output_tokens
+    temperature = payload.temperature if payload.temperature is not None else 0.2
+    top_p = payload.top_p if payload.top_p is not None else 1.0
+
+    if payload.stream:
+        def stream_generator():
+            response_id = f"resp_{uuid.uuid4().hex}"
+            message_id = f"msg_{uuid.uuid4().hex}"
+            created_at = int(time.time())
+            base_response = {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "in_progress",
+                "instructions": None,
+                "max_output_tokens": payload.max_output_tokens,
+                "model": model_id,
+                "output": [],
+                "output_text": "",
+                "temperature": temperature,
+                "top_p": top_p,
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            }
+            yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': base_response})}\n\n"
+            yield f"event: response.in_progress\ndata: {json.dumps({'type': 'response.in_progress', 'response': base_response})}\n\n"
+            message_item = {
+                "id": message_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            }
+            yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': message_item})}\n\n"
+            content_part = {"type": "output_text", "text": "", "annotations": []}
+            yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': content_part})}\n\n"
+
+            usage_stats = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            full_text = ""
+            try:
+                for chunk in stream_generate(
+                    model=model,
+                    processor=processor,
+                    prompt=prompt,
+                    image=images or None,
+                    audio=audio or None,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    **kwargs,
+                ):
+                    if not chunk or not hasattr(chunk, "text"):
+                        continue
+                    delta = chunk.text
+                    full_text += delta
+                    usage_stats = {
+                        "input_tokens": getattr(chunk, "prompt_tokens", 0),
+                        "output_tokens": getattr(chunk, "generation_tokens", 0),
+                        "total_tokens": getattr(chunk, "prompt_tokens", 0)
+                        + getattr(chunk, "generation_tokens", 0),
+                    }
+                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
+                yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': full_text})}\n\n"
+                final_content_part = {"type": "output_text", "text": full_text, "annotations": []}
+                yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_content_part})}\n\n"
+                final_message_item = {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [final_content_part],
+                }
+                yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': final_message_item})}\n\n"
+                completed = dict(base_response)
+                completed.update(
+                    {
+                        "status": "completed",
+                        "output": [final_message_item],
+                        "output_text": full_text,
+                        "usage": usage_stats,
+                    }
+                )
+                yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed})}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                gc.collect()
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    gen_result = generate(
+        model=model,
+        processor=processor,
+        prompt=prompt,
+        image=images or None,
+        audio=audio or None,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        verbose=False,
+        **kwargs,
+    )
+    gc.collect()
+    content = gen_result.text
+    response_id = f"resp_{uuid.uuid4().hex}"
+    message_id = f"msg_{uuid.uuid4().hex}"
+    response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "instructions": None,
+        "max_output_tokens": payload.max_output_tokens,
+        "model": model_id,
+        "output": [
+            {
+                "id": message_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content, "annotations": []}],
+            }
+        ],
+        "output_text": content,
+        "temperature": temperature,
+        "top_p": top_p,
+        "usage": {
+            "input_tokens": getattr(gen_result, "prompt_tokens", 0),
+            "output_tokens": getattr(gen_result, "generation_tokens", 0),
+            "total_tokens": getattr(gen_result, "total_tokens", 0),
+        },
+    }
+    return JSONResponse(response)
