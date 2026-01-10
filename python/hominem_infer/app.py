@@ -5,8 +5,10 @@ from __future__ import annotations
 import gc
 import json
 import os
+import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -21,6 +23,7 @@ DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "mlx-community/Qwen2-VL-2B-Instru
 EVENT_LOG_PATH = os.getenv("INFER_EVENT_LOG")
 EVENTS_ENABLED = os.getenv("INFER_EVENT_LOG", "").strip() != ""
 BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")
+ALLOW_REMOTE_MEDIA = os.getenv("INFER_ALLOW_REMOTE_MEDIA", "false").strip().lower() == "true"
 
 _MODEL_CACHE: Dict[str, Any] = {}
 
@@ -213,6 +216,111 @@ def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, An
     raise HTTPException(status_code=400, detail="Unsupported responses input format.")
 
 
+@dataclass(frozen=True)
+class _VideoSpec:
+    ele: Dict[str, Any]
+    is_file_like: bool
+
+
+def _normalize_video_elements(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[_VideoSpec]]:
+    """
+    Convert OpenAI-style video elements into the MLX-VLM expected schema:
+      - {"type":"video_url","video_url":{"url":...}} -> {"type":"video","video": "..."}
+    Returns a deep-ish copy of messages (only content lists are copied) plus detected videos.
+    """
+    out_messages: List[Dict[str, Any]] = []
+    videos: List[_VideoSpec] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out_messages.append(msg)
+            continue
+        new_content: List[Any] = []
+        for item in content:
+            if not isinstance(item, dict):
+                new_content.append(item)
+                continue
+            item_type = (item.get("type") or "").strip()
+            if item_type in ("video_url", "input_video"):
+                video_url = item.get("video_url") or {}
+                url = video_url.get("url") if isinstance(video_url, dict) else None
+                if url:
+                    ele = dict(item)
+                    ele.pop("video_url", None)
+                    ele["type"] = "video"
+                    ele["video"] = str(url)
+                    new_content.append(ele)
+                    videos.append(_VideoSpec(ele=ele, is_file_like=True))
+                    continue
+            if item_type == "video":
+                ele = dict(item)
+                new_content.append(ele)
+                # "video" may be a file path/URI or a list of frames.
+                videos.append(_VideoSpec(ele=ele, is_file_like=isinstance(ele.get("video"), str)))
+                continue
+            new_content.append(item)
+        new_msg = dict(msg)
+        new_msg["content"] = new_content
+        out_messages.append(new_msg)
+    return out_messages, videos
+
+
+def _materialize_video_path(path_or_url: str) -> str:
+    """
+    Ensure OpenCV can read the video (local path/file://, or optionally http(s)/data url).
+    Returns a local filesystem path.
+    """
+    raw = str(path_or_url or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty video URL/path.")
+    if raw.startswith("file://"):
+        return raw[7:]
+    if raw.startswith("data:video"):
+        if "base64," not in raw:
+            raise HTTPException(status_code=400, detail="data:video URL must be base64-encoded.")
+        header, b64 = raw.split("base64,", 1)
+        suffix = ".mp4"
+        if ";" in header:
+            mime = header.split(";", 1)[0].removeprefix("data:")
+            if mime.endswith("/webm"):
+                suffix = ".webm"
+            elif mime.endswith("/mp4"):
+                suffix = ".mp4"
+        try:
+            import base64
+
+            data = base64.b64decode(b64, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 video data: {exc}") from exc
+        fd, tmp_path = tempfile.mkstemp(prefix="hominem_video_", suffix=suffix)
+        os.close(fd)
+        Path(tmp_path).write_bytes(data)
+        return tmp_path
+    if raw.startswith("http://") or raw.startswith("https://"):
+        if not ALLOW_REMOTE_MEDIA:
+            raise HTTPException(
+                status_code=400,
+                detail="Remote video URLs are disabled (set INFER_ALLOW_REMOTE_MEDIA=true to enable).",
+            )
+        try:
+            import requests
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail=f"requests not installed: {exc}") from exc
+        fd, tmp_path = tempfile.mkstemp(prefix="hominem_video_", suffix=".mp4")
+        os.close(fd)
+        with requests.get(raw, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return tmp_path
+    return raw
+
+
 @app.get("/v1/models")
 def list_models() -> ModelList:
     return ModelList(data=[{"id": DEFAULT_MODEL_ID, "object": "model"}])
@@ -243,7 +351,8 @@ def chat_completions(payload: ChatCompletionRequest):
 
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
-    images, audio = _extract_media(payload.messages)
+    normalized_messages, video_specs = _normalize_video_elements(payload.messages)
+    images, audio = _extract_media(normalized_messages)
 
     try:
         from mlx_vlm.generate import generate, stream_generate
@@ -260,13 +369,67 @@ def chat_completions(payload: ChatCompletionRequest):
         else:
             kwargs["resize_shape"] = (payload.resize_shape[0], payload.resize_shape[1])
 
-    prompt = apply_chat_template(
-        processor,
-        config,
-        payload.messages,
-        num_images=len(images),
-        num_audios=len(audio),
-    )
+    # Video support: route through mlx_vlm.video_generate so we produce pixel_values_videos + grid_thw.
+    if video_specs:
+        try:
+            import mlx.core as mx
+            from mlx_vlm.video_generate import process_vision_info
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail=f"mlx_vlm video dependencies missing: {exc}") from exc
+
+        # Materialize file-based videos so OpenCV can read them.
+        # (Frame-list videos are handled inside mlx_vlm.video_generate.fetch_video.)
+        for spec in video_specs:
+            if not spec.is_file_like:
+                continue
+            try:
+                spec.ele["video"] = _materialize_video_path(str(spec.ele.get("video") or ""))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid video input: {exc}") from exc
+
+        try:
+            prompt = processor.apply_chat_template(
+                normalized_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processor does not support video chat_template: {exc}",
+            ) from exc
+
+        image_inputs, video_inputs, _video_kwargs = process_vision_info(normalized_messages, True)
+        inputs = processor(
+            text=[prompt],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        input_ids = mx.array(inputs["input_ids"])
+        pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
+        if pixel_values is None:
+            raise HTTPException(status_code=400, detail="Video input produced no pixel values.")
+        pixel_values = mx.array(pixel_values)
+        mask = mx.array(inputs["attention_mask"])
+        kwargs["input_ids"] = input_ids
+        kwargs["pixel_values"] = pixel_values
+        kwargs["mask"] = mask
+        if inputs.get("video_grid_thw") is not None:
+            kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
+        if inputs.get("image_grid_thw") is not None:
+            kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+    else:
+        prompt = apply_chat_template(
+            processor,
+            config,
+            normalized_messages,
+            num_images=len(images),
+            num_audios=len(audio),
+        )
 
     max_tokens = payload.max_tokens or payload.max_completion_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
@@ -317,7 +480,7 @@ def chat_completions(payload: ChatCompletionRequest):
             "TurnEvent",
             {
                 "model": model_id,
-                "messages": payload.messages,
+                "messages": normalized_messages,
                 "assistant": {"role": "assistant", "content": "<stream>"},
                 "stream": True,
             },
@@ -342,7 +505,7 @@ def chat_completions(payload: ChatCompletionRequest):
         "TurnEvent",
         {
             "model": model_id,
-            "messages": payload.messages,
+            "messages": normalized_messages,
             "assistant": {"role": "assistant", "content": content},
             "stream": bool(payload.stream),
         },
