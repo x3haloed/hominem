@@ -277,7 +277,6 @@ def chat_completions(payload: ChatCompletionRequest):
 
     try:
         from mlx_vlm.generate import generate, stream_generate
-        from mlx_vlm.prompt_utils import apply_chat_template
     except ImportError as exc:
         raise HTTPException(status_code=500, detail=f"mlx_vlm not installed: {exc}") from exc
 
@@ -362,12 +361,10 @@ def chat_completions(payload: ChatCompletionRequest):
         if payload.tool_choice is not None:
             chat_template_kwargs["tool_choice"] = payload.tool_choice
         try:
-            prompt = apply_chat_template(
-                processor,
-                config,
+            prompt = processor.apply_chat_template(
                 normalized_messages,
-                num_images=len(images),
-                num_audios=len(audio),
+                tokenize=False,
+                add_generation_prompt=True,
                 **chat_template_kwargs,
             )
         except TypeError as exc:
@@ -376,7 +373,10 @@ def chat_completions(payload: ChatCompletionRequest):
                     status_code=400,
                     detail=f"Model chat_template does not support tools: {exc}",
                 ) from exc
-            raise
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processor chat_template failure: {exc}",
+            ) from exc
 
     max_tokens = payload.max_tokens or payload.max_completion_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
@@ -617,7 +617,6 @@ def responses(payload: ResponsesRequest):
 
     try:
         from mlx_vlm.generate import generate, stream_generate
-        from mlx_vlm.prompt_utils import apply_chat_template
     except ImportError as exc:
         raise HTTPException(status_code=500, detail=f"mlx_vlm not installed: {exc}") from exc
 
@@ -691,12 +690,10 @@ def responses(payload: ResponsesRequest):
         audio = []
     else:
         try:
-            prompt = apply_chat_template(
-                processor,
-                config,
+            prompt = processor.apply_chat_template(
                 normalized_messages,
-                num_images=len(images),
-                num_audios=len(audio),
+                tokenize=False,
+                add_generation_prompt=True,
                 **chat_template_kwargs,
             )
         except TypeError as exc:
@@ -705,7 +702,7 @@ def responses(payload: ResponsesRequest):
                     status_code=400,
                     detail=f"Model chat_template does not support tools: {exc}",
                 ) from exc
-            raise
+            raise HTTPException(status_code=500, detail=f"Processor chat_template failure: {exc}") from exc
     max_tokens = payload.max_output_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
     top_p = payload.top_p if payload.top_p is not None else 1.0
