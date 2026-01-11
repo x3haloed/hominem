@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
-import { agentChat, getDefaultAgentBaseUrl, type AgentMessage } from '@/api/agent'
+import { agentChatStream, getDefaultAgentBaseUrl, type AgentMessage } from '@/api/agent'
 
 const LS_AGENT_BASE_URL = 'hominem_agent_base_url'
 const LS_SESSION_ID = 'hominem_session_id'
@@ -57,16 +57,41 @@ export const useChatStore = defineStore('chat', () => {
 
     // Optimistic UI: add the user message immediately.
     messages.value = [...messages.value, { role: 'user', content: text }]
+    // Placeholder assistant message we will update as the stream arrives.
+    messages.value = [...messages.value, { role: 'assistant', content: '', reasoning_content: '' }]
 
     try {
-      const resp = await agentChat({
+      await agentChatStream({
         agentBaseUrl: agentBaseUrl.value,
         sessionId: sessionId.value || null,
         message: text,
+        onEvent: (evt) => {
+          if (evt.type === 'start') {
+            sessionId.value = (evt.session_id || '').trim()
+            writeLocalStorage(LS_SESSION_ID, sessionId.value)
+            return
+          }
+          if (evt.type === 'assistant') {
+            // Replace the last assistant message with the latest snapshot.
+            const next = [...messages.value]
+            for (let i = next.length - 1; i >= 0; i--) {
+              if ((next[i]?.role || '').toLowerCase() === 'assistant') {
+                next[i] = { ...next[i], ...evt.assistant }
+                messages.value = next
+                return
+              }
+            }
+            next.push(evt.assistant)
+            messages.value = next
+            return
+          }
+          if (evt.type === 'done') {
+            sessionId.value = (evt.session_id || '').trim()
+            writeLocalStorage(LS_SESSION_ID, sessionId.value)
+            messages.value = Array.isArray(evt.messages) ? evt.messages : messages.value
+          }
+        },
       })
-      sessionId.value = (resp.session_id || '').trim()
-      writeLocalStorage(LS_SESSION_ID, sessionId.value)
-      messages.value = Array.isArray(resp.messages) ? resp.messages : messages.value
     } catch (e: any) {
       const msg = String(e?.message || e || 'Unknown error')
       error.value = msg

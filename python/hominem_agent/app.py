@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from hominem_agent.agent import build_agent, default_tools
@@ -216,3 +216,111 @@ def chat(payload: ChatIn) -> ChatOut:
 
     session.messages.extend(last_norm)
     return ChatOut(session_id=session_id, assistant=assistant_text, messages=session.messages)
+
+@app.post("/api/chat/stream")
+def chat_stream(payload: ChatIn):
+    """
+    Stream chat updates as newline-delimited JSON (NDJSON).
+
+    Events:
+    - {"type":"start","session_id":...}
+    - {"type":"assistant","assistant": {...}}  (snapshot-style updates)
+    - {"type":"done","session_id":...,"assistant":...,"messages":[...]}
+    - {"type":"error","detail":...}
+    """
+    agent = _get_agent()
+    req_id = f"req_{uuid.uuid4().hex}"
+
+    session_id = (payload.session_id or "").strip() or f"sess_{uuid.uuid4().hex}"
+    session = _SESSIONS.get(session_id)
+    if session is None:
+        session = Session(session_id=session_id)
+        _SESSIONS[session_id] = session
+
+    if payload.content is not None:
+        user_content: Any = payload.content
+    else:
+        user_content = payload.message
+    session.messages.append({"role": "user", "content": user_content})
+
+    def gen():
+        yield json.dumps({"type": "start", "session_id": session_id}, ensure_ascii=False) + "\n"
+
+        chunks: List[List[Dict[str, Any]]] = []
+        assistant_state: Dict[str, Any] = {"role": "assistant", "content": "", "reasoning_content": ""}
+        last_sent_key = ""
+
+        try:
+            responses_iter = agent.run(messages=session.messages)
+        except Exception as exc:
+            yield json.dumps({"type": "error", "detail": f"Agent run failed: {exc}"}, ensure_ascii=False) + "\n"
+            return
+
+        try:
+            for chunk in responses_iter:
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+
+                # Merge assistant updates within this chunk into a single snapshot state.
+                for msg in chunk:
+                    if not isinstance(msg, dict):
+                        continue
+                    if (msg.get("role") or "").strip().lower() != "assistant":
+                        continue
+                    assistant_state["content"] = _merge_maybe_delta_str(
+                        assistant_state.get("content", ""),
+                        msg.get("content", ""),
+                    )
+                    if "reasoning_content" in msg:
+                        assistant_state["reasoning_content"] = _merge_maybe_delta_str(
+                            assistant_state.get("reasoning_content", ""),
+                            msg.get("reasoning_content", ""),
+                        )
+                    if "tool_calls" in msg:
+                        assistant_state["tool_calls"] = _merge_tool_calls(
+                            assistant_state.get("tool_calls"),
+                            msg.get("tool_calls"),
+                        )
+
+                key = json.dumps(
+                    {
+                        "content": assistant_state.get("content") or "",
+                        "reasoning_content": assistant_state.get("reasoning_content") or "",
+                        "tool_calls": assistant_state.get("tool_calls"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                if key != last_sent_key:
+                    last_sent_key = key
+                    yield json.dumps({"type": "assistant", "assistant": assistant_state}, ensure_ascii=False) + "\n"
+
+        except Exception as exc:
+            yield json.dumps({"type": "error", "detail": f"Agent streaming failed: {exc}"}, ensure_ascii=False) + "\n"
+            return
+
+        last_norm = _accumulate_agent_chunks(chunks)
+        if not last_norm:
+            yield json.dumps({"type": "error", "detail": "Agent produced no response."}, ensure_ascii=False) + "\n"
+            return
+
+        assistant_text = ""
+        for msg_obj in reversed(last_norm):
+            if msg_obj.get("role") == "assistant":
+                assistant_text = str(msg_obj.get("content") or "")
+                break
+
+        session.messages.extend(last_norm)
+        yield json.dumps(
+            {
+                "type": "done",
+                "session_id": session_id,
+                "assistant": assistant_text,
+                "messages": session.messages,
+            },
+            ensure_ascii=False,
+        ) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
