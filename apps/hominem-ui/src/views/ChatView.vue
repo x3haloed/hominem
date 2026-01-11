@@ -10,6 +10,7 @@ const messagesEl = ref<HTMLDivElement | null>(null)
 
 const draft = ref('')
 const statusText = computed(() => (chat.sending ? 'Sending…' : chat.error ? chat.error : ''))
+const reasoningOpen = ref<Record<number, boolean>>({})
 
 function roleLabel(role: string): string {
   const r = (role || '').toLowerCase()
@@ -32,6 +33,17 @@ function formatContent(content: unknown): string {
   } catch {
     return String(content)
   }
+}
+
+function hasReasoning(msg: any): boolean {
+  const r = msg?.reasoning_content
+  if (r == null) return false
+  if (typeof r === 'string') return r.trim().length > 0
+  return true
+}
+
+function toggleReasoning(idx: number) {
+  reasoningOpen.value[idx] = !reasoningOpen.value[idx]
 }
 
 async function scrollToBottom() {
@@ -65,6 +77,7 @@ function onComposerKeydown(e: KeyboardEvent) {
 function newChat() {
   chat.resetSession()
   draft.value = ''
+  reasoningOpen.value = {}
   nextTick(() => composer.value?.focus())
 }
 
@@ -148,10 +161,51 @@ onMounted(() => {
             </div>
             <div
               v-else
-              class="bg-gray-50 border border-gray-200 text-gray-900 rounded-2xl px-4 py-3 shadow-sm"
+              class="text-gray-900"
             >
-              <div class="text-xs text-gray-500 mb-2">{{ roleLabel(msg.role) }}</div>
-              <pre class="text-sm leading-relaxed whitespace-pre-wrap">{{ formatContent(msg.content) }}</pre>
+              <div v-if="msg.role === 'assistant'" class="flex items-start space-x-3">
+                <div
+                  class="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-full flex items-center justify-center flex-shrink-0"
+                >
+                  <i class="fa-solid fa-brain text-white text-sm"></i>
+                </div>
+                <div class="flex-1">
+                  <div
+                    v-if="hasReasoning(msg)"
+                    class="mb-4 border border-gray-200 rounded-xl overflow-hidden"
+                  >
+                    <button
+                      class="w-full px-4 py-3 bg-gray-50 hover:bg-gray-100 flex items-center justify-between transition-colors"
+                      type="button"
+                      @click="toggleReasoning(idx)"
+                    >
+                      <div class="flex items-center space-x-2">
+                        <i class="fa-solid fa-brain text-purple-600"></i>
+                        <span class="font-medium text-gray-700">AI Reasoning</span>
+                      </div>
+                      <i
+                        class="fa-solid fa-chevron-down text-gray-500 transition-transform"
+                        :class="reasoningOpen[idx] ? 'rotate-180' : ''"
+                      ></i>
+                    </button>
+                    <div
+                      v-show="reasoningOpen[idx]"
+                      class="px-4 py-3 bg-purple-50 border-t border-gray-200"
+                    >
+                      <pre class="text-sm text-gray-700 whitespace-pre-wrap">{{ formatContent(msg.reasoning_content) }}</pre>
+                    </div>
+                  </div>
+
+                  <div class="bg-gray-100 rounded-2xl px-4 py-3">
+                    <pre class="text-gray-800 leading-relaxed whitespace-pre-wrap">{{ formatContent(msg.content) }}</pre>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="bg-gray-50 border border-gray-200 text-gray-900 rounded-2xl px-4 py-3 shadow-sm">
+                <div class="text-xs text-gray-500 mb-2">{{ roleLabel(msg.role) }}</div>
+                <pre class="text-sm leading-relaxed whitespace-pre-wrap">{{ formatContent(msg.content) }}</pre>
+              </div>
             </div>
           </div>
         </div>
