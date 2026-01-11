@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -14,6 +15,19 @@ from hominem_agent.agent import build_agent, default_tools
 
 
 app = FastAPI(title="Hominem Agent")
+
+_CORS_ORIGINS = [o.strip() for o in os.getenv("HOMINEM_UI_CORS_ORIGINS", "").split(",") if o.strip()]
+if not _CORS_ORIGINS:
+    # Default dev origin for `apps/hominem-ui` (Vite).
+    _CORS_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @dataclass
@@ -46,89 +60,25 @@ class ChatOut(BaseModel):
     assistant: str
     messages: List[Dict[str, Any]]
 
-
-INDEX_HTML = """<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Hominem Agent</title>
-    <style>
-      body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #0b0f16; color: #e6edf3; }
-      header { padding: 12px 16px; border-bottom: 1px solid #222b3a; background: #0b0f16; position: sticky; top: 0; }
-      main { max-width: 900px; margin: 0 auto; padding: 16px; }
-      #log { white-space: pre-wrap; background: #0f1623; border: 1px solid #222b3a; border-radius: 8px; padding: 12px; min-height: 240px; }
-      form { display: flex; gap: 8px; margin-top: 12px; }
-      input[type=text] { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #222b3a; background: #0f1623; color: #e6edf3; }
-      button { padding: 10px 12px; border-radius: 8px; border: 1px solid #2b3a52; background: #1a2638; color: #e6edf3; cursor: pointer; }
-      button:disabled { opacity: 0.6; cursor: not-allowed; }
-      .meta { color: #9db0c6; font-size: 12px; margin-top: 8px; }
-      code { background: #0b1220; padding: 2px 4px; border-radius: 6px; }
-    </style>
-  </head>
-  <body>
-    <header>
-      <div><strong>Hominem Agent</strong> <span class="meta">UI → Qwen-Agent → infer → Qwen-Agent → UI</span></div>
-    </header>
-    <main>
-      <div class="meta">Agent server: <code>/api/chat</code> • Infer base URL from <code>HOMINEM_INFER_BASE_URL</code></div>
-      <div id="log"></div>
-      <form id="form">
-        <input id="msg" type="text" placeholder="Say something…" autocomplete="off" />
-        <button id="send" type="submit">Send</button>
-      </form>
-    </main>
-    <script>
-      const log = document.getElementById("log");
-      const form = document.getElementById("form");
-      const msg = document.getElementById("msg");
-      const send = document.getElementById("send");
-      let sessionId = localStorage.getItem("hominem_session_id") || "";
-
-      function append(text) {
-        log.textContent += text + "\\n";
-        log.scrollTop = log.scrollHeight;
-      }
-
-      async function chat(userText) {
-        send.disabled = true;
-        append("> " + userText);
-        const body = { session_id: sessionId || null, message: userText };
-        const resp = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await resp.json();
-        if (!resp.ok) {
-          append("! error: " + (data.detail || JSON.stringify(data)));
-          send.disabled = false;
-          return;
-        }
-        sessionId = data.session_id;
-        localStorage.setItem("hominem_session_id", sessionId);
-        append(data.assistant);
-        send.disabled = false;
-      }
-
-      form.addEventListener("submit", (e) => {
-        e.preventDefault();
-        const text = (msg.value || "").trim();
-        if (!text) return;
-        msg.value = "";
-        chat(text).catch((err) => {
-          append("! exception: " + err);
-          send.disabled = false;
-        });
-      });
-    </script>
-  </body>
-</html>
-"""
-
-
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse(INDEX_HTML)
+    return HTMLResponse(
+        """<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>Hominem Agent</title></head>
+  <body style="font-family: system-ui, -apple-system, sans-serif; padding: 24px;">
+    <h1 style="margin: 0 0 8px 0;">Hominem Agent</h1>
+    <p style="margin: 0 0 16px 0;">API server for orchestration + tool calling.</p>
+    <ul>
+      <li><code>POST /api/chat</code></li>
+      <li><code>GET /health</code></li>
+    </ul>
+    <p style="margin-top: 16px;">
+      UI is now a separate SPA: <code>apps/hominem-ui</code>.
+    </p>
+  </body>
+</html>"""
+    )
 
 
 @app.get("/health")
@@ -177,4 +127,3 @@ def chat(payload: ChatIn) -> ChatOut:
 
     session.messages.extend(last)
     return ChatOut(session_id=session_id, assistant=assistant_text, messages=session.messages)
-

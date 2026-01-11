@@ -22,7 +22,7 @@ apps/
 - apps/hominem-agent/ (Python, Qwen-Agent): owns planning + tool calling loop, emits tool events.
 - apps/hominem-core/ (Rust): log writer/reader, rotation, indexing, scheduling.
 - apps/hominem-tools/ (Rust or Python): optional tool execution sandbox if not using Qwen-Agent tools directly.
-- apps/hominem-ui/ (optional): UI/CLI client.
+- apps/hominem-ui/ (static SPA): UI client that talks to hominem-agent over HTTP.
 
 crates/
 - crates/log/ : JSONL.zst writer/reader, ULID, rotation, offsets.
