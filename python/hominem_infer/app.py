@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -55,6 +56,8 @@ class ResponsesRequest(BaseModel):
     stream: bool | None = False
     adapter_path: Optional[str] = None
     resize_shape: Optional[List[int]] = None
+    tools: List[Dict[str, Any]] | None = None
+    tool_choice: Any | None = None
 
 
 class ModelList(BaseModel):
@@ -99,7 +102,16 @@ def _usage_stub() -> Dict[str, int]:
     return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
-def _make_response(model: str, content: str, *, finish_reason: str = "stop") -> Dict[str, Any]:
+def _make_response(
+    model: str,
+    content: str,
+    *,
+    finish_reason: str = "stop",
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": f"chatcmpl_{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -108,7 +120,7 @@ def _make_response(model: str, content: str, *, finish_reason: str = "stop") -> 
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -145,6 +157,75 @@ def _stream_response(model: str, content: str) -> Iterator[str]:
     }
     yield f"data: {json.dumps(done)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>", re.DOTALL)
+
+
+def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    if not text:
+        return "", []
+
+    tool_calls: List[Dict[str, Any]] = []
+    for match in _TOOL_CALL_RE.finditer(text):
+        raw = match.group(1).strip()
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid <tool_call> JSON: {exc}") from exc
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="Invalid <tool_call>: missing 'name' string.")
+        arguments = payload.get("arguments", {})
+        if isinstance(arguments, str):
+            arguments_json = arguments
+        else:
+            try:
+                arguments_json = json.dumps(arguments, ensure_ascii=False)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid <tool_call> arguments JSON: {exc}") from exc
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments_json},
+            }
+        )
+
+    cleaned = _TOOL_CALL_RE.sub("", text).strip()
+    return cleaned, tool_calls
+
+
+def _tool_calls_to_responses_required_action(tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "type": "submit_tool_outputs",
+        "submit_tool_outputs": {
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": tc["type"],
+                    "function": tc["function"],
+                }
+                for tc in tool_calls
+            ]
+        },
+    }
+
+
+def _tool_calls_to_responses_output_items(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        items.append(
+            {
+                "id": tc.get("id"),
+                "type": "function_call",
+                "status": "completed",
+                "name": fn.get("name"),
+                "arguments": fn.get("arguments"),
+            }
+        )
+    return items
 
 
 app = FastAPI(title="Hominem Infer")
@@ -389,16 +470,28 @@ def chat_completions(payload: ChatCompletionRequest):
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Invalid video input: {exc}") from exc
 
+        chat_template_kwargs: Dict[str, Any] = {}
+        if payload.tools:
+            chat_template_kwargs["tools"] = payload.tools
+        if payload.tool_choice is not None:
+            chat_template_kwargs["tool_choice"] = payload.tool_choice
+
         try:
             prompt = processor.apply_chat_template(
                 normalized_messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                **chat_template_kwargs,
             )
-        except Exception as exc:
+        except TypeError as exc:
+            if payload.tools:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model chat_template does not support tools: {exc}",
+                ) from exc
             raise HTTPException(
                 status_code=500,
-                detail=f"Processor does not support video chat_template: {exc}",
+                detail=f"Processor chat_template failure: {exc}",
             ) from exc
 
         image_inputs, video_inputs, _video_kwargs = process_vision_info(normalized_messages, True)
@@ -423,13 +516,27 @@ def chat_completions(payload: ChatCompletionRequest):
         if inputs.get("image_grid_thw") is not None:
             kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
     else:
-        prompt = apply_chat_template(
-            processor,
-            config,
-            normalized_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-        )
+        chat_template_kwargs = {}
+        if payload.tools:
+            chat_template_kwargs["tools"] = payload.tools
+        if payload.tool_choice is not None:
+            chat_template_kwargs["tool_choice"] = payload.tool_choice
+        try:
+            prompt = apply_chat_template(
+                processor,
+                config,
+                normalized_messages,
+                num_images=len(images),
+                num_audios=len(audio),
+                **chat_template_kwargs,
+            )
+        except TypeError as exc:
+            if payload.tools:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model chat_template does not support tools: {exc}",
+                ) from exc
+            raise
 
     max_tokens = payload.max_tokens or payload.max_completion_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
@@ -437,7 +544,20 @@ def chat_completions(payload: ChatCompletionRequest):
 
     if payload.stream:
         def stream_generator():
+            resp_id = f"chatcmpl_{uuid.uuid4().hex}"
+            created = int(time.time())
+            buffer = ""
+            saw_tool_call = False
             try:
+                first = {
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(first)}\n\n"
+
                 for chunk in stream_generate(
                     model=model,
                     processor=processor,
@@ -451,26 +571,54 @@ def chat_completions(payload: ChatCompletionRequest):
                 ):
                     if not chunk or not hasattr(chunk, "text"):
                         continue
+                    delta = str(getattr(chunk, "text", "") or "")
+                    if not delta:
+                        continue
+                    buffer += delta
+                    if "<tool_call>" in buffer:
+                        saw_tool_call = True
+                    if saw_tool_call:
+                        continue
                     payload_chunk = {
-                        "id": f"chatcmpl_{uuid.uuid4().hex}",
+                        "id": resp_id,
                         "object": "chat.completion.chunk",
-                        "created": int(time.time()),
+                        "created": created,
                         "model": model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": chunk.text},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(payload_chunk)}\n\n"
+
+                final_text, tool_calls = _extract_tool_calls_from_text(buffer)
+                if tool_calls:
+                    delta_tc = {
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": tc["id"],
+                                "type": tc["type"],
+                                "function": tc["function"],
+                            }
+                            for i, tc in enumerate(tool_calls)
+                        ]
+                    }
+                    payload_chunk = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": delta_tc, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(payload_chunk)}\n\n"
+                    finish_reason = "tool_calls"
+                else:
+                    finish_reason = "stop"
+
                 done = {
-                    "id": f"chatcmpl_{uuid.uuid4().hex}",
+                    "id": resp_id,
                     "object": "chat.completion.chunk",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": model_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 }
                 yield f"data: {json.dumps(done)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -500,17 +648,18 @@ def chat_completions(payload: ChatCompletionRequest):
         **kwargs,
     )
     gc.collect()
-    content = gen_result.text
+    content, tool_calls = _extract_tool_calls_from_text(gen_result.text)
+    finish_reason = "tool_calls" if tool_calls else "stop"
     event_writer.emit(
         "TurnEvent",
         {
             "model": model_id,
             "messages": normalized_messages,
-            "assistant": {"role": "assistant", "content": content},
+            "assistant": {"role": "assistant", "content": content, "tool_calls": tool_calls or None},
             "stream": bool(payload.stream),
         },
     )
-    return JSONResponse(_make_response(model_id, content))
+    return JSONResponse(_make_response(model_id, content, finish_reason=finish_reason, tool_calls=tool_calls or None))
 
 
 @app.post("/v1/responses")
@@ -551,7 +700,8 @@ def responses(payload: ResponsesRequest):
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
     messages = _responses_input_to_messages(payload)
-    images, audio = _extract_media(messages)
+    normalized_messages, _video_specs = _normalize_video_elements(messages)
+    images, audio = _extract_media(normalized_messages)
 
     try:
         from mlx_vlm.generate import generate, stream_generate
@@ -568,13 +718,27 @@ def responses(payload: ResponsesRequest):
         else:
             kwargs["resize_shape"] = (payload.resize_shape[0], payload.resize_shape[1])
 
-    prompt = apply_chat_template(
-        processor,
-        config,
-        messages,
-        num_images=len(images),
-        num_audios=len(audio),
-    )
+    chat_template_kwargs = {}
+    if payload.tools:
+        chat_template_kwargs["tools"] = payload.tools
+    if payload.tool_choice is not None:
+        chat_template_kwargs["tool_choice"] = payload.tool_choice
+    try:
+        prompt = apply_chat_template(
+            processor,
+            config,
+            normalized_messages,
+            num_images=len(images),
+            num_audios=len(audio),
+            **chat_template_kwargs,
+        )
+    except TypeError as exc:
+        if payload.tools:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model chat_template does not support tools: {exc}",
+            ) from exc
+        raise
     max_tokens = payload.max_output_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
     top_p = payload.top_p if payload.top_p is not None else 1.0
@@ -636,8 +800,9 @@ def responses(payload: ResponsesRequest):
                         + getattr(chunk, "generation_tokens", 0),
                     }
                     yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
-                yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': full_text})}\n\n"
-                final_content_part = {"type": "output_text", "text": full_text, "annotations": []}
+                cleaned, tool_calls = _extract_tool_calls_from_text(full_text)
+                yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': cleaned})}\n\n"
+                final_content_part = {"type": "output_text", "text": cleaned, "annotations": []}
                 yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_content_part})}\n\n"
                 final_message_item = {
                     "id": message_id,
@@ -647,12 +812,25 @@ def responses(payload: ResponsesRequest):
                     "content": [final_content_part],
                 }
                 yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': final_message_item})}\n\n"
+
+                tool_items: List[Dict[str, Any]] = []
+                required_action: Optional[Dict[str, Any]] = None
+                status = "completed"
+                if tool_calls:
+                    status = "requires_action"
+                    required_action = _tool_calls_to_responses_required_action(tool_calls)
+                    tool_items = _tool_calls_to_responses_output_items(tool_calls)
+                    for idx, item in enumerate(tool_items, start=1):
+                        yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': idx, 'item': item})}\n\n"
+                        yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': idx, 'item': item})}\n\n"
+
                 completed = dict(base_response)
                 completed.update(
                     {
-                        "status": "completed",
-                        "output": [final_message_item],
-                        "output_text": full_text,
+                        "status": status,
+                        "required_action": required_action,
+                        "output": [final_message_item, *tool_items],
+                        "output_text": cleaned,
                         "usage": usage_stats,
                     }
                 )
@@ -676,14 +854,15 @@ def responses(payload: ResponsesRequest):
         **kwargs,
     )
     gc.collect()
-    content = gen_result.text
+    content, tool_calls = _extract_tool_calls_from_text(gen_result.text)
     response_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"
+    tool_items = _tool_calls_to_responses_output_items(tool_calls) if tool_calls else []
     response = {
         "id": response_id,
         "object": "response",
         "created_at": int(time.time()),
-        "status": "completed",
+        "status": ("requires_action" if tool_calls else "completed"),
         "instructions": None,
         "max_output_tokens": payload.max_output_tokens,
         "model": model_id,
@@ -695,10 +874,12 @@ def responses(payload: ResponsesRequest):
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": content, "annotations": []}],
             }
-        ],
+        ]
+        + tool_items,
         "output_text": content,
         "temperature": temperature,
         "top_p": top_p,
+        "required_action": (_tool_calls_to_responses_required_action(tool_calls) if tool_calls else None),
         "usage": {
             "input_tokens": getattr(gen_result, "prompt_tokens", 0),
             "output_tokens": getattr(gen_result, "generation_tokens", 0),
