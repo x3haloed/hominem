@@ -261,7 +261,6 @@ def _mlx_load_model(model_id: str, adapter_path: Optional[str]):
 
 def _extract_media(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
     images: List[str] = []
-    audio: List[str] = []
     for msg in messages:
         content = msg.get("content")
         if not isinstance(content, list):
@@ -275,12 +274,8 @@ def _extract_media(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[str]
             elif item_type == "image_url":
                 image_url = item.get("image_url") or {}
                 images.append(str(image_url.get("url") or ""))
-            elif item_type == "input_audio":
-                input_audio = item.get("input_audio") or {}
-                audio.append(str(input_audio.get("data") or ""))
     images = [img for img in images if img]
-    audio = [aud for aud in audio if aud]
-    return images, audio
+    return images, []
 
 
 def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, Any]]:
@@ -700,7 +695,7 @@ def responses(payload: ResponsesRequest):
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
     messages = _responses_input_to_messages(payload)
-    normalized_messages, _video_specs = _normalize_video_elements(messages)
+    normalized_messages, video_specs = _normalize_video_elements(messages)
     images, audio = _extract_media(normalized_messages)
 
     try:
@@ -723,22 +718,77 @@ def responses(payload: ResponsesRequest):
         chat_template_kwargs["tools"] = payload.tools
     if payload.tool_choice is not None:
         chat_template_kwargs["tool_choice"] = payload.tool_choice
-    try:
-        prompt = apply_chat_template(
-            processor,
-            config,
-            normalized_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-            **chat_template_kwargs,
+
+    if video_specs:
+        try:
+            import mlx.core as mx
+            from mlx_vlm.video_generate import process_vision_info
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail=f"mlx_vlm video dependencies missing: {exc}") from exc
+
+        for spec in video_specs:
+            if not spec.is_file_like:
+                continue
+            try:
+                spec.ele["video"] = _materialize_video_path(str(spec.ele.get("video") or ""))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid video input: {exc}") from exc
+
+        try:
+            prompt = processor.apply_chat_template(
+                normalized_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **chat_template_kwargs,
+            )
+        except TypeError as exc:
+            if payload.tools:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model chat_template does not support tools: {exc}",
+                ) from exc
+            raise HTTPException(status_code=500, detail=f"Processor chat_template failure: {exc}") from exc
+
+        image_inputs, video_inputs, _video_kwargs = process_vision_info(normalized_messages, True)
+        inputs = processor(
+            text=[prompt],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         )
-    except TypeError as exc:
-        if payload.tools:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model chat_template does not support tools: {exc}",
-            ) from exc
-        raise
+        kwargs["input_ids"] = mx.array(inputs["input_ids"])
+        pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
+        if pixel_values is None:
+            raise HTTPException(status_code=400, detail="Video input produced no pixel values.")
+        kwargs["pixel_values"] = mx.array(pixel_values)
+        kwargs["mask"] = mx.array(inputs["attention_mask"])
+        if inputs.get("video_grid_thw") is not None:
+            kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
+        if inputs.get("image_grid_thw") is not None:
+            kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+        # Media already packed into pixel_values; avoid redundant loader paths.
+        images = []
+        audio = []
+    else:
+        try:
+            prompt = apply_chat_template(
+                processor,
+                config,
+                normalized_messages,
+                num_images=len(images),
+                num_audios=len(audio),
+                **chat_template_kwargs,
+            )
+        except TypeError as exc:
+            if payload.tools:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model chat_template does not support tools: {exc}",
+                ) from exc
+            raise
     max_tokens = payload.max_output_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
     top_p = payload.top_p if payload.top_p is not None else 1.0
