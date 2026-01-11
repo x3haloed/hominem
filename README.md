@@ -24,4 +24,5 @@ High-level goals:
 
 See `docs/ARCHITECTURE.md` for a concise architecture overview.
 
+Quickstart (agent UI): see `docs/agent_ui.md`.
 

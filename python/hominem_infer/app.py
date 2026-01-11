@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from hominem_infer.events import EventWriter
 
 
-DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "mlx-community/Qwen2-VL-2B-Instruct-4bit")
+DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "/Users/user/unified-theory/Qwen3-VL-8B-Thinking-abliterated-v1-4bit")
 EVENT_LOG_PATH = os.getenv("INFER_EVENT_LOG")
 EVENTS_ENABLED = os.getenv("INFER_EVENT_LOG", "").strip() != ""
 BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")

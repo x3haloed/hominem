@@ -10,6 +10,14 @@ setup(
     include_package_data=True,
     install_requires=[],
     extras_require={
+        "agent": [
+            "qwen-agent>=0.0.31",
+            "openai>=1.0.0",
+        ],
+        "agent_ui": [
+            "fastapi>=0.104.0",
+            "uvicorn[standard]>=0.24.0",
+        ],
         "training_factory": [
             "fastapi>=0.104.0",
             "uvicorn[standard]>=0.24.0",
