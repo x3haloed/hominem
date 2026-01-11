@@ -60,6 +60,92 @@ class ChatOut(BaseModel):
     assistant: str
     messages: List[Dict[str, Any]]
 
+def _merge_maybe_delta_str(existing: Any, incoming: Any) -> Any:
+    """
+    Merge a possibly-streamed string field.
+
+    Some clients emit cumulative strings; others emit deltas. We handle both:
+    - If incoming starts with existing, treat it as cumulative and take incoming.
+    - If existing starts with incoming, keep existing.
+    - Otherwise, append incoming (treat as delta).
+    """
+    if not isinstance(incoming, str):
+        return incoming
+    if not isinstance(existing, str) or not existing:
+        return incoming
+    if incoming.startswith(existing):
+        return incoming
+    if existing.startswith(incoming):
+        return existing
+    return existing + incoming
+
+
+def _merge_tool_calls(existing: Any, incoming: Any) -> Any:
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    if isinstance(existing, list) and isinstance(incoming, list):
+        seen = set()
+        out: List[Any] = []
+        for tc in existing + incoming:
+            if not isinstance(tc, dict):
+                out.append(tc)
+                continue
+            key = tc.get("id") or json.dumps(tc, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(tc)
+        return out
+    return incoming
+
+
+def _accumulate_agent_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Accumulate qwen-agent streamed output into a single list of new messages to append.
+
+    `qwen-agent` often yields many chunks; each chunk may contain partial updates
+    ("deltas") for fields like `content` and `reasoning_content`. Those deltas
+    should be merged into a single assistant message for the turn, not treated as
+    separate messages.
+    """
+    out: List[Dict[str, Any]] = []
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+        for msg in chunk:
+            if not isinstance(msg, dict):
+                continue
+            role = (msg.get("role") or "").strip().lower()
+
+            if role == "assistant" and out and (out[-1].get("role") or "").strip().lower() == "assistant":
+                # Merge streamed assistant fields into the last assistant message.
+                out[-1]["content"] = _merge_maybe_delta_str(out[-1].get("content", ""), msg.get("content", ""))
+                if "reasoning_content" in msg:
+                    out[-1]["reasoning_content"] = _merge_maybe_delta_str(
+                        out[-1].get("reasoning_content", ""),
+                        msg.get("reasoning_content", ""),
+                    )
+                if "tool_calls" in msg:
+                    out[-1]["tool_calls"] = _merge_tool_calls(out[-1].get("tool_calls"), msg.get("tool_calls"))
+                continue
+
+            # If we see an assistant message that only has reasoning_content, we still create it,
+            # expecting a later delta to fill `content` into the same message.
+            out.append(dict(msg))
+
+    # Drop any assistant messages that never received any payload (shouldn't happen, but avoids UI artifacts).
+    cleaned: List[Dict[str, Any]] = []
+    for msg in out:
+        role = (msg.get("role") or "").strip().lower()
+        if role == "assistant":
+            if not (msg.get("content") or msg.get("reasoning_content") or msg.get("tool_calls")):
+                continue
+        cleaned.append(msg)
+    return cleaned
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(
@@ -89,6 +175,7 @@ def health() -> Dict[str, str]:
 @app.post("/api/chat", response_model=ChatOut)
 def chat(payload: ChatIn) -> ChatOut:
     agent = _get_agent()
+    req_id = f"req_{uuid.uuid4().hex}"
 
     session_id = (payload.session_id or "").strip() or f"sess_{uuid.uuid4().hex}"
     session = _SESSIONS.get(session_id)
@@ -107,23 +194,25 @@ def chat(payload: ChatIn) -> ChatOut:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent run failed: {exc}") from exc
 
-    last: List[Dict[str, Any]] = []
+    chunks: List[List[Dict[str, Any]]] = []
     try:
         for chunk in responses_iter:
             if chunk:
-                last = chunk
+                chunks.append(chunk)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent streaming failed: {exc}") from exc
 
-    if not last:
+    if not chunks:
         raise HTTPException(status_code=500, detail="Agent produced no response.")
+
+    last_norm = _accumulate_agent_chunks(chunks)
 
     # Qwen-Agent returns a list of message dicts; take the last assistant content if present.
     assistant_text = ""
-    for msg_obj in reversed(last):
+    for msg_obj in reversed(last_norm):
         if msg_obj.get("role") == "assistant":
             assistant_text = str(msg_obj.get("content") or "")
             break
 
-    session.messages.extend(last)
+    session.messages.extend(last_norm)
     return ChatOut(session_id=session_id, assistant=assistant_text, messages=session.messages)

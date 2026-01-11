@@ -98,6 +98,7 @@ class ThinkStreamParser:
     in_think: bool = False
     buffer: str = ""
     carry: str = ""
+    strip_next_content_prefix: bool = False
 
     def feed(self, delta: str) -> Tuple[str, str]:
         if not delta:
@@ -141,6 +142,7 @@ class ThinkStreamParser:
             rest = self.buffer[close_idx + len(_THINK_CLOSE) :]
             self.buffer = ""
             self.in_think = False
+            self.strip_next_content_prefix = True
             # After the close, we treat as content (but still allow explicit think blocks later).
             c2, r2 = self._feed_explicit(rest)
             return c2, reasoning_prefix + (("\n" + r2) if r2 else "")
@@ -163,6 +165,14 @@ class ThinkStreamParser:
         out_c: List[str] = []
         out_r: List[str] = []
 
+        if not self.in_think and self.strip_next_content_prefix:
+            stripped = s.lstrip()
+            if not stripped:
+                # Entire chunk is whitespace after </think>; drop it and keep stripping.
+                return "", ""
+            s = stripped
+            self.strip_next_content_prefix = False
+
         while s:
             lower = s.lower()
             if not self.in_think:
@@ -182,9 +192,9 @@ class ThinkStreamParser:
                         out_r.append(s[:idx])
                     s = s[idx + len(_THINK_CLOSE) :]
                     self.in_think = False
+                    self.strip_next_content_prefix = True
                     continue
                 out_r.append(s)
                 break
 
         return "".join(out_c), "".join(out_r)
-
