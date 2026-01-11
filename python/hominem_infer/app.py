@@ -5,11 +5,8 @@ from __future__ import annotations
 import gc
 import json
 import os
-import re
-import tempfile
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -18,13 +15,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from hominem_infer.events import EventWriter
+from hominem_infer.media import extract_media, materialize_video_path, normalize_video_elements
+from hominem_infer.parsing import ThinkStreamParser, extract_reasoning_from_text, extract_tool_calls_from_text
 
 
-DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "/Users/user/unified-theory/Qwen3-VL-8B-Thinking-abliterated-v1-4bit")
+DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "mlx-community/Qwen2-VL-2B-Instruct-4bit")
 EVENT_LOG_PATH = os.getenv("INFER_EVENT_LOG")
 EVENTS_ENABLED = os.getenv("INFER_EVENT_LOG", "").strip() != ""
 BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")
-ALLOW_REMOTE_MEDIA = os.getenv("INFER_ALLOW_REMOTE_MEDIA", "false").strip().lower() == "true"
 
 _MODEL_CACHE: Dict[str, Any] = {}
 
@@ -108,8 +106,11 @@ def _make_response(
     *,
     finish_reason: str = "stop",
     tool_calls: Optional[List[Dict[str, Any]]] = None,
+    reasoning_content: Optional[str] = None,
 ) -> Dict[str, Any]:
     message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     if tool_calls:
         message["tool_calls"] = tool_calls
     return {
@@ -159,41 +160,9 @@ def _stream_response(model: str, content: str) -> Iterator[str]:
     yield "data: [DONE]\n\n"
 
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>", re.DOTALL)
-
-
-def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    if not text:
-        return "", []
-
-    tool_calls: List[Dict[str, Any]] = []
-    for match in _TOOL_CALL_RE.finditer(text):
-        raw = match.group(1).strip()
-        try:
-            payload = json.loads(raw)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid <tool_call> JSON: {exc}") from exc
-        name = payload.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise HTTPException(status_code=400, detail="Invalid <tool_call>: missing 'name' string.")
-        arguments = payload.get("arguments", {})
-        if isinstance(arguments, str):
-            arguments_json = arguments
-        else:
-            try:
-                arguments_json = json.dumps(arguments, ensure_ascii=False)
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid <tool_call> arguments JSON: {exc}") from exc
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex}",
-                "type": "function",
-                "function": {"name": name, "arguments": arguments_json},
-            }
-        )
-
-    cleaned = _TOOL_CALL_RE.sub("", text).strip()
-    return cleaned, tool_calls
+#
+# NOTE: parsing helpers live in `hominem_infer.parsing`.
+#
 
 
 def _tool_calls_to_responses_required_action(tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -259,25 +228,6 @@ def _mlx_load_model(model_id: str, adapter_path: Optional[str]):
     return model, processor, config
 
 
-def _extract_media(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
-    images: List[str] = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type == "input_image":
-                images.append(str(item.get("image_url") or ""))
-            elif item_type == "image_url":
-                image_url = item.get("image_url") or {}
-                images.append(str(image_url.get("url") or ""))
-    images = [img for img in images if img]
-    return images, []
-
-
 def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, Any]]:
     raw = payload.input
     if isinstance(raw, str):
@@ -290,111 +240,6 @@ def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, An
         if messages:
             return messages
     raise HTTPException(status_code=400, detail="Unsupported responses input format.")
-
-
-@dataclass(frozen=True)
-class _VideoSpec:
-    ele: Dict[str, Any]
-    is_file_like: bool
-
-
-def _normalize_video_elements(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[_VideoSpec]]:
-    """
-    Convert OpenAI-style video elements into the MLX-VLM expected schema:
-      - {"type":"video_url","video_url":{"url":...}} -> {"type":"video","video": "..."}
-    Returns a deep-ish copy of messages (only content lists are copied) plus detected videos.
-    """
-    out_messages: List[Dict[str, Any]] = []
-    videos: List[_VideoSpec] = []
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            out_messages.append(msg)
-            continue
-        new_content: List[Any] = []
-        for item in content:
-            if not isinstance(item, dict):
-                new_content.append(item)
-                continue
-            item_type = (item.get("type") or "").strip()
-            if item_type in ("video_url", "input_video"):
-                video_url = item.get("video_url") or {}
-                url = video_url.get("url") if isinstance(video_url, dict) else None
-                if url:
-                    ele = dict(item)
-                    ele.pop("video_url", None)
-                    ele["type"] = "video"
-                    ele["video"] = str(url)
-                    new_content.append(ele)
-                    videos.append(_VideoSpec(ele=ele, is_file_like=True))
-                    continue
-            if item_type == "video":
-                ele = dict(item)
-                new_content.append(ele)
-                # "video" may be a file path/URI or a list of frames.
-                videos.append(_VideoSpec(ele=ele, is_file_like=isinstance(ele.get("video"), str)))
-                continue
-            new_content.append(item)
-        new_msg = dict(msg)
-        new_msg["content"] = new_content
-        out_messages.append(new_msg)
-    return out_messages, videos
-
-
-def _materialize_video_path(path_or_url: str) -> str:
-    """
-    Ensure OpenCV can read the video (local path/file://, or optionally http(s)/data url).
-    Returns a local filesystem path.
-    """
-    raw = str(path_or_url or "").strip()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty video URL/path.")
-    if raw.startswith("file://"):
-        return raw[7:]
-    if raw.startswith("data:video"):
-        if "base64," not in raw:
-            raise HTTPException(status_code=400, detail="data:video URL must be base64-encoded.")
-        header, b64 = raw.split("base64,", 1)
-        suffix = ".mp4"
-        if ";" in header:
-            mime = header.split(";", 1)[0].removeprefix("data:")
-            if mime.endswith("/webm"):
-                suffix = ".webm"
-            elif mime.endswith("/mp4"):
-                suffix = ".mp4"
-        try:
-            import base64
-
-            data = base64.b64decode(b64, validate=True)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid base64 video data: {exc}") from exc
-        fd, tmp_path = tempfile.mkstemp(prefix="hominem_video_", suffix=suffix)
-        os.close(fd)
-        Path(tmp_path).write_bytes(data)
-        return tmp_path
-    if raw.startswith("http://") or raw.startswith("https://"):
-        if not ALLOW_REMOTE_MEDIA:
-            raise HTTPException(
-                status_code=400,
-                detail="Remote video URLs are disabled (set INFER_ALLOW_REMOTE_MEDIA=true to enable).",
-            )
-        try:
-            import requests
-        except ImportError as exc:
-            raise HTTPException(status_code=500, detail=f"requests not installed: {exc}") from exc
-        fd, tmp_path = tempfile.mkstemp(prefix="hominem_video_", suffix=".mp4")
-        os.close(fd)
-        with requests.get(raw, stream=True, timeout=30) as resp:
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        return tmp_path
-    return raw
 
 
 @app.get("/v1/models")
@@ -427,8 +272,8 @@ def chat_completions(payload: ChatCompletionRequest):
 
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
-    normalized_messages, video_specs = _normalize_video_elements(payload.messages)
-    images, audio = _extract_media(normalized_messages)
+    normalized_messages, video_specs = normalize_video_elements(payload.messages)
+    images, audio = extract_media(normalized_messages)
 
     try:
         from mlx_vlm.generate import generate, stream_generate
@@ -459,7 +304,7 @@ def chat_completions(payload: ChatCompletionRequest):
             if not spec.is_file_like:
                 continue
             try:
-                spec.ele["video"] = _materialize_video_path(str(spec.ele.get("video") or ""))
+                spec.ele["video"] = materialize_video_path(str(spec.ele.get("video") or ""))
             except HTTPException:
                 raise
             except Exception as exc:
@@ -543,6 +388,7 @@ def chat_completions(payload: ChatCompletionRequest):
             created = int(time.time())
             buffer = ""
             saw_tool_call = False
+            think_parser = ThinkStreamParser()
             try:
                 first = {
                     "id": resp_id,
@@ -570,20 +416,76 @@ def chat_completions(payload: ChatCompletionRequest):
                     if not delta:
                         continue
                     buffer += delta
-                    if "<tool_call>" in buffer:
-                        saw_tool_call = True
                     if saw_tool_call:
                         continue
+
+                    tool_idx = delta.find("<tool_call>")
+                    if tool_idx != -1:
+                        prefix = delta[:tool_idx]
+                        if prefix:
+                            c_delta, r_delta = think_parser.feed(prefix)
+                            if r_delta:
+                                payload_chunk = {
+                                    "id": resp_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{"index": 0, "delta": {"reasoning_content": r_delta}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(payload_chunk)}\n\n"
+                            if c_delta:
+                                payload_chunk = {
+                                    "id": resp_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(payload_chunk)}\n\n"
+                        saw_tool_call = True
+                        continue
+
+                    c_delta, r_delta = think_parser.feed(delta)
+                    if r_delta:
+                        payload_chunk = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"reasoning_content": r_delta}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(payload_chunk)}\n\n"
+                    if c_delta:
+                        payload_chunk = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(payload_chunk)}\n\n"
+
+                c_final, r_final = think_parser.finish()
+                if r_final:
                     payload_chunk = {
                         "id": resp_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_id,
-                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"reasoning_content": r_final}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(payload_chunk)}\n\n"
+                if c_final:
+                    payload_chunk = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": c_final}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(payload_chunk)}\n\n"
 
-                final_text, tool_calls = _extract_tool_calls_from_text(buffer)
+                _final_text_no_tools, tool_calls = extract_tool_calls_from_text(buffer)
                 if tool_calls:
                     delta_tc = {
                         "tool_calls": [
@@ -643,18 +545,33 @@ def chat_completions(payload: ChatCompletionRequest):
         **kwargs,
     )
     gc.collect()
-    content, tool_calls = _extract_tool_calls_from_text(gen_result.text)
+    content_raw = gen_result.text
+    content_no_tools, tool_calls = extract_tool_calls_from_text(content_raw)
+    content, reasoning_content = extract_reasoning_from_text(content_no_tools)
     finish_reason = "tool_calls" if tool_calls else "stop"
     event_writer.emit(
         "TurnEvent",
         {
             "model": model_id,
             "messages": normalized_messages,
-            "assistant": {"role": "assistant", "content": content, "tool_calls": tool_calls or None},
+            "assistant": {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning_content or None,
+                "tool_calls": tool_calls or None,
+            },
             "stream": bool(payload.stream),
         },
     )
-    return JSONResponse(_make_response(model_id, content, finish_reason=finish_reason, tool_calls=tool_calls or None))
+    return JSONResponse(
+        _make_response(
+            model_id,
+            content,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls or None,
+            reasoning_content=reasoning_content or None,
+        )
+    )
 
 
 @app.post("/v1/responses")
@@ -695,8 +612,8 @@ def responses(payload: ResponsesRequest):
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
     messages = _responses_input_to_messages(payload)
-    normalized_messages, video_specs = _normalize_video_elements(messages)
-    images, audio = _extract_media(normalized_messages)
+    normalized_messages, video_specs = normalize_video_elements(messages)
+    images, audio = extract_media(normalized_messages)
 
     try:
         from mlx_vlm.generate import generate, stream_generate
@@ -730,7 +647,7 @@ def responses(payload: ResponsesRequest):
             if not spec.is_file_like:
                 continue
             try:
-                spec.ele["video"] = _materialize_video_path(str(spec.ele.get("video") or ""))
+                spec.ele["video"] = materialize_video_path(str(spec.ele.get("video") or ""))
             except HTTPException:
                 raise
             except Exception as exc:
@@ -850,7 +767,7 @@ def responses(payload: ResponsesRequest):
                         + getattr(chunk, "generation_tokens", 0),
                     }
                     yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
-                cleaned, tool_calls = _extract_tool_calls_from_text(full_text)
+                cleaned, tool_calls = extract_tool_calls_from_text(full_text)
                 yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': cleaned})}\n\n"
                 final_content_part = {"type": "output_text", "text": cleaned, "annotations": []}
                 yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_content_part})}\n\n"
@@ -904,7 +821,7 @@ def responses(payload: ResponsesRequest):
         **kwargs,
     )
     gc.collect()
-    content, tool_calls = _extract_tool_calls_from_text(gen_result.text)
+    content, tool_calls = extract_tool_calls_from_text(gen_result.text)
     response_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"
     tool_items = _tool_calls_to_responses_output_items(tool_calls) if tool_calls else []
