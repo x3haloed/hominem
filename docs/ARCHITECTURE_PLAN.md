@@ -22,7 +22,7 @@ apps/
 - apps/hominem-agent/ (Python, Qwen-Agent): owns planning + tool calling loop, emits tool events.
 - apps/hominem-core/ (Rust): log writer/reader, rotation, indexing, scheduling.
 - apps/hominem-tools/ (Rust or Python): optional tool execution sandbox if not using Qwen-Agent tools directly.
-- apps/hominem-ui/ (static SPA): UI client that talks to hominem-agent over HTTP.
+- Open WebUI (external service): primary UI, configured to use hominem-agent as an OpenAI-compatible backend.
 
 crates/
 - crates/log/ : JSONL.zst writer/reader, ULID, rotation, offsets.
@@ -104,6 +104,7 @@ Event-driven wrapper
 - apps/training_factory/ becomes a training binary or python/hominem_train/ (no canonical storage).
 - database.py becomes a derived index or is replaced by log consumers.
 - training_logger.py JSONL legacy mode is removed or updated to log format.
+- Open WebUI is version-pinned (dependency or deployment pin) and treated as an external service.
 
 ## Immediate Next Steps (If You Choose)
 - Define event schemas for DatasetQueryRequested, DatasetBuilt, TrainingRunCompleted.
@@ -119,3 +120,4 @@ Event-driven wrapper
   - ToolInvocationRequested (tool name, args, parent turn)
   - ToolInvocationResult (tool name, result, status, timing)
 - hominem-infer remains stateless and does not execute tools.
+- hominem-agent exposes OpenAI-compatible `/v1/models` and `/v1/chat/completions` for Open WebUI.
