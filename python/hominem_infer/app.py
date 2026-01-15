@@ -26,6 +26,15 @@ BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")
 
 _MODEL_CACHE: Dict[str, Any] = {}
 
+_DEBUG_PROMPT_DUMP_ENABLED = os.getenv("INFER_DEBUG_PROMPT_DUMP", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+_DEBUG_PROMPT_DUMP_DIR = os.getenv("INFER_DEBUG_PROMPT_DUMP_DIR", "").strip()
+
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -61,6 +70,19 @@ class ResponsesRequest(BaseModel):
 class ModelList(BaseModel):
     object: str = "list"
     data: List[Dict[str, Any]]
+
+
+def _dump_templatized_prompt(*, prompt: str, model_id: str, endpoint: str) -> None:
+    if not _DEBUG_PROMPT_DUMP_ENABLED:
+        return
+    try:
+        target_dir = Path(_DEBUG_PROMPT_DUMP_DIR) if _DEBUG_PROMPT_DUMP_DIR else Path.cwd()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = target_dir / f"infer_prompt_{endpoint}_{int(time.time())}_{uuid.uuid4().hex}.txt"
+        dump_path.write_text(prompt, encoding="utf-8")
+    except Exception:
+        # Debug-only; never fail inference because of prompt dumping.
+        return
 
 
 def _extract_text(content: Any) -> str:
@@ -377,6 +399,7 @@ def chat_completions(payload: ChatCompletionRequest):
                 status_code=500,
                 detail=f"Processor chat_template failure: {exc}",
             ) from exc
+    _dump_templatized_prompt(prompt=prompt, model_id=model_id, endpoint="chat_completions")
 
     max_tokens = payload.max_tokens or payload.max_completion_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
@@ -703,6 +726,7 @@ def responses(payload: ResponsesRequest):
                     detail=f"Model chat_template does not support tools: {exc}",
                 ) from exc
             raise HTTPException(status_code=500, detail=f"Processor chat_template failure: {exc}") from exc
+    _dump_templatized_prompt(prompt=prompt, model_id=model_id, endpoint="responses")
     max_tokens = payload.max_output_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
     top_p = payload.top_p if payload.top_p is not None else 1.0

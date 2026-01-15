@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -59,6 +61,29 @@ class ChatOut(BaseModel):
     session_id: str
     assistant: str
     messages: List[Dict[str, Any]]
+
+
+_DEBUG_DUMP_ENABLED = os.getenv("HOMINEM_AGENT_DEBUG_DUMP", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+_DEBUG_DUMP_DIR = os.getenv("HOMINEM_AGENT_DEBUG_DUMP_DIR", "").strip()
+
+
+def _dump_debug_json(*, name: str, payload: Any) -> None:
+    if not _DEBUG_DUMP_ENABLED:
+        return
+    try:
+        target_dir = Path(_DEBUG_DUMP_DIR) if _DEBUG_DUMP_DIR else Path.cwd()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"agent_debug_{name}_{int(time.time())}_{uuid.uuid4().hex}.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+    except Exception:
+        return
+
 
 def _merge_maybe_delta_str(existing: Any, incoming: Any) -> Any:
     """
@@ -146,6 +171,7 @@ def _accumulate_agent_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[st
         cleaned.append(msg)
     return cleaned
 
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(
@@ -188,6 +214,15 @@ def chat(payload: ChatIn) -> ChatOut:
     else:
         user_content = payload.message
     session.messages.append({"role": "user", "content": user_content})
+    _dump_debug_json(
+        name="chat_request",
+        payload={
+            "req_id": req_id,
+            "session_id": session_id,
+            "user": user_content,
+            "messages_before": session.messages,
+        },
+    )
 
     try:
         responses_iter = agent.run(messages=session.messages)
@@ -206,6 +241,15 @@ def chat(payload: ChatIn) -> ChatOut:
         raise HTTPException(status_code=500, detail="Agent produced no response.")
 
     last_norm = _accumulate_agent_chunks(chunks)
+    _dump_debug_json(
+        name="chat_response_raw",
+        payload={
+            "req_id": req_id,
+            "session_id": session_id,
+            "chunks": chunks,
+            "last_normalized": last_norm,
+        },
+    )
 
     # Qwen-Agent returns a list of message dicts; take the last assistant content if present.
     assistant_text = ""
@@ -216,6 +260,7 @@ def chat(payload: ChatIn) -> ChatOut:
 
     session.messages.extend(last_norm)
     return ChatOut(session_id=session_id, assistant=assistant_text, messages=session.messages)
+
 
 @app.post("/api/chat/stream")
 def chat_stream(payload: ChatIn):
@@ -242,6 +287,16 @@ def chat_stream(payload: ChatIn):
     else:
         user_content = payload.message
     session.messages.append({"role": "user", "content": user_content})
+
+    _dump_debug_json(
+        name="chat_stream_request",
+        payload={
+            "req_id": req_id,
+            "session_id": session_id,
+            "user": user_content,
+            "messages_before": session.messages,
+        },
+    )
 
     def gen():
         yield json.dumps({"type": "start", "session_id": session_id}, ensure_ascii=False) + "\n"
@@ -313,6 +368,15 @@ def chat_stream(payload: ChatIn):
                 break
 
         session.messages.extend(last_norm)
+        _dump_debug_json(
+            name="chat_stream_response",
+            payload={
+                "req_id": req_id,
+                "session_id": session_id,
+                "chunks": chunks,
+                "last_normalized": last_norm,
+            },
+        )
         yield json.dumps(
             {
                 "type": "done",

@@ -48,4 +48,3 @@ def default_tools() -> List[Any]:
         raise RuntimeError(f"Failed to import default tools: {exc}") from exc
 
     return [DescribeFile(), ExtractSection(), ReplaceSection()]
-
