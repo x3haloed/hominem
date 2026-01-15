@@ -1,6 +1,6 @@
 # Agent UI Quickstart
 
-Goal: run a minimal loop `UI → Qwen-Agent → hominem_infer → Qwen-Agent → UI`.
+Goal: run a minimal loop `Open WebUI → hominem_agent → hominem_infer → hominem_agent → Open WebUI`.
 
 ## 1) Start `hominem_infer`
 
@@ -15,7 +15,7 @@ python3 -m hominem_infer
 Optional:
 - `INFER_MODEL_ID`: model to load (defaults in `python/hominem_infer/app.py`).
 
-## 2) Start `hominem_agent` (UI-first)
+## 2) Start `hominem_agent` (OpenAI-compatible API)
 
 ```bash
 PYTHONPATH=python \
@@ -25,7 +25,13 @@ HOMINEM_AGENT_PORT=8020 \
 python3 -m hominem_agent
 ```
 
-Open `http://127.0.0.1:8020/`.
+Open `http://127.0.0.1:8020/` for a quick health check.
+
+## 3) Start Open WebUI
+
+Set the OpenAI base URL to point at `hominem_agent`:
+- Base URL: `http://127.0.0.1:8020/v1`
+- API key: optional (can be blank)
 
 ## Notes
 

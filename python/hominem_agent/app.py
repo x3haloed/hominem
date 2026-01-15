@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from hominem_agent.agent import build_agent, default_tools
@@ -20,8 +20,15 @@ app = FastAPI(title="Hominem Agent")
 
 _CORS_ORIGINS = [o.strip() for o in os.getenv("HOMINEM_UI_CORS_ORIGINS", "").split(",") if o.strip()]
 if not _CORS_ORIGINS:
-    # Default dev origin for `apps/hominem-ui` (Vite).
-    _CORS_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    # Common Open WebUI dev/prod origins.
+    _CORS_ORIGINS = [
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,14 +38,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@dataclass
-class Session:
-    session_id: str
-    messages: List[Dict[str, Any]] = field(default_factory=list)
-
-
-_SESSIONS: Dict[str, Session] = {}
 _AGENT = None
 
 
@@ -49,51 +48,48 @@ def _get_agent():
     return _AGENT
 
 
-class ChatIn(BaseModel):
+def _get_model_id() -> str:
+    model = os.getenv("HOMINEM_AGENT_MODEL", os.getenv("INFER_MODEL_ID", "")).strip()
+    if not model:
+        model = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+    return model
+
+
+class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-    session_id: Optional[str] = None
-    message: str
-    # OpenAI-style list-of-parts content is allowed for multimodal.
-    content: Optional[List[Dict[str, Any]]] = None
-
-
-class ChatOut(BaseModel):
-    session_id: str
-    assistant: str
+    model: Optional[str] = None
     messages: List[Dict[str, Any]]
+    stream: bool | None = False
+    tools: List[Dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    stream_options: Dict[str, Any] | None = None
 
 
-_DEBUG_DUMP_ENABLED = os.getenv("HOMINEM_AGENT_DEBUG_DUMP", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-}
-_DEBUG_DUMP_DIR = os.getenv("HOMINEM_AGENT_DEBUG_DUMP_DIR", "").strip()
-
-
-def _dump_debug_json(*, name: str, payload: Any) -> None:
-    if not _DEBUG_DUMP_ENABLED:
-        return
-    try:
-        target_dir = Path(_DEBUG_DUMP_DIR) if _DEBUG_DUMP_DIR else Path.cwd()
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"agent_debug_{name}_{int(time.time())}_{uuid.uuid4().hex}.json"
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
-    except Exception:
-        return
+def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = (msg.get("role") or "user").strip().lower()
+        if role == "developer":
+            role = "system"
+        if role not in {"system", "user", "assistant", "tool"}:
+            role = "user"
+        content = msg.get("content")
+        if content is None:
+            content = ""
+        normalized_msg: Dict[str, Any] = {"role": role, "content": content}
+        if role == "assistant" and msg.get("tool_calls") is not None:
+            normalized_msg["tool_calls"] = msg.get("tool_calls")
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id") or msg.get("toolCallId")
+            if tool_call_id:
+                normalized_msg["tool_call_id"] = tool_call_id
+        normalized.append(normalized_msg)
+    return normalized
 
 
 def _merge_maybe_delta_str(existing: Any, incoming: Any) -> Any:
-    """
-    Merge a possibly-streamed string field.
-
-    Some clients emit cumulative strings; others emit deltas. We handle both:
-    - If incoming starts with existing, treat it as cumulative and take incoming.
-    - If existing starts with incoming, keep existing.
-    - Otherwise, append incoming (treat as delta).
-    """
     if not isinstance(incoming, str):
         return incoming
     if not isinstance(existing, str) or not existing:
@@ -103,6 +99,18 @@ def _merge_maybe_delta_str(existing: Any, incoming: Any) -> Any:
     if existing.startswith(incoming):
         return existing
     return existing + incoming
+
+
+def _extract_delta(previous: str, incoming: str) -> tuple[str, str]:
+    if not incoming:
+        return previous, ""
+    if not previous:
+        return incoming, incoming
+    if incoming.startswith(previous):
+        return incoming, incoming[len(previous):]
+    if previous.startswith(incoming):
+        return previous, ""
+    return previous + incoming, incoming
 
 
 def _merge_tool_calls(existing: Any, incoming: Any) -> Any:
@@ -127,14 +135,6 @@ def _merge_tool_calls(existing: Any, incoming: Any) -> Any:
 
 
 def _accumulate_agent_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """
-    Accumulate qwen-agent streamed output into a single list of new messages to append.
-
-    `qwen-agent` often yields many chunks; each chunk may contain partial updates
-    ("deltas") for fields like `content` and `reasoning_content`. Those deltas
-    should be merged into a single assistant message for the turn, not treated as
-    separate messages.
-    """
     out: List[Dict[str, Any]] = []
 
     for chunk in chunks:
@@ -146,7 +146,6 @@ def _accumulate_agent_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[st
             role = (msg.get("role") or "").strip().lower()
 
             if role == "assistant" and out and (out[-1].get("role") or "").strip().lower() == "assistant":
-                # Merge streamed assistant fields into the last assistant message.
                 out[-1]["content"] = _merge_maybe_delta_str(out[-1].get("content", ""), msg.get("content", ""))
                 if "reasoning_content" in msg:
                     out[-1]["reasoning_content"] = _merge_maybe_delta_str(
@@ -157,11 +156,8 @@ def _accumulate_agent_chunks(chunks: List[List[Dict[str, Any]]]) -> List[Dict[st
                     out[-1]["tool_calls"] = _merge_tool_calls(out[-1].get("tool_calls"), msg.get("tool_calls"))
                 continue
 
-            # If we see an assistant message that only has reasoning_content, we still create it,
-            # expecting a later delta to fill `content` into the same message.
             out.append(dict(msg))
 
-    # Drop any assistant messages that never received any payload (shouldn't happen, but avoids UI artifacts).
     cleaned: List[Dict[str, Any]] = []
     for msg in out:
         role = (msg.get("role") or "").strip().lower()
@@ -182,12 +178,10 @@ def index():
     <h1 style="margin: 0 0 8px 0;">Hominem Agent</h1>
     <p style="margin: 0 0 16px 0;">API server for orchestration + tool calling.</p>
     <ul>
-      <li><code>POST /api/chat</code></li>
+      <li><code>GET /v1/models</code></li>
+      <li><code>POST /v1/chat/completions</code></li>
       <li><code>GET /health</code></li>
     </ul>
-    <p style="margin-top: 16px;">
-      UI is now a separate SPA: <code>apps/hominem-ui</code>.
-    </p>
   </body>
 </html>"""
     )
@@ -198,36 +192,181 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/chat", response_model=ChatOut)
-def chat(payload: ChatIn) -> ChatOut:
+@app.get("/v1/models")
+def list_models() -> Dict[str, Any]:
+    model_id = _get_model_id()
+    created = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": "hominem",
+            }
+        ],
+    }
+
+
+def _run_agent(
+    *,
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    tool_choice: Any | None,
+) -> Iterable[List[Dict[str, Any]]]:
+    kwargs: Dict[str, Any] = {"messages": messages}
+    sig = None
+    try:
+        sig = inspect.signature(agent.run)
+    except Exception:
+        sig = None
+    if sig is not None:
+        if "tools" in sig.parameters:
+            kwargs["tools"] = tools
+        if "tool_choice" in sig.parameters:
+            kwargs["tool_choice"] = tool_choice
+    return agent.run(**kwargs)
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(payload: ChatCompletionRequest) -> Any:
     agent = _get_agent()
     req_id = f"req_{uuid.uuid4().hex}"
+    model_name = payload.model or _get_model_id()
+    normalized_messages = _normalize_messages(payload.messages)
 
-    session_id = (payload.session_id or "").strip() or f"sess_{uuid.uuid4().hex}"
-    session = _SESSIONS.get(session_id)
-    if session is None:
-        session = Session(session_id=session_id)
-        _SESSIONS[session_id] = session
+    tools = payload.tools
+    if payload.tool_choice == "none":
+        tools = None
 
-    if payload.content is not None:
-        user_content: Any = payload.content
-    else:
-        user_content = payload.message
-    session.messages.append({"role": "user", "content": user_content})
-    _dump_debug_json(
-        name="chat_request",
-        payload={
-            "req_id": req_id,
-            "session_id": session_id,
-            "user": user_content,
-            "messages_before": session.messages,
-        },
-    )
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
 
     try:
-        responses_iter = agent.run(messages=session.messages)
+        responses_iter = _run_agent(
+            agent=agent,
+            messages=normalized_messages,
+            tools=tools,
+            tool_choice=payload.tool_choice,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent run failed: {exc}") from exc
+
+    def build_response(
+        *,
+        assistant_text: str | None,
+        tool_calls: List[Dict[str, Any]] | None,
+        finish_reason: str,
+    ) -> Dict[str, Any]:
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": assistant_text if assistant_text else None,
+                        "tool_calls": tool_calls,
+                    },
+                    "logprobs": None,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+
+    if payload.stream:
+        def event_stream() -> Iterable[str]:
+            def send_chunk(
+                *,
+                delta_content: str | None = None,
+                delta_role: str | None = None,
+                delta_tool_calls: List[Dict[str, Any]] | None = None,
+                finish_reason: str | None = None,
+                usage: Dict[str, Any] | None = None,
+            ) -> str:
+                delta: Dict[str, Any] = {}
+                if delta_role:
+                    delta["role"] = delta_role
+                if delta_content is not None:
+                    delta["content"] = delta_content
+                if delta_tool_calls is not None:
+                    delta["tool_calls"] = delta_tool_calls
+                if usage is not None:
+                    payload = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                        "usage": usage,
+                    }
+                else:
+                    payload = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                    }
+                return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            assistant_content = ""
+            tool_calls: List[Dict[str, Any]] | None = None
+            yield send_chunk(delta_role="assistant")
+
+            try:
+                for chunk in responses_iter:
+                    if not chunk:
+                        continue
+                    for msg in chunk:
+                        if not isinstance(msg, dict):
+                            continue
+                        if (msg.get("role") or "").strip().lower() != "assistant":
+                            continue
+                        content = msg.get("content") or ""
+                        assistant_content, delta = _extract_delta(assistant_content, str(content))
+                        if delta:
+                            yield send_chunk(delta_content=delta)
+                        if "tool_calls" in msg:
+                            merged = _merge_tool_calls(tool_calls, msg.get("tool_calls"))
+                            if merged != tool_calls:
+                                tool_calls = merged
+                                if tool_calls:
+                                    yield send_chunk(delta_tool_calls=tool_calls)
+            except Exception as exc:
+                error_payload = {
+                    "error": {
+                        "message": f"Agent streaming failed: {exc}",
+                        "type": "server_error",
+                    }
+                }
+                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            if payload.stream_options and payload.stream_options.get("include_usage"):
+                yield send_chunk(
+                    usage={
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                    }
+                )
+            yield send_chunk(finish_reason=finish_reason)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     chunks: List[List[Dict[str, Any]]] = []
     try:
@@ -241,150 +380,18 @@ def chat(payload: ChatIn) -> ChatOut:
         raise HTTPException(status_code=500, detail="Agent produced no response.")
 
     last_norm = _accumulate_agent_chunks(chunks)
-    _dump_debug_json(
-        name="chat_response_raw",
-        payload={
-            "req_id": req_id,
-            "session_id": session_id,
-            "chunks": chunks,
-            "last_normalized": last_norm,
-        },
-    )
 
-    # Qwen-Agent returns a list of message dicts; take the last assistant content if present.
-    assistant_text = ""
+    assistant_text = None
+    tool_calls: List[Dict[str, Any]] | None = None
     for msg_obj in reversed(last_norm):
         if msg_obj.get("role") == "assistant":
-            assistant_text = str(msg_obj.get("content") or "")
+            assistant_text = str(msg_obj.get("content") or "") or None
+            tool_calls = msg_obj.get("tool_calls")
             break
 
-    session.messages.extend(last_norm)
-    return ChatOut(session_id=session_id, assistant=assistant_text, messages=session.messages)
-
-
-@app.post("/api/chat/stream")
-def chat_stream(payload: ChatIn):
-    """
-    Stream chat updates as newline-delimited JSON (NDJSON).
-
-    Events:
-    - {"type":"start","session_id":...}
-    - {"type":"assistant","assistant": {...}}  (snapshot-style updates)
-    - {"type":"done","session_id":...,"assistant":...,"messages":[...]}
-    - {"type":"error","detail":...}
-    """
-    agent = _get_agent()
-    req_id = f"req_{uuid.uuid4().hex}"
-
-    session_id = (payload.session_id or "").strip() or f"sess_{uuid.uuid4().hex}"
-    session = _SESSIONS.get(session_id)
-    if session is None:
-        session = Session(session_id=session_id)
-        _SESSIONS[session_id] = session
-
-    if payload.content is not None:
-        user_content: Any = payload.content
-    else:
-        user_content = payload.message
-    session.messages.append({"role": "user", "content": user_content})
-
-    _dump_debug_json(
-        name="chat_stream_request",
-        payload={
-            "req_id": req_id,
-            "session_id": session_id,
-            "user": user_content,
-            "messages_before": session.messages,
-        },
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    return build_response(
+        assistant_text=assistant_text,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
     )
-
-    def gen():
-        yield json.dumps({"type": "start", "session_id": session_id}, ensure_ascii=False) + "\n"
-
-        chunks: List[List[Dict[str, Any]]] = []
-        assistant_state: Dict[str, Any] = {"role": "assistant", "content": "", "reasoning_content": ""}
-        last_sent_key = ""
-
-        try:
-            responses_iter = agent.run(messages=session.messages)
-        except Exception as exc:
-            yield json.dumps({"type": "error", "detail": f"Agent run failed: {exc}"}, ensure_ascii=False) + "\n"
-            return
-
-        try:
-            for chunk in responses_iter:
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-
-                # Merge assistant updates within this chunk into a single snapshot state.
-                for msg in chunk:
-                    if not isinstance(msg, dict):
-                        continue
-                    if (msg.get("role") or "").strip().lower() != "assistant":
-                        continue
-                    assistant_state["content"] = _merge_maybe_delta_str(
-                        assistant_state.get("content", ""),
-                        msg.get("content", ""),
-                    )
-                    if "reasoning_content" in msg:
-                        assistant_state["reasoning_content"] = _merge_maybe_delta_str(
-                            assistant_state.get("reasoning_content", ""),
-                            msg.get("reasoning_content", ""),
-                        )
-                    if "tool_calls" in msg:
-                        assistant_state["tool_calls"] = _merge_tool_calls(
-                            assistant_state.get("tool_calls"),
-                            msg.get("tool_calls"),
-                        )
-
-                key = json.dumps(
-                    {
-                        "content": assistant_state.get("content") or "",
-                        "reasoning_content": assistant_state.get("reasoning_content") or "",
-                        "tool_calls": assistant_state.get("tool_calls"),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                )
-                if key != last_sent_key:
-                    last_sent_key = key
-                    yield json.dumps({"type": "assistant", "assistant": assistant_state}, ensure_ascii=False) + "\n"
-
-        except Exception as exc:
-            yield json.dumps({"type": "error", "detail": f"Agent streaming failed: {exc}"}, ensure_ascii=False) + "\n"
-            return
-
-        last_norm = _accumulate_agent_chunks(chunks)
-        if not last_norm:
-            yield json.dumps({"type": "error", "detail": "Agent produced no response."}, ensure_ascii=False) + "\n"
-            return
-
-        assistant_text = ""
-        for msg_obj in reversed(last_norm):
-            if msg_obj.get("role") == "assistant":
-                assistant_text = str(msg_obj.get("content") or "")
-                break
-
-        session.messages.extend(last_norm)
-        _dump_debug_json(
-            name="chat_stream_response",
-            payload={
-                "req_id": req_id,
-                "session_id": session_id,
-                "chunks": chunks,
-                "last_normalized": last_norm,
-            },
-        )
-        yield json.dumps(
-            {
-                "type": "done",
-                "session_id": session_id,
-                "assistant": assistant_text,
-                "messages": session.messages,
-            },
-            ensure_ascii=False,
-        ) + "\n"
-
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
