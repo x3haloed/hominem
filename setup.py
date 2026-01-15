@@ -13,10 +13,15 @@ setup(
         "agent": [
             "qwen-agent>=0.0.31",
             "openai>=1.0.0",
-        ],
-        "agent_ui": [
             "fastapi>=0.104.0",
             "uvicorn[standard]>=0.24.0",
+        ],
+        "infer": [
+            "fastapi>=0.104.0",
+            "uvicorn[standard]>=0.24.0",
+        ],
+        "open_webui": [
+            "open-webui==0.7.2",
         ],
         "training_factory": [
             "fastapi>=0.104.0",
