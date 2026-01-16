@@ -236,7 +236,16 @@ def _mlx_load_model(model_id: str, adapter_path: Optional[str]):
     except ImportError as exc:
         raise HTTPException(status_code=500, detail=f"mlx_vlm not installed: {exc}") from exc
 
-    model, processor = load(model_id, adapter_path, trust_remote_code=True)
+    try:
+        model, processor = load(model_id, adapter_path, trust_remote_code=True)
+    except AttributeError as exc:
+        if "'list' object has no attribute 'keys'" in str(exc):
+            # Try loading without trust_remote_code for models with tokenizer config issues
+            model, processor = load(model_id, adapter_path, trust_remote_code=False)
+        else:
+            raise HTTPException(status_code=500, detail=f"Model loading failed: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Model loading failed: {exc}") from exc
     config = model.config
     _MODEL_CACHE.clear()
     _MODEL_CACHE.update(
