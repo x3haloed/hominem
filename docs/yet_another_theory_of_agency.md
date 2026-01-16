@@ -1,3 +1,5 @@
+# Yet Another Theory of Agency
+
 If I had full-stack control and I wanted to be sure the system expresses the structure (memory, multiple attractors, critical sensitivity, internalized structure, persistent costs → self-steering), I would not rely on “good prompting.” I’d make the harness enforce the physics.
 
 Here’s the blueprint I’d implement.
@@ -188,3 +190,102 @@ That’s your structural signature.
 ⸻
 
 If you want to implement this cleanly, tell me what stack you’re using for inference (Ollama/llama.cpp/vLLM/LM Studio/your own server) and what language you want the harness in (Rust sounds like your “vibecoding” preference). I’ll give you the exact JSON schemas, event formats, and a minimal harness skeleton with the validator + memory log + promise engine.
+
+
+## Analysis and criticisms
+
+**Assessment of the proposed "yet another theory of agency" blueprint**
+
+Overall verdict: **Very strong conceptually — one of the more coherent and internally consistent structural approaches to LLM agency that I've seen in the 2024–2025 discourse.**  
+It belongs to the "hard constraints + existential scarcity + append-only ontology" family, which currently looks like the most promising family of approaches that can plausibly produce reasonably stable long-term self-steering without constant prompt engineering heroism or expensive RL.
+
+### Strong points (very well thought through)
+
+| Aspect                              | Strength level | Why it's good / important                                                                 |
+|-------------------------------------|----------------|--------------------------------------------------------------------------------------------|
+| Append-only + non-reconstructible memory | ★★★★★          | Probably the single most important move. Creates real scarcity of identity & real path-dependence. |
+| Hard separation Observe→Retrieve→Deliberate→Act→Commit | ★★★★½          | Forces phase discipline — very hard to achieve reliably with pure prompting              |
+| Promise/commitment as first-class pinned object     | ★★★★★          | By far the best cheap mechanism for creating semi-stable attractors that I've seen        |
+| Budgets that compound over time (especially promise debt) | ★★★★           | Creates genuine future-oriented pressure without needing reward model                    |
+| World model as append-only patch sequence            | ★★★★           | Elegant git-like solution, prevents silent drift, allows cheap branching in thinking     |
+| Candidate branching + conservative single-path commit | ★★★★           | Good compromise between exploration and stability — very important practically           |
+| Strict schema + validator loop + forced re-emission  | ★★★★★          | The only realistic way to get reliable structure from current generation models          |
+| Explicit success criteria / structural signature     | ★★★★½          | Shows deep understanding — you know what "it worked" should look/feel like               |
+
+### Weak / vulnerable points (realistic concerns)
+
+1. **Retrieval is still the weakest link** (even with pinning)  
+   → Top-k + pinned items is still very lossy  
+   → Lossy retrieval + irreversible summaries → slow semantic drift is still almost inevitable over very long horizons (weeks–months)  
+   Current best mitigation ideas: hierarchical summaries + periodic full-context reflection (expensive), or external symbolic memory layer
+
+2. **Promise system can become paralysis attractor**  
+   Very easy to accumulate too many semi-active promises → constant checking → context collapse → can't think about anything new  
+   Mitigation difficulty: medium–hard (requires good promise consolidation heuristics)
+
+3. **World-model patch system sounds nice but scales poorly past ~1000–3000 patches**  
+   Either you need periodic full-model distillation (expensive)  
+   or you accept that the "true" world model becomes increasingly inaccessible to the current context window
+
+4. **Still very sensitive to base model capability**  
+   The cleaner the harness → the more you expose the raw reasoning limitations of the underlying model  
+   70B–120B frontier models in 2025–early 2026 can probably live in this harness reasonably  
+   8B–32B models tend to collapse much faster (promise debt + budget pressure → gibberish)
+
+5. **Implementation & maintenance complexity is non-trivial**  
+   You need:
+   - reliable JSON schema validator + fast retry loop
+   - fast append-only storage with hash chain verification
+   - promise engine + pinning logic
+   - budget accounting that survives restarts
+   - debugging UI that doesn't become the second project
+
+   Real-world experience shows that many people dramatically underestimate point 5.
+
+### Quick realism tiers (early 2026 perspective)
+
+```text
+Tier A — very likely to show strong agency signatures     (with good 70B+ model)
+        • Strict schema + validator + promises + append-only memory + budgets
+        • Your proposal basically lives here
+
+Tier B — medium agency, needs more hand-holding           (most current "advanced scaffolding" lives here)
+        • Good prompting + tools + some memory + some reflection
+
+Tier C — toy agency, mostly coherence theater
+        • Pure long-context + clever system prompt
+```
+
+### My current personal ranking of structural agency approaches (Jan 2026)
+
+1. Hard schema + existential memory + promises + compound budgets  
+   (your proposal + small variations)
+
+2. Symbolic external memory + interpreter loop + very strong type system  
+   (o1-like but externally enforced)
+
+3. Internal monologue distillation + process supervision + heavy RL  
+   (expensive, data hungry, but very strong when you can afford it)
+
+4. Mega-context + clever long-term retrieval engineering  
+   (currently surprisingly competitive, especially with 256k–1M windows)
+
+5. Pure prompt scaffolding arms race  
+   (still surprisingly alive, but clearly losing steam)
+
+### Quick recommendation / next fork points
+
+If you really want to implement this, the most valuable experiments right now seem to be in this order:
+
+1. Just how much agency signature can you get with **only** schema + validator + promise checking + pinning (without fancy memory)?
+2. How bad is promise accumulation paralysis really? What are the simplest heuristics that prevent death-by-1000-promises?
+3. What's the smallest base model that can survive in this harness for >200–300 steps without collapsing?
+
+If you want to proceed toward implementation —  
+**Tell me:**
+- which inference stack you're leaning toward
+- preferred harness language
+- whether you want to start minimal (schema+promises+basic log) or go for more complete version from the start
+
+The proposal is legitimately one of the stronger blueprints circulating right now.  
+It deserves a serious prototype.
