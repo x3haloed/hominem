@@ -113,6 +113,65 @@ def _extract_delta(previous: str, incoming: str) -> tuple[str, str]:
     return previous + incoming, incoming
 
 
+def _process_qwen_tool_calls(chunks: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Convert Qwen-Agent tool call format to OpenAI format."""
+    import re
+    from hominem_agent.tools.openai_tools import execute_tool
+
+    processed = []
+    tool_call_id = f"call_{uuid.uuid4().hex}"
+
+    for chunk in chunks:
+        for msg in chunk:
+            # Ensure msg is a dict
+            if not isinstance(msg, dict):
+                continue
+
+            if msg.get("role") == "assistant" and "content" in msg:
+                content = msg["content"]
+                # Look for Qwen tool call format: {"name": "...", "arguments": {...}}</tool_call>
+                tool_match = re.search(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', content, re.DOTALL)
+                if tool_match:
+                    try:
+                        tool_data = json.loads(tool_match.group(1))
+                        tool_name = tool_data.get("name")
+                        tool_args = tool_data.get("arguments", {})
+
+                        # Execute the tool
+                        tool_result = execute_tool(tool_name, **tool_args)
+
+                        # Create OpenAI format tool call
+                        tool_call = {
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(tool_args)
+                            }
+                        }
+
+                        # Replace content with clean version and add tool_calls
+                        clean_content = content.replace(tool_match.group(0), "").strip()
+                        msg["content"] = clean_content if clean_content else None
+                        msg["tool_calls"] = [tool_call]
+
+                        # Add tool result message
+                        processed.append(msg)
+                        processed.append({
+                            "role": "tool",
+                            "content": json.dumps(tool_result),
+                            "tool_call_id": tool_call_id
+                        })
+                        continue
+                    except (json.JSONDecodeError, KeyError, Exception) as e:
+                        # If parsing fails, keep original content
+                        pass
+
+            processed.append(msg)
+
+    return processed
+
+
 def _merge_tool_calls(existing: Any, incoming: Any) -> Any:
     if not incoming:
         return existing
@@ -251,6 +310,20 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
             tools=tools,
             tool_choice=payload.tool_choice,
         )
+
+        # Collect all responses to process tool calls
+        all_chunks = []
+        for chunk in responses_iter:
+            if chunk:
+                all_chunks.extend(chunk)
+
+        # Process tool calls from Qwen-Agent format to OpenAI format
+        if all_chunks:
+            processed_chunks = _process_qwen_tool_calls([all_chunks])
+            responses_iter = iter([processed_chunks])
+        else:
+            # If no chunks, create empty response
+            responses_iter = iter([[]])
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent run failed: {exc}") from exc
 
@@ -320,29 +393,12 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
                     }
                 return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-            assistant_content = ""
-            tool_calls: List[Dict[str, Any]] | None = None
-            yield send_chunk(delta_role="assistant")
-
+            # Process all chunks first for tool calls
+            all_chunks = []
             try:
                 for chunk in responses_iter:
-                    if not chunk:
-                        continue
-                    for msg in chunk:
-                        if not isinstance(msg, dict):
-                            continue
-                        if (msg.get("role") or "").strip().lower() != "assistant":
-                            continue
-                        content = msg.get("content") or ""
-                        assistant_content, delta = _extract_delta(assistant_content, str(content))
-                        if delta:
-                            yield send_chunk(delta_content=delta)
-                        if "tool_calls" in msg:
-                            merged = _merge_tool_calls(tool_calls, msg.get("tool_calls"))
-                            if merged != tool_calls:
-                                tool_calls = merged
-                                if tool_calls:
-                                    yield send_chunk(delta_tool_calls=tool_calls)
+                    if chunk:
+                        all_chunks.extend(chunk)
             except Exception as exc:
                 error_payload = {
                     "error": {
@@ -353,6 +409,38 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
                 yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+
+            # Process tool calls
+            processed_chunks = _process_qwen_tool_calls([all_chunks]) if all_chunks else []
+
+            # Stream the processed chunks
+            assistant_content = ""
+            tool_calls: List[Dict[str, Any]] | None = None
+            yielded_assistant = False
+
+            for msg in processed_chunks:
+                if msg.get("role") == "assistant":
+                    if not yielded_assistant:
+                        yield send_chunk(delta_role="assistant")
+                        yielded_assistant = True
+
+                    content = msg.get("content") or ""
+                    if content:
+                        assistant_content, delta = _extract_delta(assistant_content, str(content))
+                        if delta:
+                            yield send_chunk(delta_content=delta)
+
+                    if "tool_calls" in msg:
+                        merged = _merge_tool_calls(tool_calls, msg.get("tool_calls"))
+                        if merged != tool_calls:
+                            tool_calls = merged
+                            if tool_calls:
+                                yield send_chunk(delta_tool_calls=tool_calls)
+
+                elif msg.get("role") == "tool":
+                    # Tool results are sent as separate messages, but for streaming
+                    # we might need to handle this differently. For now, skip tool results in streaming.
+                    pass
 
             finish_reason = "tool_calls" if tool_calls else "stop"
             if payload.stream_options and payload.stream_options.get("include_usage"):
@@ -368,6 +456,7 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+    # For non-streaming, process all chunks and tool calls
     chunks: List[List[Dict[str, Any]]] = []
     try:
         for chunk in responses_iter:
@@ -379,11 +468,12 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
     if not chunks:
         raise HTTPException(status_code=500, detail="Agent produced no response.")
 
-    last_norm = _accumulate_agent_chunks(chunks)
+    # Process tool calls from Qwen format to OpenAI format
+    processed_chunks = _process_qwen_tool_calls(chunks)
 
     assistant_text = None
     tool_calls: List[Dict[str, Any]] | None = None
-    for msg_obj in reversed(last_norm):
+    for msg_obj in reversed(processed_chunks):
         if msg_obj.get("role") == "assistant":
             assistant_text = str(msg_obj.get("content") or "") or None
             tool_calls = msg_obj.get("tool_calls")

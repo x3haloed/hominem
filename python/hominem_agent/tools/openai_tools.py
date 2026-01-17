@@ -1,0 +1,172 @@
+"""
+OpenAI-style tool definitions and implementations.
+
+These replace the Qwen-Agent BaseTool classes with pure OpenAI-compatible
+function schemas and execution functions.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from typing import Any, Dict, List
+
+# OpenAI tool schemas
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_file",
+            "description": "Describe a local file (outline for .py, otherwise head preview). Accepts absolute paths.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to a file."},
+                    "max_lines": {"type": "integer", "description": "Max preview lines for non-.py files."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_section",
+            "description": "Extract a section from a local file. For .py supports selector `function:<name>` or `class:<name>`. Otherwise supports `lines:<start>-<end>`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to a file."},
+                    "selector": {"type": "string", "description": "Selector string."},
+                },
+                "required": ["path", "selector"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_section",
+            "description": "Replace a line range in a local file. Selector must be `lines:<start>-<end>`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to a file."},
+                    "selector": {"type": "string", "description": "lines:<start>-<end>"},
+                    "value": {"type": "string", "description": "Replacement text."},
+                },
+                "required": ["path", "selector", "value"],
+            },
+        },
+    },
+]
+
+
+def describe_file(path: str, max_lines: int = 120) -> Dict[str, Any]:
+    """Describe a local file (outline for .py, otherwise head preview)."""
+    if not path:
+        raise ValueError("path is required")
+    p = Path(path)
+    if not p.is_absolute():
+        raise ValueError("path must be absolute")
+    if not p.exists():
+        raise ValueError(f"path does not exist: {p}")
+    if p.is_dir():
+        entries = sorted([x.name for x in p.iterdir()])
+        return {"kind": "dir", "path": str(p), "entries": entries[:200], "total": len(entries)}
+
+    suffix = p.suffix.lower()
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    if suffix == ".py":
+        try:
+            mod = ast.parse(raw)
+        except SyntaxError as exc:
+            return {"kind": "python", "path": str(p), "error": f"syntax_error: {exc}", "preview": raw[:4000]}
+        outline: List[Dict[str, Any]] = []
+        for node in mod.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                outline.append({"type": "function", "name": node.name, "line": getattr(node, "lineno", None)})
+            elif isinstance(node, ast.ClassDef):
+                outline.append({"type": "class", "name": node.name, "line": getattr(node, "lineno", None)})
+        return {"kind": "python", "path": str(p), "outline": outline, "size_bytes": p.stat().st_size}
+
+    lines = raw.splitlines()
+    head = "\n".join(lines[:max_lines])
+    return {"kind": "text", "path": str(p), "size_bytes": p.stat().st_size, "preview": head}
+
+
+def extract_section(path: str, selector: str) -> Dict[str, Any]:
+    """Extract a section from a local file."""
+    if not path or not selector:
+        raise ValueError("path and selector are required")
+    p = Path(path)
+    if not p.is_absolute():
+        raise ValueError("path must be absolute")
+    if not p.exists() or p.is_dir():
+        raise ValueError(f"file not found: {p}")
+    raw = p.read_text(encoding="utf-8", errors="replace")
+
+    if p.suffix.lower() == ".py":
+        mod = ast.parse(raw)
+        want_type, _, want_name = selector.partition(":")
+        want_type = want_type.strip().lower()
+        want_name = want_name.strip()
+        for node in mod.body:
+            if want_type == "function" and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == want_name:
+                return {"path": str(p), "selector": selector, "text": ast.get_source_segment(raw, node) or ""}
+            if want_type == "class" and isinstance(node, ast.ClassDef) and node.name == want_name:
+                return {"path": str(p), "selector": selector, "text": ast.get_source_segment(raw, node) or ""}
+        return {"path": str(p), "selector": selector, "text": "", "error": "not_found"}
+
+    if selector.lower().startswith("lines:"):
+        spec = selector.split(":", 1)[1].strip()
+        start_s, _, end_s = spec.partition("-")
+        start = int(start_s.strip() or "1")
+        end = int(end_s.strip() or str(start))
+        if start < 1 or end < start:
+            raise ValueError("invalid line range")
+        lines = raw.splitlines()
+        chunk = "\n".join(lines[start - 1:end])
+        return {"path": str(p), "selector": selector, "text": chunk}
+
+    raise ValueError("unsupported selector for this file type")
+
+
+def replace_section(path: str, selector: str, value: str) -> Dict[str, Any]:
+    """Replace a line range in a local file."""
+    if not path or not selector:
+        raise ValueError("path and selector are required")
+    p = Path(path)
+    if not p.is_absolute():
+        raise ValueError("path must be absolute")
+    if not p.exists() or p.is_dir():
+        raise ValueError(f"file not found: {p}")
+    if not selector.lower().startswith("lines:"):
+        raise ValueError("unsupported selector; only lines:<start>-<end> is supported")
+    spec = selector.split(":", 1)[1].strip()
+    start_s, _, end_s = spec.partition("-")
+    start = int(start_s.strip() or "1")
+    end = int(end_s.strip() or str(start))
+    if start < 1 or end < start:
+        raise ValueError("invalid line range")
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    lines = raw.splitlines()
+    new_lines = lines[: start - 1] + value.splitlines() + lines[end:]
+    p.write_text("\n".join(new_lines) + ("\n" if raw.endswith("\n") else ""), encoding="utf-8")
+    return {"ok": True, "path": str(p), "selector": selector}
+
+
+# Tool execution dispatcher
+TOOL_FUNCTIONS = {
+    "describe_file": describe_file,
+    "extract_section": extract_section,
+    "replace_section": replace_section,
+}
+
+
+def execute_tool(tool_name: str, **kwargs) -> Any:
+    """Execute a tool by name with the given arguments."""
+    if tool_name not in TOOL_FUNCTIONS:
+        raise ValueError(f"Unknown tool: {tool_name}")
+    func = TOOL_FUNCTIONS[tool_name]
+    return func(**kwargs)

@@ -40,11 +40,10 @@ def build_agent(*, tools: Optional[List[Any]] = None):
 
 
 def default_tools() -> List[Any]:
+    """Return Qwen-Agent compatible tool wrappers."""
     try:
-        from hominem_agent.tools.describe_file import DescribeFile
-        from hominem_agent.tools.extract_section import ExtractSection
-        from hominem_agent.tools.replace_section import ReplaceSection
+        from hominem_agent.tools.wrapper_tools import get_wrapped_tools
     except Exception as exc:
         raise RuntimeError(f"Failed to import default tools: {exc}") from exc
 
-    return [DescribeFile(), ExtractSection(), ReplaceSection()]
+    return get_wrapped_tools()
