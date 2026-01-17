@@ -103,6 +103,12 @@ The intended setup is:
 
 This repo pins an Open WebUI version via `setup.py` extra: `./.venv/bin/python -m pip install -e ".[open_webui]"`.
 
+```bash
+open-webui serve
+```
+
+Open web browser to http://localhost:8080/
+
 ## Training (`hominem_train`)
 
 Training is CLI-first and can emit JSONL training events (see `docs/ARCHITECTURE_PLAN.md`).
