@@ -6,7 +6,8 @@ from setuptools import find_packages, setup
 setup(
     name="hominem",
     version="0.0.0",
-    packages=find_packages(),
+    package_dir={"": "python"},
+    packages=find_packages(where="python"),
     include_package_data=True,
     install_requires=[],
     extras_require={
