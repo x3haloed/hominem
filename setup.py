@@ -25,6 +25,7 @@ setup(
         "infer": [
             "fastapi>=0.104.0",
             "uvicorn[standard]>=0.24.0",
+            "third_party/mlx_vlm",
         ],
         "open_webui": [
             "open-webui==0.7.2",
