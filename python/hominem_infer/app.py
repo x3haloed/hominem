@@ -19,7 +19,7 @@ from hominem_infer.media import extract_media, materialize_video_path, normalize
 from hominem_infer.parsing import ThinkStreamParser, extract_reasoning_from_text, extract_tool_calls_from_text
 
 
-DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "mlx-community/Qwen2-VL-2B-Instruct-4bit")
+DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx")
 EVENT_LOG_PATH = os.getenv("INFER_EVENT_LOG")
 EVENTS_ENABLED = os.getenv("INFER_EVENT_LOG", "").strip() != ""
 BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")

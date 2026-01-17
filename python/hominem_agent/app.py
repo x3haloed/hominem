@@ -51,7 +51,7 @@ def _get_agent():
 def _get_model_id() -> str:
     model = os.getenv("HOMINEM_AGENT_MODEL", os.getenv("INFER_MODEL_ID", "")).strip()
     if not model:
-        model = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+        model = "alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx"
     return model
 
 

@@ -6,6 +6,14 @@ import argparse
 import sys
 
 
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="hominem_train entry point")
     parser.add_argument(
@@ -18,6 +26,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _load_dotenv()
     parser = _build_parser()
     ns = parser.parse_args()
 

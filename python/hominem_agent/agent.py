@@ -21,7 +21,7 @@ def build_agent(*, tools: Optional[List[Any]] = None):
     infer_base_url = os.getenv("HOMINEM_INFER_BASE_URL", "http://127.0.0.1:8000/v1").strip()
     model = os.getenv("HOMINEM_AGENT_MODEL", os.getenv("INFER_MODEL_ID", "")).strip()
     if not model:
-        model = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+        model = "alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx"
 
     llm_cfg: Dict[str, Any] = {
         "model": model,

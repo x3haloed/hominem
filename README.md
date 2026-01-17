@@ -33,12 +33,20 @@ Background research (not the repo’s current organizing design):
 
 ## Quickstart (local dev)
 
-Create (or reuse) the local venv at `.venv/` and install this repo:
+Create (or reuse) the local venv at `.venv/` and install this repo (includes optional tool deps like Tabstack):
 
 ```bash
 python3 -m venv .venv
 ./.venv/bin/python -m pip install -U pip
-./.venv/bin/python -m pip install -e ".[agent,infer]"
+./.venv/bin/python -m pip install -e ".[agent,infer,tools]"
+```
+
+### Configuration via .env
+
+The CLI entrypoints (`python -m hominem_infer`, `python -m hominem_agent`, `python -m hominem_train`) load a `.env` file automatically if present. Use `.env.example` as a starting point:
+
+```bash
+cp .env.example .env
 ```
 
 ### Run inference (`hominem_infer`)
@@ -64,7 +72,7 @@ MLX-VLM backend notes:
 
 Key env vars:
 - `INFER_HOST` (default `0.0.0.0`), `INFER_PORT` (default `8000`)
-- `INFER_MODEL_ID` (default `mlx-community/Qwen2-VL-2B-Instruct-4bit`)
+- `INFER_MODEL_ID` (default `alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx`)
 - `INFER_EVENT_LOG` (if set, append JSONL events like `TurnEvent`)
 
 ### Run the agent (`hominem_agent`)
@@ -81,6 +89,9 @@ Key env vars:
 - `HOMINEM_INFER_BASE_URL` (default `http://127.0.0.1:8000/v1`)
 - `HOMINEM_AGENT_MODEL` (defaults to `INFER_MODEL_ID`, then a Qwen2-VL fallback)
 - `HOMINEM_UI_CORS_ORIGINS` (comma-separated allowlist; defaults include common Open WebUI dev ports)
+- `HOMINEM_YACY_BASE_URL` (default `http://127.0.0.1:8090`)
+- `TABSTACK_API_KEY` (required for `fetch_markdown` / `fetch_json`)
+- `fetch_markdown` / `fetch_json` require the `tools` extra (`pip install -e ".[tools]"`).
 
 ## Using with Open WebUI
 

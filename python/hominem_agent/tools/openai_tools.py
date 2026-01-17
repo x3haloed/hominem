@@ -59,6 +59,74 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "Search the local index and return structured results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query string."},
+                    "limit": {"type": "integer", "description": "Max results (1-20)."},
+                    "offset": {"type": "integer", "description": "Start offset (0-100)."},
+                    "site": {"type": "string", "description": "Optional site filter (e.g. example.com)."},
+                    "since": {"type": "string", "description": "Optional since filter (best-effort)."},
+                    "format": {
+                        "type": "string",
+                        "description": "Preferred endpoint: auto, solr, yacysearch_json.",
+                    },
+                    "dedupe": {"type": "boolean", "description": "Deduplicate results by URL."},
+                    "include_raw": {"type": "boolean", "description": "Include raw response payload."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_status",
+            "description": "Check reachability of the local search index.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_markdown",
+            "description": "Fetch a URL and return cleaned Markdown content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch."},
+                    "timeout_s": {"type": "number", "description": "Override request timeout in seconds."},
+                    "max_retries": {"type": "integer", "description": "Override retry count for this request."},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_json",
+            "description": "Fetch a URL and extract structured data using a JSON schema.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch."},
+                    "json_schema": {"type": "object", "description": "JSON schema to extract."},
+                    "timeout_s": {"type": "number", "description": "Override request timeout in seconds."},
+                    "max_retries": {"type": "integer", "description": "Override retry count for this request."},
+                },
+                "required": ["url", "json_schema"],
+            },
+        },
+    },
 ]
 
 
@@ -161,6 +229,10 @@ TOOL_FUNCTIONS = {
     "describe_file": describe_file,
     "extract_section": extract_section,
     "replace_section": replace_section,
+    "search": None,
+    "search_status": None,
+    "fetch_markdown": None,
+    "fetch_json": None,
 }
 
 
@@ -169,4 +241,16 @@ def execute_tool(tool_name: str, **kwargs) -> Any:
     if tool_name not in TOOL_FUNCTIONS:
         raise ValueError(f"Unknown tool: {tool_name}")
     func = TOOL_FUNCTIONS[tool_name]
+    if func is None and tool_name in {"search", "search_status"}:
+        from hominem_agent.tools.yacy import search, search_status
+
+        TOOL_FUNCTIONS["search"] = search
+        TOOL_FUNCTIONS["search_status"] = search_status
+        func = TOOL_FUNCTIONS[tool_name]
+    if func is None and tool_name in {"fetch_markdown", "fetch_json"}:
+        from hominem_agent.tools.tabstack_tools import fetch_json, fetch_markdown
+
+        TOOL_FUNCTIONS["fetch_markdown"] = fetch_markdown
+        TOOL_FUNCTIONS["fetch_json"] = fetch_json
+        func = TOOL_FUNCTIONS[tool_name]
     return func(**kwargs)
