@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
@@ -25,6 +26,7 @@ EVENTS_ENABLED = os.getenv("INFER_EVENT_LOG", "").strip() != ""
 BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")
 
 _MODEL_CACHE: Dict[str, Any] = {}
+_MLX_LOCK = threading.Lock()
 
 _DEBUG_PROMPT_DUMP_ENABLED = os.getenv("INFER_DEBUG_PROMPT_DUMP", "").strip().lower() in {
     "1",
@@ -228,35 +230,36 @@ event_writer = EventWriter(
 
 def _mlx_load_model(model_id: str, adapter_path: Optional[str]):
     cache_key = f"{model_id}|{adapter_path or ''}"
-    if _MODEL_CACHE.get("cache_key") == cache_key:
-        return _MODEL_CACHE["model"], _MODEL_CACHE["processor"], _MODEL_CACHE["config"]
+    with _MLX_LOCK:
+        if _MODEL_CACHE.get("cache_key") == cache_key:
+            return _MODEL_CACHE["model"], _MODEL_CACHE["processor"], _MODEL_CACHE["config"]
 
-    try:
-        from mlx_vlm.utils import load
-    except ImportError as exc:
-        raise HTTPException(status_code=500, detail=f"mlx_vlm not installed: {exc}") from exc
+        try:
+            from mlx_vlm.utils import load
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail=f"mlx_vlm not installed: {exc}") from exc
 
-    try:
-        model, processor = load(model_id, adapter_path, trust_remote_code=True)
-    except AttributeError as exc:
-        if "'list' object has no attribute 'keys'" in str(exc):
-            # Try loading without trust_remote_code for models with tokenizer config issues
-            model, processor = load(model_id, adapter_path, trust_remote_code=False)
-        else:
+        try:
+            model, processor = load(model_id, adapter_path, trust_remote_code=True)
+        except AttributeError as exc:
+            if "'list' object has no attribute 'keys'" in str(exc):
+                # Try loading without trust_remote_code for models with tokenizer config issues
+                model, processor = load(model_id, adapter_path, trust_remote_code=False)
+            else:
+                raise HTTPException(status_code=500, detail=f"Model loading failed: {exc}") from exc
+        except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Model loading failed: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Model loading failed: {exc}") from exc
-    config = model.config
-    _MODEL_CACHE.clear()
-    _MODEL_CACHE.update(
-        {
-            "cache_key": cache_key,
-            "model": model,
-            "processor": processor,
-            "config": config,
-        }
-    )
-    return model, processor, config
+        config = model.config
+        _MODEL_CACHE.clear()
+        _MODEL_CACHE.update(
+            {
+                "cache_key": cache_key,
+                "model": model,
+                "processor": processor,
+                "config": config,
+            }
+        )
+        return model, processor, config
 
 
 def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, Any]]:
@@ -372,19 +375,20 @@ def chat_completions(payload: ChatCompletionRequest):
             padding=True,
             return_tensors="pt",
         )
-        input_ids = mx.array(inputs["input_ids"])
-        pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
-        if pixel_values is None:
-            raise HTTPException(status_code=400, detail="Video input produced no pixel values.")
-        pixel_values = mx.array(pixel_values)
-        mask = mx.array(inputs["attention_mask"])
-        kwargs["input_ids"] = input_ids
-        kwargs["pixel_values"] = pixel_values
-        kwargs["mask"] = mask
-        if inputs.get("video_grid_thw") is not None:
-            kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
-        if inputs.get("image_grid_thw") is not None:
-            kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+        with _MLX_LOCK:
+            input_ids = mx.array(inputs["input_ids"])
+            pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
+            if pixel_values is None:
+                raise HTTPException(status_code=400, detail="Video input produced no pixel values.")
+            pixel_values = mx.array(pixel_values)
+            mask = mx.array(inputs["attention_mask"])
+            kwargs["input_ids"] = input_ids
+            kwargs["pixel_values"] = pixel_values
+            kwargs["mask"] = mask
+            if inputs.get("video_grid_thw") is not None:
+                kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
+            if inputs.get("image_grid_thw") is not None:
+                kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
     else:
         chat_template_kwargs = {}
         if payload.tools:
@@ -431,71 +435,72 @@ def chat_completions(payload: ChatCompletionRequest):
                 }
                 yield f"data: {json.dumps(first)}\n\n"
 
-                for chunk in stream_generate(
-                    model=model,
-                    processor=processor,
-                    prompt=prompt,
-                    image=images or None,
-                    audio=audio or None,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                    **kwargs,
-                ):
-                    if not chunk or not hasattr(chunk, "text"):
-                        continue
-                    delta = str(getattr(chunk, "text", "") or "")
-                    if not delta:
-                        continue
-                    buffer += delta
-                    if saw_tool_call:
-                        continue
+                with _MLX_LOCK:
+                    for chunk in stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=prompt,
+                        image=images or None,
+                        audio=audio or None,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
+                        **kwargs,
+                    ):
+                        if not chunk or not hasattr(chunk, "text"):
+                            continue
+                        delta = str(getattr(chunk, "text", "") or "")
+                        if not delta:
+                            continue
+                        buffer += delta
+                        if saw_tool_call:
+                            continue
 
-                    tool_idx = delta.find("<tool_call>")
-                    if tool_idx != -1:
-                        prefix = delta[:tool_idx]
-                        if prefix:
-                            c_delta, r_delta = think_parser.feed(prefix)
-                            if r_delta:
-                                payload_chunk = {
-                                    "id": resp_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model_id,
-                                    "choices": [{"index": 0, "delta": {"reasoning_content": r_delta}, "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(payload_chunk)}\n\n"
-                            if c_delta:
-                                payload_chunk = {
-                                    "id": resp_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model_id,
-                                    "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(payload_chunk)}\n\n"
-                        saw_tool_call = True
-                        continue
+                        tool_idx = delta.find("<tool_call>")
+                        if tool_idx != -1:
+                            prefix = delta[:tool_idx]
+                            if prefix:
+                                c_delta, r_delta = think_parser.feed(prefix)
+                                if r_delta:
+                                    payload_chunk = {
+                                        "id": resp_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [{"index": 0, "delta": {"reasoning_content": r_delta}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(payload_chunk)}\n\n"
+                                if c_delta:
+                                    payload_chunk = {
+                                        "id": resp_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(payload_chunk)}\n\n"
+                            saw_tool_call = True
+                            continue
 
-                    c_delta, r_delta = think_parser.feed(delta)
-                    if r_delta:
-                        payload_chunk = {
-                            "id": resp_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [{"index": 0, "delta": {"reasoning_content": r_delta}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(payload_chunk)}\n\n"
-                    if c_delta:
-                        payload_chunk = {
-                            "id": resp_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id,
-                            "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(payload_chunk)}\n\n"
+                        c_delta, r_delta = think_parser.feed(delta)
+                        if r_delta:
+                            payload_chunk = {
+                                "id": resp_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": r_delta}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(payload_chunk)}\n\n"
+                        if c_delta:
+                            payload_chunk = {
+                                "id": resp_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(payload_chunk)}\n\n"
 
                 c_final, r_final = think_parser.finish()
                 if r_final:
@@ -564,18 +569,19 @@ def chat_completions(payload: ChatCompletionRequest):
         )
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-    gen_result = generate(
-        model=model,
-        processor=processor,
-        prompt=prompt,
-        image=images or None,
-        audio=audio or None,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        verbose=False,
-        **kwargs,
-    )
+    with _MLX_LOCK:
+        gen_result = generate(
+            model=model,
+            processor=processor,
+            prompt=prompt,
+            image=images or None,
+            audio=audio or None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            verbose=False,
+            **kwargs,
+        )
     gc.collect()
     content_raw = gen_result.text
     content_no_tools, tool_calls = extract_tool_calls_from_text(content_raw)
@@ -707,16 +713,17 @@ def responses(payload: ResponsesRequest):
             padding=True,
             return_tensors="pt",
         )
-        kwargs["input_ids"] = mx.array(inputs["input_ids"])
-        pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
-        if pixel_values is None:
-            raise HTTPException(status_code=400, detail="Video input produced no pixel values.")
-        kwargs["pixel_values"] = mx.array(pixel_values)
-        kwargs["mask"] = mx.array(inputs["attention_mask"])
-        if inputs.get("video_grid_thw") is not None:
-            kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
-        if inputs.get("image_grid_thw") is not None:
-            kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+        with _MLX_LOCK:
+            kwargs["input_ids"] = mx.array(inputs["input_ids"])
+            pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
+            if pixel_values is None:
+                raise HTTPException(status_code=400, detail="Video input produced no pixel values.")
+            kwargs["pixel_values"] = mx.array(pixel_values)
+            kwargs["mask"] = mx.array(inputs["attention_mask"])
+            if inputs.get("video_grid_thw") is not None:
+                kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
+            if inputs.get("image_grid_thw") is not None:
+                kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
         # Media already packed into pixel_values; avoid redundant loader paths.
         images = []
         audio = []
@@ -775,28 +782,29 @@ def responses(payload: ResponsesRequest):
             usage_stats = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             full_text = ""
             try:
-                for chunk in stream_generate(
-                    model=model,
-                    processor=processor,
-                    prompt=prompt,
-                    image=images or None,
-                    audio=audio or None,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                    **kwargs,
-                ):
-                    if not chunk or not hasattr(chunk, "text"):
-                        continue
-                    delta = chunk.text
-                    full_text += delta
-                    usage_stats = {
-                        "input_tokens": getattr(chunk, "prompt_tokens", 0),
-                        "output_tokens": getattr(chunk, "generation_tokens", 0),
-                        "total_tokens": getattr(chunk, "prompt_tokens", 0)
-                        + getattr(chunk, "generation_tokens", 0),
-                    }
-                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
+                with _MLX_LOCK:
+                    for chunk in stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=prompt,
+                        image=images or None,
+                        audio=audio or None,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=top_p,
+                        **kwargs,
+                    ):
+                        if not chunk or not hasattr(chunk, "text"):
+                            continue
+                        delta = chunk.text
+                        full_text += delta
+                        usage_stats = {
+                            "input_tokens": getattr(chunk, "prompt_tokens", 0),
+                            "output_tokens": getattr(chunk, "generation_tokens", 0),
+                            "total_tokens": getattr(chunk, "prompt_tokens", 0)
+                            + getattr(chunk, "generation_tokens", 0),
+                        }
+                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
                 cleaned, tool_calls = extract_tool_calls_from_text(full_text)
                 yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': cleaned})}\n\n"
                 final_content_part = {"type": "output_text", "text": cleaned, "annotations": []}
@@ -838,18 +846,19 @@ def responses(payload: ResponsesRequest):
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-    gen_result = generate(
-        model=model,
-        processor=processor,
-        prompt=prompt,
-        image=images or None,
-        audio=audio or None,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        verbose=False,
-        **kwargs,
-    )
+    with _MLX_LOCK:
+        gen_result = generate(
+            model=model,
+            processor=processor,
+            prompt=prompt,
+            image=images or None,
+            audio=audio or None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            verbose=False,
+            **kwargs,
+        )
     gc.collect()
     content, tool_calls = extract_tool_calls_from_text(gen_result.text)
     response_id = f"resp_{uuid.uuid4().hex}"
