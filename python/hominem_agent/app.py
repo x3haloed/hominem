@@ -320,6 +320,7 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
         # Process tool calls from Qwen-Agent format to OpenAI format
         if all_chunks:
             processed_chunks = _process_qwen_tool_calls([all_chunks])
+            processed_chunks = _accumulate_agent_chunks([processed_chunks])
             responses_iter = iter([processed_chunks])
         else:
             # If no chunks, create empty response
@@ -412,6 +413,7 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
 
             # Process tool calls
             processed_chunks = _process_qwen_tool_calls([all_chunks]) if all_chunks else []
+            processed_chunks = _accumulate_agent_chunks([processed_chunks])
 
             # Stream the processed chunks
             assistant_content = ""
@@ -470,6 +472,7 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
 
     # Process tool calls from Qwen format to OpenAI format
     processed_chunks = _process_qwen_tool_calls(chunks)
+    processed_chunks = _accumulate_agent_chunks([processed_chunks])
 
     assistant_text = None
     tool_calls: List[Dict[str, Any]] | None = None
