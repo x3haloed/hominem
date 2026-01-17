@@ -109,6 +109,10 @@ open-webui serve
 
 Open web browser to http://localhost:8080/
 
+Configure OpenAI API in Admin Panel > Settings
+
+<img width="491" height="181" alt="image" src="https://github.com/user-attachments/assets/1db4beb0-d69b-434d-b920-0f1569b3c58e" />
+
 ## Training (`hominem_train`)
 
 Training is CLI-first and can emit JSONL training events (see `docs/ARCHITECTURE_PLAN.md`).
