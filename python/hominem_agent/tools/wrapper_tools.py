@@ -5,6 +5,7 @@ but use OpenAI-style schemas and execution functions.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Union
 
 from qwen_agent.tools.base import BaseTool
@@ -23,6 +24,15 @@ class OpenAIToolWrapper(BaseTool):
 
     def call(self, params: Union[str, dict], **kwargs) -> Dict[str, Any]:
         if isinstance(params, str):
+            raw = params.strip()
+            if not raw:
+                params = {}
+            else:
+                try:
+                    params = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"params must be an object: {exc}") from exc
+        if not isinstance(params, dict):
             raise ValueError("params must be an object")
 
         # Execute the tool using our OpenAI tool executor
