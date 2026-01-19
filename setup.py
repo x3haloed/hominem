@@ -26,7 +26,7 @@ setup(
             "fastapi>=0.104.0",
             "uvicorn[standard]>=0.24.0",
             "torchvision",
-            "third_party/mlx_vlm",
+            "mlx-vlm @ git+https://github.com/x3haloed/mlx-vlm.git@hominem",
         ],
         "open_webui": [
             "open-webui==0.7.2",
@@ -36,8 +36,8 @@ setup(
             "uvicorn[standard]>=0.24.0",
             "pydantic>=2.0.0",
             "mlx",
-            "mlx-vlm @ git+https://github.com/x3haloed/mlx-vlm.git@weighted-loss",
-            "torchvision"
+            "mlx-vlm @ git+https://github.com/x3haloed/mlx-vlm.git@hominem",
+            "torchvision",
         ],
     },
 )
