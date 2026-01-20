@@ -8,12 +8,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from hominem_agent.agent import build_agent, default_tools
+from hominem_observability.trace import new_trace_id, set_trace_id, trace_event
 
 
 app = FastAPI(title="Hominem Agent")
@@ -63,6 +64,35 @@ class ChatCompletionRequest(BaseModel):
     tools: List[Dict[str, Any]] | None = None
     tool_choice: Any | None = None
     stream_options: Dict[str, Any] | None = None
+
+
+@app.middleware("http")
+async def _trace_middleware(request: Request, call_next):
+    trace_id = (
+        request.headers.get("x-trace-id")
+        or request.headers.get("x-request-id")
+        or request.headers.get("openai-request-id")
+        or request.headers.get("x-openai-request-id")
+        or ""
+    ).strip()
+    if not trace_id:
+        trace_id = new_trace_id()
+    set_trace_id(trace_id)
+    trace_event(
+        "http.request",
+        {"method": request.method, "path": request.url.path},
+        source="hominem_agent",
+        trace_id=trace_id,
+    )
+    response = await call_next(request)
+    response.headers["x-trace-id"] = trace_id
+    trace_event(
+        "http.response",
+        {"status_code": getattr(response, "status_code", None), "path": request.url.path},
+        source="hominem_agent",
+        trace_id=trace_id,
+    )
+    return response
 
 
 def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -120,6 +150,7 @@ def _process_qwen_tool_calls(chunks: List[List[Dict[str, Any]]]) -> List[Dict[st
 
     processed = []
     tool_call_id = f"call_{uuid.uuid4().hex}"
+    tool_call_mode = (os.getenv("HOMINEM_AGENT_TOOL_CALL_MODE", "execute").strip().lower() or "execute")
 
     for chunk in chunks:
         for msg in chunk:
@@ -127,18 +158,26 @@ def _process_qwen_tool_calls(chunks: List[List[Dict[str, Any]]]) -> List[Dict[st
             if not isinstance(msg, dict):
                 continue
 
+            # If tool_calls already exist (native OpenAI), don't try to re-parse.
+            if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+                processed.append(msg)
+                continue
+
             if msg.get("role") == "assistant" and "content" in msg:
                 content = msg["content"]
                 # Look for Qwen tool call format: {"name": "...", "arguments": {...}}</tool_call>
-                tool_match = re.search(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', content, re.DOTALL)
+                tool_match = re.search(r"<tool_call>\\s*(.*?)\\s*</tool_call>", content, re.DOTALL)
                 if tool_match:
                     try:
                         tool_data = json.loads(tool_match.group(1))
                         tool_name = tool_data.get("name")
                         tool_args = tool_data.get("arguments", {})
 
-                        # Execute the tool
-                        tool_result = execute_tool(tool_name, **tool_args)
+                        trace_event(
+                            "agent.tool_call.detected",
+                            {"name": tool_name, "arguments": tool_args, "mode": tool_call_mode},
+                            source="hominem_agent",
+                        )
 
                         # Create OpenAI format tool call
                         tool_call = {
@@ -155,13 +194,21 @@ def _process_qwen_tool_calls(chunks: List[List[Dict[str, Any]]]) -> List[Dict[st
                         msg["content"] = clean_content if clean_content else None
                         msg["tool_calls"] = [tool_call]
 
-                        # Add tool result message
                         processed.append(msg)
-                        processed.append({
-                            "role": "tool",
-                            "content": json.dumps(tool_result),
-                            "tool_call_id": tool_call_id
-                        })
+                        if tool_call_mode == "execute":
+                            tool_result = execute_tool(tool_name, **tool_args)
+                            trace_event(
+                                "agent.tool_call.executed",
+                                {"name": tool_name, "tool_call_id": tool_call_id},
+                                source="hominem_agent",
+                            )
+                            processed.append(
+                                {
+                                    "role": "tool",
+                                    "content": json.dumps(tool_result),
+                                    "tool_call_id": tool_call_id,
+                                }
+                            )
                         continue
                     except (json.JSONDecodeError, KeyError, Exception) as e:
                         # If parsing fails, keep original content
@@ -299,6 +346,18 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
     tools = payload.tools
     if payload.tool_choice == "none":
         tools = None
+    trace_event(
+        "agent.chat_completions.request",
+        {
+            "req_id": req_id,
+            "model": model_name,
+            "messages": normalized_messages,
+            "tools": tools,
+            "tool_choice": payload.tool_choice,
+            "stream": bool(payload.stream),
+        },
+        source="hominem_agent",
+    )
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -315,6 +374,11 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
         all_chunks = []
         for chunk in responses_iter:
             if chunk:
+                trace_event(
+                    "agent.run.chunk",
+                    {"req_id": req_id, "chunk": chunk},
+                    source="hominem_agent",
+                )
                 all_chunks.extend(chunk)
 
         # Process tool calls from Qwen-Agent format to OpenAI format
@@ -399,6 +463,11 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
             try:
                 for chunk in responses_iter:
                     if chunk:
+                        trace_event(
+                            "agent.run.chunk",
+                            {"req_id": req_id, "chunk": chunk},
+                            source="hominem_agent",
+                        )
                         all_chunks.extend(chunk)
             except Exception as exc:
                 error_payload = {
@@ -414,6 +483,11 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
             # Process tool calls
             processed_chunks = _process_qwen_tool_calls([all_chunks]) if all_chunks else []
             processed_chunks = _accumulate_agent_chunks([processed_chunks])
+            trace_event(
+                "agent.chat_completions.processed",
+                {"req_id": req_id, "messages": processed_chunks},
+                source="hominem_agent",
+            )
 
             # Stream the processed chunks
             assistant_content = ""
@@ -463,6 +537,11 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
     try:
         for chunk in responses_iter:
             if chunk:
+                trace_event(
+                    "agent.run.chunk",
+                    {"req_id": req_id, "chunk": chunk},
+                    source="hominem_agent",
+                )
                 chunks.append(chunk)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent streaming failed: {exc}") from exc
@@ -473,6 +552,11 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
     # Process tool calls from Qwen format to OpenAI format
     processed_chunks = _process_qwen_tool_calls(chunks)
     processed_chunks = _accumulate_agent_chunks([processed_chunks])
+    trace_event(
+        "agent.chat_completions.processed",
+        {"req_id": req_id, "messages": processed_chunks},
+        source="hominem_agent",
+    )
 
     assistant_text = None
     tool_calls: List[Dict[str, Any]] | None = None
@@ -483,6 +567,16 @@ def chat_completions(payload: ChatCompletionRequest) -> Any:
             break
 
     finish_reason = "tool_calls" if tool_calls else "stop"
+    trace_event(
+        "agent.chat_completions.response",
+        {
+            "req_id": req_id,
+            "finish_reason": finish_reason,
+            "assistant_text": assistant_text,
+            "tool_calls": tool_calls,
+        },
+        source="hominem_agent",
+    )
     return build_response(
         assistant_text=assistant_text,
         tool_calls=tool_calls,

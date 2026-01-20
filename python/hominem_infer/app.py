@@ -11,13 +11,14 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from hominem_infer.events import EventWriter
 from hominem_infer.media import extract_media, materialize_video_path, normalize_video_elements
 from hominem_infer.parsing import ThinkStreamParser, extract_reasoning_from_text, extract_tool_calls_from_text
+from hominem_observability.trace import get_trace_id, new_trace_id, set_trace_id, trace_event
 
 
 DEFAULT_MODEL_ID = os.getenv("INFER_MODEL_ID", "alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx")
@@ -230,6 +231,35 @@ event_writer = EventWriter(
 )
 
 
+@app.middleware("http")
+async def _trace_middleware(request: Request, call_next):
+    trace_id = (
+        request.headers.get("x-trace-id")
+        or request.headers.get("x-request-id")
+        or request.headers.get("openai-request-id")
+        or request.headers.get("x-openai-request-id")
+        or ""
+    ).strip()
+    if not trace_id:
+        trace_id = new_trace_id()
+    set_trace_id(trace_id)
+    trace_event(
+        "http.request",
+        {"method": request.method, "path": request.url.path},
+        source="hominem_infer",
+        trace_id=trace_id,
+    )
+    response = await call_next(request)
+    response.headers["x-trace-id"] = trace_id
+    trace_event(
+        "http.response",
+        {"status_code": getattr(response, "status_code", None), "path": request.url.path},
+        source="hominem_infer",
+        trace_id=trace_id,
+    )
+    return response
+
+
 def _mlx_load_model(model_id: str, adapter_path: Optional[str]):
     cache_key = f"{model_id}|{adapter_path or ''}"
     with _MLX_LOCK:
@@ -337,9 +367,15 @@ def list_models() -> ModelList:
 def chat_completions(payload: ChatCompletionRequest):
     if BACKEND == "stub":
         content = _stub_completion(payload.messages)
+        trace_event(
+            "infer.chat_completions.stub",
+            {"model": payload.model or DEFAULT_MODEL_ID, "messages": payload.messages, "content": content},
+            source="hominem_infer",
+        )
         event_writer.emit(
             "TurnEvent",
             {
+                "trace_id": get_trace_id(),
                 "model": payload.model or DEFAULT_MODEL_ID,
                 "messages": payload.messages,
                 "assistant": {"role": "assistant", "content": content},
@@ -360,6 +396,20 @@ def chat_completions(payload: ChatCompletionRequest):
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
     normalized_messages, video_specs = normalize_video_elements(payload.messages)
     images, audio = extract_media(normalized_messages)
+    trace_event(
+        "infer.chat_completions.request",
+        {
+            "model": model_id,
+            "messages": normalized_messages,
+            "tools": payload.tools,
+            "tool_choice": payload.tool_choice,
+            "stream": bool(payload.stream),
+            "has_images": bool(images),
+            "has_audio": bool(audio),
+            "has_video": bool(video_specs),
+        },
+        source="hominem_infer",
+    )
 
     try:
         from mlx_vlm.generate import generate, stream_generate
@@ -427,6 +477,20 @@ def chat_completions(payload: ChatCompletionRequest):
             padding=True,
             return_tensors="pt",
         )
+        try:
+            token_ids = list((inputs.get("input_ids") or [])[0])
+        except Exception:
+            token_ids = None
+        trace_event(
+            "infer.tokenizer.encode",
+            {
+                "endpoint": "chat_completions",
+                "model": model_id,
+                "input_ids_len": (len(token_ids) if isinstance(token_ids, list) else None),
+                "input_ids": token_ids,
+            },
+            source="hominem_infer",
+        )
         with _MLX_LOCK:
             input_ids = mx.array(inputs["input_ids"])
             pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
@@ -464,6 +528,16 @@ def chat_completions(payload: ChatCompletionRequest):
                 status_code=500,
                 detail=f"Processor chat_template failure: {exc}",
             ) from exc
+    trace_event(
+        "infer.chat_template.applied",
+        {
+            "endpoint": "chat_completions",
+            "model": model_id,
+            "chat_template_kwargs": chat_template_kwargs,
+            "prompt": prompt,
+        },
+        source="hominem_infer",
+    )
     _dump_templatized_prompt(prompt=prompt, model_id=model_id, endpoint="chat_completions")
 
     max_tokens = payload.max_tokens or payload.max_completion_tokens
@@ -480,6 +554,9 @@ def chat_completions(payload: ChatCompletionRequest):
             created = int(time.time())
             buffer = ""
             saw_tool_call = False
+            tool_pending = ""
+            tool_tag = "<tool_call>"
+            tool_keep = len(tool_tag) - 1
             think_parser = ThinkStreamParser()
             try:
                 first = {
@@ -512,11 +589,13 @@ def chat_completions(payload: ChatCompletionRequest):
                         if saw_tool_call:
                             continue
 
-                        tool_idx = delta.find("<tool_call>")
+                        s = tool_pending + delta
+                        tool_idx = s.find(tool_tag)
                         if tool_idx != -1:
-                            prefix = delta[:tool_idx]
-                            if prefix:
-                                c_delta, r_delta = think_parser.feed(prefix)
+                            safe = s[:tool_idx]
+                            tool_pending = s[tool_idx:]
+                            if safe:
+                                c_delta, r_delta = think_parser.feed(safe)
                                 if r_delta:
                                     payload_chunk = {
                                         "id": resp_id,
@@ -538,7 +617,17 @@ def chat_completions(payload: ChatCompletionRequest):
                             saw_tool_call = True
                             continue
 
-                        c_delta, r_delta = think_parser.feed(delta)
+                        if tool_keep and len(s) <= tool_keep:
+                            tool_pending = s
+                            continue
+                        if tool_keep:
+                            emit_now = s[:-tool_keep]
+                            tool_pending = s[-tool_keep:]
+                        else:
+                            emit_now = s
+                            tool_pending = ""
+
+                        c_delta, r_delta = think_parser.feed(emit_now)
                         if r_delta:
                             payload_chunk = {
                                 "id": resp_id,
@@ -557,6 +646,27 @@ def chat_completions(payload: ChatCompletionRequest):
                                 "choices": [{"index": 0, "delta": {"content": c_delta}, "finish_reason": None}],
                             }
                             yield f"data: {json.dumps(payload_chunk)}\n\n"
+
+                if not saw_tool_call and tool_pending:
+                    c_tail, r_tail = think_parser.feed(tool_pending)
+                    if r_tail:
+                        payload_chunk = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"reasoning_content": r_tail}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(payload_chunk)}\n\n"
+                    if c_tail:
+                        payload_chunk = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"content": c_tail}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(payload_chunk)}\n\n"
 
                 c_final, r_final = think_parser.finish()
                 if r_final:
@@ -617,6 +727,7 @@ def chat_completions(payload: ChatCompletionRequest):
         event_writer.emit(
             "TurnEvent",
             {
+                "trace_id": get_trace_id(),
                 "model": model_id,
                 "messages": normalized_messages,
                 "assistant": {"role": "assistant", "content": "<stream>"},
@@ -640,12 +751,24 @@ def chat_completions(payload: ChatCompletionRequest):
         )
     gc.collect()
     content_raw = gen_result.text
+    trace_event(
+        "infer.generate.result",
+        {
+            "endpoint": "chat_completions",
+            "model": model_id,
+            "text": content_raw,
+            "prompt_tokens": getattr(gen_result, "prompt_tokens", 0),
+            "generation_tokens": getattr(gen_result, "generation_tokens", 0),
+        },
+        source="hominem_infer",
+    )
     content_no_tools, tool_calls = extract_tool_calls_from_text(content_raw)
     content, reasoning_content = extract_reasoning_from_text(content_no_tools)
     finish_reason = "tool_calls" if tool_calls else "stop"
     event_writer.emit(
         "TurnEvent",
         {
+            "trace_id": get_trace_id(),
             "model": model_id,
             "messages": normalized_messages,
             "assistant": {
@@ -673,6 +796,11 @@ def responses(payload: ResponsesRequest):
     if BACKEND == "stub":
         messages = _responses_input_to_messages(payload)
         content = _stub_completion(messages)
+        trace_event(
+            "infer.responses.stub",
+            {"model": payload.model or DEFAULT_MODEL_ID, "messages": messages, "content": content},
+            source="hominem_infer",
+        )
         created_at = int(time.time())
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -708,6 +836,20 @@ def responses(payload: ResponsesRequest):
     messages = _responses_input_to_messages(payload)
     normalized_messages, video_specs = normalize_video_elements(messages)
     images, audio = extract_media(normalized_messages)
+    trace_event(
+        "infer.responses.request",
+        {
+            "model": model_id,
+            "messages": normalized_messages,
+            "tools": payload.tools,
+            "tool_choice": payload.tool_choice,
+            "stream": bool(payload.stream),
+            "has_images": bool(images),
+            "has_audio": bool(audio),
+            "has_video": bool(video_specs),
+        },
+        source="hominem_infer",
+    )
 
     try:
         from mlx_vlm.generate import generate, stream_generate
@@ -769,6 +911,20 @@ def responses(payload: ResponsesRequest):
             padding=True,
             return_tensors="pt",
         )
+        try:
+            token_ids = list((inputs.get("input_ids") or [])[0])
+        except Exception:
+            token_ids = None
+        trace_event(
+            "infer.tokenizer.encode",
+            {
+                "endpoint": "responses",
+                "model": model_id,
+                "input_ids_len": (len(token_ids) if isinstance(token_ids, list) else None),
+                "input_ids": token_ids,
+            },
+            source="hominem_infer",
+        )
         with _MLX_LOCK:
             kwargs["input_ids"] = mx.array(inputs["input_ids"])
             pixel_values = inputs.get("pixel_values_videos", inputs.get("pixel_values"))
@@ -798,6 +954,16 @@ def responses(payload: ResponsesRequest):
                     detail=f"Model chat_template does not support tools: {exc}",
                 ) from exc
             raise HTTPException(status_code=500, detail=f"Processor chat_template failure: {exc}") from exc
+    trace_event(
+        "infer.chat_template.applied",
+        {
+            "endpoint": "responses",
+            "model": model_id,
+            "chat_template_kwargs": chat_template_kwargs,
+            "prompt": prompt,
+        },
+        source="hominem_infer",
+    )
     _dump_templatized_prompt(prompt=prompt, model_id=model_id, endpoint="responses")
     max_tokens = payload.max_output_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
@@ -841,6 +1007,10 @@ def responses(payload: ResponsesRequest):
 
             usage_stats = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             full_text = ""
+            saw_tool_call = False
+            tool_pending = ""
+            tool_tag = "<tool_call>"
+            tool_keep = len(tool_tag) - 1
             try:
                 with _MLX_LOCK:
                     for chunk in stream_generate(
@@ -856,7 +1026,9 @@ def responses(payload: ResponsesRequest):
                     ):
                         if not chunk or not hasattr(chunk, "text"):
                             continue
-                        delta = chunk.text
+                        delta = str(getattr(chunk, "text", "") or "")
+                        if not delta:
+                            continue
                         full_text += delta
                         usage_stats = {
                             "input_tokens": getattr(chunk, "prompt_tokens", 0),
@@ -864,7 +1036,31 @@ def responses(payload: ResponsesRequest):
                             "total_tokens": getattr(chunk, "prompt_tokens", 0)
                             + getattr(chunk, "generation_tokens", 0),
                         }
-                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
+                        if saw_tool_call:
+                            continue
+                        s = tool_pending + delta
+                        tool_idx = s.find(tool_tag)
+                        if tool_idx != -1:
+                            safe = s[:tool_idx]
+                            tool_pending = s[tool_idx:]
+                            if safe:
+                                yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': safe})}\n\n"
+                            saw_tool_call = True
+                            continue
+
+                        if tool_keep and len(s) <= tool_keep:
+                            tool_pending = s
+                            continue
+                        if tool_keep:
+                            emit_now = s[:-tool_keep]
+                            tool_pending = s[-tool_keep:]
+                        else:
+                            emit_now = s
+                            tool_pending = ""
+                        if emit_now:
+                            yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': emit_now})}\n\n"
+                if not saw_tool_call and tool_pending:
+                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': tool_pending})}\n\n"
                 cleaned, tool_calls = extract_tool_calls_from_text(full_text)
                 yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': cleaned})}\n\n"
                 final_content_part = {"type": "output_text", "text": cleaned, "annotations": []}
@@ -920,6 +1116,17 @@ def responses(payload: ResponsesRequest):
             **kwargs,
         )
     gc.collect()
+    trace_event(
+        "infer.generate.result",
+        {
+            "endpoint": "responses",
+            "model": model_id,
+            "text": gen_result.text,
+            "prompt_tokens": getattr(gen_result, "prompt_tokens", 0),
+            "generation_tokens": getattr(gen_result, "generation_tokens", 0),
+        },
+        source="hominem_infer",
+    )
     content, tool_calls = extract_tool_calls_from_text(gen_result.text)
     response_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"

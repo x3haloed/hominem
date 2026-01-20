@@ -6,10 +6,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-from fastapi import HTTPException
 
-
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
@@ -19,23 +17,31 @@ def extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
         return "", []
 
     tool_calls: List[Dict[str, Any]] = []
+    out: List[str] = []
+    last = 0
     for match in _TOOL_CALL_RE.finditer(text):
-        raw = match.group(1).strip()
+        raw = (match.group(1) or "").strip()
         try:
             payload = json.loads(raw)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid <tool_call> JSON: {exc}") from exc
+        except Exception:
+            # Treat malformed tool calls as plain text (keep in output).
+            continue
+
         name = payload.get("name")
         if not isinstance(name, str) or not name.strip():
-            raise HTTPException(status_code=400, detail="Invalid <tool_call>: missing 'name' string.")
+            continue
+
         arguments = payload.get("arguments", {})
         if isinstance(arguments, str):
             arguments_json = arguments
         else:
             try:
                 arguments_json = json.dumps(arguments, ensure_ascii=False)
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid <tool_call> arguments JSON: {exc}") from exc
+            except Exception:
+                continue
+
+        out.append(text[last : match.start()])
+        last = match.end()
         tool_calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex}",
@@ -44,7 +50,8 @@ def extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
             }
         )
 
-    cleaned = _TOOL_CALL_RE.sub("", text).strip()
+    out.append(text[last:])
+    cleaned = "".join(out).strip()
     return cleaned, tool_calls
 
 
