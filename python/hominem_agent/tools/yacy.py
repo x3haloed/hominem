@@ -19,6 +19,21 @@ _DEFAULT_BASE_URL = "http://127.0.0.1:8090"
 _DEFAULT_TIMEOUT_S = 10
 _MAX_LIMIT = 20
 _MAX_OFFSET = 100
+_MAX_SNIPPET_CHARS = 600
+
+
+def _truncate_text(value: Any, *, max_chars: int = _MAX_SNIPPET_CHARS) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        value = "\n".join(str(x) for x in value if x is not None)
+    s = str(value)
+    s = s.strip()
+    if not s:
+        return None
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars].rstrip() + "…"
 
 
 def _get_base_url() -> str:
@@ -107,16 +122,21 @@ def _normalize_result(item: Dict[str, Any]) -> Dict[str, Any]:
             break
 
     snippet = None
-    for key in ("snippet", "description", "description_txt", "text_t", "content"):
+    # Prefer short summary fields; avoid full-text fields like `text_t` unless needed.
+    for key in ("snippet", "description", "description_txt", "bold_txt", "h1_txt", "h2_txt", "content"):
         if key in item:
             snippet = item.get(key)
             break
+    if snippet is None and "text_t" in item:
+        snippet = item.get("text_t")
 
     score = item.get("score")
+    if score is None and "ranking" in item:
+        score = item.get("ranking")
     return {
         "title": str(title) if title is not None else None,
         "url": str(url) if url is not None else None,
-        "snippet": str(snippet) if snippet is not None else None,
+        "snippet": _truncate_text(snippet),
         "score": score,
         "source": "yacy",
     }
@@ -138,15 +158,19 @@ def _parse_solr_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _parse_yacysearch_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    items = None
-    for key in ("channels", "items", "results", "links"):
-        if key in payload:
-            items = payload.get(key)
-            break
-    if isinstance(items, dict):
-        items = items.get("items") or items.get("results")
-    if not isinstance(items, list):
-        return []
+    # YaCy yacysearch.json returns: {"channels":[{"items":[...], ...}], ...}
+    if isinstance(payload.get("channels"), list) and payload["channels"]:
+        chan0 = payload["channels"][0]
+        if isinstance(chan0, dict) and isinstance(chan0.get("items"), list):
+            items = chan0.get("items")
+        else:
+            items = []
+    else:
+        items = payload.get("items") or payload.get("results") or payload.get("links")
+        if isinstance(items, dict):
+            items = items.get("items") or items.get("results")
+        if not isinstance(items, list):
+            return []
     results: List[Dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict):
@@ -192,10 +216,10 @@ def search(
 
     endpoints = []
     fmt = (format or "auto").strip().lower()
-    if fmt in {"solr", "auto"}:
-        endpoints.append(("solr", f"{base_url}/solr/select"))
     if fmt in {"yacysearch_json", "auto"}:
         endpoints.append(("yacysearch_json", f"{base_url}/yacysearch.json"))
+    if fmt in {"solr", "auto"}:
+        endpoints.append(("solr", f"{base_url}/solr/select"))
 
     last_error = None
     for name, url in endpoints:
@@ -209,6 +233,11 @@ def search(
                         "rows": limit,
                         "start": offset,
                         "wt": "json",
+                        # Improve relevance and keep payload small.
+                        "defType": "edismax",
+                        "q.op": "AND",
+                        "qf": "title^5 h1_txt^3 description_txt^2 text_t^1",
+                        "fl": "sku,id,title,description_txt,score",
                     },
                 )
                 results = _parse_solr_results(payload)
@@ -220,6 +249,9 @@ def search(
                         "count": limit,
                         "start": offset,
                         "format": "json",
+                        # Prefer global/distributed results when available.
+                        "resource": "global",
+                        "contentdom": "text",
                     },
                 )
                 results = _parse_yacysearch_results(payload)
