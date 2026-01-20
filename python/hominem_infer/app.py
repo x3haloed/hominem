@@ -42,6 +42,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str = DEFAULT_MODEL_ID
     messages: List[Dict[str, Any]]
+    response_format: Dict[str, Any] | None = None
     stream: bool | None = False
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -59,6 +60,7 @@ class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     input: Any
     model: str = DEFAULT_MODEL_ID
+    response_format: Dict[str, Any] | None = None
     max_output_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -276,6 +278,56 @@ def _responses_input_to_messages(payload: ResponsesRequest) -> List[Dict[str, An
     raise HTTPException(status_code=400, detail="Unsupported responses input format.")
 
 
+def _maybe_get_structured_outputs_logits_processors(
+    payload: Any,
+    *,
+    processor: Any,
+    model: Any | None = None,
+) -> List[Any] | None:
+    response_format = getattr(payload, "response_format", None)
+    if not isinstance(response_format, dict):
+        return None
+
+    if response_format.get("type") != "json_schema":
+        return None
+
+    json_schema = response_format.get("json_schema")
+    if not isinstance(json_schema, dict):
+        raise HTTPException(status_code=400, detail="response_format.json_schema must be an object.")
+
+    schema = json_schema.get("schema")
+    if not isinstance(schema, dict):
+        raise HTTPException(status_code=400, detail="response_format.json_schema.schema must be an object.")
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    try:
+        from mlx_vlm.structured_outputs import build_outlines_json_schema_logits_processor
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Structured outputs requested but mlx_vlm structured outputs helpers are unavailable: {exc}",
+        ) from exc
+
+    try:
+        eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None) if model is not None else None
+        proc = build_outlines_json_schema_logits_processor(
+            tokenizer=tokenizer,
+            schema=schema,
+            eos_token_id=eos_token_id,
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Structured outputs requested but Outlines/Outlines Core is unavailable: {exc}",
+        ) from exc
+    except TypeError as exc:
+        raise HTTPException(status_code=500, detail=f"Structured outputs configuration error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid response_format.json_schema.schema: {exc}") from exc
+
+    return [proc]
+
+
 @app.get("/v1/models")
 def list_models() -> ModelList:
     return ModelList(data=[{"id": DEFAULT_MODEL_ID, "object": "model"}])
@@ -417,6 +469,10 @@ def chat_completions(payload: ChatCompletionRequest):
     max_tokens = payload.max_tokens or payload.max_completion_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
     top_p = payload.top_p if payload.top_p is not None else 1.0
+
+    logits_processors = _maybe_get_structured_outputs_logits_processors(payload, processor=processor, model=model)
+    if logits_processors is not None:
+        kwargs["logits_processors"] = logits_processors
 
     if payload.stream:
         def stream_generator():
@@ -746,6 +802,10 @@ def responses(payload: ResponsesRequest):
     max_tokens = payload.max_output_tokens
     temperature = payload.temperature if payload.temperature is not None else 0.2
     top_p = payload.top_p if payload.top_p is not None else 1.0
+
+    logits_processors = _maybe_get_structured_outputs_logits_processors(payload, processor=processor, model=model)
+    if logits_processors is not None:
+        kwargs["logits_processors"] = logits_processors
 
     if payload.stream:
         def stream_generator():
