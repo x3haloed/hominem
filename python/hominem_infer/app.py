@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 import time
 import uuid
+import logging
 from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -16,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from hominem_infer.events import EventWriter
+from hominem_infer import media as infer_media
 from hominem_infer.media import extract_media, materialize_video_path, normalize_video_elements
 from hominem_infer.parsing import ThinkStreamParser, extract_reasoning_from_text, extract_tool_calls_from_text
 from hominem_observability.trace import get_trace_id, new_trace_id, set_trace_id, trace_event
@@ -28,6 +31,7 @@ BACKEND = os.getenv("INFER_BACKEND", "mlx_vlm")
 
 _MODEL_CACHE: Dict[str, Any] = {}
 _MLX_LOCK = threading.Lock()
+_LOG = logging.getLogger("hominem_infer")
 
 _DEBUG_PROMPT_DUMP_ENABLED = os.getenv("INFER_DEBUG_PROMPT_DUMP", "").strip().lower() in {
     "1",
@@ -121,6 +125,90 @@ def _stream_chunks(text: str, *, chunk_size: int = 40) -> Iterator[str]:
         return
     for i in range(0, len(text), chunk_size):
         yield text[i : i + chunk_size]
+
+
+def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize OpenAI-ish messages for the model chat template.
+
+    In particular:
+    - Map legacy `role="function"` to `role="tool"` so the template emits <tool_response>.
+    - Convert assistant `function_call` into OpenAI `tool_calls` so the template emits <tool_call>.
+
+    This is required because many orchestrators (incl. qwen-agent) still use `function_call`/`function`
+    while the template only understands `tool_calls`/`tool`.
+    """
+    out: List[Dict[str, Any]] = []
+    pending_tool_call_id: Optional[str] = None
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+
+        role = (msg.get("role") or "user").strip().lower()
+        if role == "developer":
+            role = "system"
+        if role == "function":
+            role = "tool"
+        if role not in {"system", "user", "assistant", "tool"}:
+            role = "user"
+
+        normalized: Dict[str, Any] = dict(msg)
+        normalized["role"] = role
+        if normalized.get("content") is None:
+            normalized["content"] = ""
+
+        # Convert `function_call` => `tool_calls`
+        if role == "assistant" and isinstance(normalized.get("function_call"), dict) and normalized.get("tool_calls") is None:
+            fc = normalized.get("function_call") or {}
+            tool_name = fc.get("name")
+            tool_args = fc.get("arguments", "{}")
+            try:
+                tool_args_json = tool_args if isinstance(tool_args, str) else json.dumps(tool_args, ensure_ascii=False)
+            except Exception:
+                tool_args_json = "{}"
+            function_id = None
+            extra = normalized.get("extra")
+            if isinstance(extra, dict):
+                function_id = extra.get("function_id") or extra.get("tool_call_id")
+            tool_call_id = function_id or f"call_{uuid.uuid4().hex}"
+            normalized["tool_calls"] = [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": str(tool_name or ""), "arguments": tool_args_json},
+                }
+            ]
+            pending_tool_call_id = tool_call_id
+            # Keep content empty; tool call will be emitted by template.
+            normalized.pop("function_call", None)
+
+        if role == "tool":
+            tool_call_id = (
+                normalized.get("tool_call_id")
+                or normalized.get("toolCallId")
+                or (normalized.get("extra", {}) or {}).get("function_id")
+                or (normalized.get("extra", {}) or {}).get("tool_call_id")
+            )
+            if not tool_call_id and pending_tool_call_id:
+                tool_call_id = pending_tool_call_id
+            if tool_call_id:
+                normalized["tool_call_id"] = tool_call_id
+                pending_tool_call_id = None
+
+        out.append(normalized)
+
+    return out
+
+
+def _preview(obj: Any, *, max_len: int = 6000) -> Any:
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(obj)
+    if len(s) <= max_len:
+        return obj
+    return s[:max_len] + "…<truncated>"
 
 
 def _usage_stub() -> Dict[str, int]:
@@ -394,7 +482,66 @@ def chat_completions(payload: ChatCompletionRequest):
 
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
-    normalized_messages, video_specs = normalize_video_elements(payload.messages)
+    normalized_messages = _normalize_messages(payload.messages)
+    if not normalized_messages:
+        _LOG.warning("Empty messages after normalization (raw=%r)", payload.messages)
+        trace_event(
+            "infer.chat_completions.invalid_messages",
+            {"model": model_id, "messages": payload.messages},
+            source="hominem_infer",
+        )
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+    trace_event(
+        "infer.messages.normalized",
+        {
+            "endpoint": "chat_completions",
+            "model": model_id,
+            "normalized_len": len(normalized_messages),
+            "roles": [m.get("role") for m in normalized_messages[:20] if isinstance(m, dict)],
+            "first_message_types": [type(m).__name__ for m in normalized_messages[:5]],
+            "preview": _preview(normalized_messages),
+        },
+        source="hominem_infer",
+    )
+    normalized_messages, video_specs = normalize_video_elements(normalized_messages)
+    if not normalized_messages:
+        try:
+            media_file = inspect.getsourcefile(infer_media.normalize_video_elements)
+        except Exception:
+            media_file = None
+        try:
+            first_type = type((payload.messages or [None])[0]).__name__
+        except Exception:
+            first_type = None
+        _LOG.warning(
+            "Empty messages after video normalization (media=%r first_type=%r raw=%r)",
+            media_file,
+            first_type,
+            payload.messages,
+        )
+        trace_event(
+            "infer.messages.video_normalize.empty",
+            {
+                "endpoint": "chat_completions",
+                "model": model_id,
+                "media_file": media_file,
+                "first_type": first_type,
+                "raw_preview": _preview(payload.messages),
+            },
+            source="hominem_infer",
+        )
+        trace_event(
+            "infer.chat_completions.invalid_messages",
+            {
+                "model": model_id,
+                "messages": payload.messages,
+                "stage": "post_video_normalize",
+                "media_file": media_file,
+                "first_type": first_type,
+            },
+            source="hominem_infer",
+        )
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
     images, audio = extract_media(normalized_messages)
     trace_event(
         "infer.chat_completions.request",
@@ -834,7 +981,66 @@ def responses(payload: ResponsesRequest):
     model_id = payload.model or DEFAULT_MODEL_ID
     model, processor, config = _mlx_load_model(model_id, payload.adapter_path)
     messages = _responses_input_to_messages(payload)
-    normalized_messages, video_specs = normalize_video_elements(messages)
+    normalized_messages = _normalize_messages(messages)
+    if not normalized_messages:
+        _LOG.warning("Empty messages after normalization (raw=%r)", messages)
+        trace_event(
+            "infer.responses.invalid_messages",
+            {"model": model_id, "messages": messages},
+            source="hominem_infer",
+        )
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+    trace_event(
+        "infer.messages.normalized",
+        {
+            "endpoint": "responses",
+            "model": model_id,
+            "normalized_len": len(normalized_messages),
+            "roles": [m.get("role") for m in normalized_messages[:20] if isinstance(m, dict)],
+            "first_message_types": [type(m).__name__ for m in normalized_messages[:5]],
+            "preview": _preview(normalized_messages),
+        },
+        source="hominem_infer",
+    )
+    normalized_messages, video_specs = normalize_video_elements(normalized_messages)
+    if not normalized_messages:
+        try:
+            media_file = inspect.getsourcefile(infer_media.normalize_video_elements)
+        except Exception:
+            media_file = None
+        try:
+            first_type = type((messages or [None])[0]).__name__
+        except Exception:
+            first_type = None
+        _LOG.warning(
+            "Empty messages after video normalization (media=%r first_type=%r raw=%r)",
+            media_file,
+            first_type,
+            messages,
+        )
+        trace_event(
+            "infer.messages.video_normalize.empty",
+            {
+                "endpoint": "responses",
+                "model": model_id,
+                "media_file": media_file,
+                "first_type": first_type,
+                "raw_preview": _preview(messages),
+            },
+            source="hominem_infer",
+        )
+        trace_event(
+            "infer.responses.invalid_messages",
+            {
+                "model": model_id,
+                "messages": messages,
+                "stage": "post_video_normalize",
+                "media_file": media_file,
+                "first_type": first_type,
+            },
+            source="hominem_infer",
+        )
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
     images, audio = extract_media(normalized_messages)
     trace_event(
         "infer.responses.request",
