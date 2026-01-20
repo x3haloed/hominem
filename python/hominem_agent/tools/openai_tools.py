@@ -63,7 +63,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Search the local index and return structured results.",
+            "description": "Search the internet.",
             "parameters": {
                 "type": "object",
                 "properties": {
