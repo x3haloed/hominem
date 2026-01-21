@@ -8,6 +8,7 @@ function schemas and execution functions.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -258,6 +259,57 @@ TOOL_FUNCTIONS = {
 }
 
 
+_ABS_PATH_SUBSTR_RE = re.compile(
+    r"(?P<p>"
+    r"(?:/Users/[^ \n\t\"'<>]+)"
+    r"|(?:/home/[^ \n\t\"'<>]+)"
+    r"|(?:/private/[^ \n\t\"'<>]+)"
+    r"|(?:/var/[^ \n\t\"'<>]+)"
+    r"|(?:/tmp/[^ \n\t\"'<>]+)"
+    r"|(?:[A-Za-z]:\\\\[^ \n\t\"'<>]+)"
+    r")"
+)
+
+
+def _redact_path_token(p: str) -> str:
+    try:
+        name = Path(p).name
+    except Exception:
+        name = "redacted"
+    return f"<path:{name or 'redacted'}>"
+
+
+def _redact_paths_in_string(s: str) -> str:
+    if not s:
+        return s
+    return _ABS_PATH_SUBSTR_RE.sub(lambda m: _redact_path_token(m.group("p")), s)
+
+
+def _sanitize_tool_result(obj: Any) -> Any:
+    """
+    Remove local on-disk file paths from tool outputs before they are exposed to the model.
+    Tool *inputs* may still require absolute paths; this only affects returned content.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return _redact_paths_in_string(obj)
+    if isinstance(obj, (int, float, bool)):
+        return obj
+    if isinstance(obj, list):
+        return [_sanitize_tool_result(x) for x in obj]
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() in {"path", "filepath", "file_path", "filename", "canonical_path", "state_path"}:
+                if isinstance(v, str):
+                    out[k] = _redact_path_token(v) if (v.startswith(("/", "\\")) or (":\\" in v)) else v
+                    continue
+            out[k] = _sanitize_tool_result(v)
+        return out
+    return obj
+
+
 def execute_tool(tool_name: str, **kwargs) -> Any:
     """Execute a tool by name with the given arguments."""
     if tool_name not in TOOL_FUNCTIONS:
@@ -280,4 +332,4 @@ def execute_tool(tool_name: str, **kwargs) -> Any:
         TOOL_FUNCTIONS["fetch_markdown"] = fetch_markdown
         TOOL_FUNCTIONS["fetch_json"] = fetch_json
         func = TOOL_FUNCTIONS[tool_name]
-    return func(**kwargs)
+    return _sanitize_tool_result(func(**kwargs))

@@ -226,8 +226,6 @@ class RlmStore:
         lines: List[str] = []
         lines.append("# RLM View")
         lines.append("")
-        lines.append(f"- canonical_path: {self.canonical_path}")
-        lines.append(f"- state_path: {self.state_path}")
         lines.append(f"- canonical_records_shown: {len(recs)}")
         lines.append(f"- canonical_next_cursor: {next_cursor}")
         lines.append("")
@@ -264,4 +262,3 @@ def get_store() -> RlmStore:
     if _STORE is None:
         _STORE = RlmStore.from_env()
     return _STORE
-
