@@ -16,6 +16,27 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "rlm_repl",
+            "description": "RLM state access tool: view/search/messages/working_memory/commitments.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action name (view, search, get_messages, mem_get, mem_set, commit_add, commit_list, commit_resolve).",
+                    },
+                    "query": {"type": "string", "description": "Search query or key/cursor depending on action."},
+                    "limit": {"type": "integer", "description": "Limit for search/get_messages/commit_list."},
+                    "text": {"type": "string", "description": "Text value for mem_set / commit_add / commit_resolve."},
+                    "cid": {"type": "string", "description": "Commitment id for commit_resolve."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "describe_file",
             "description": "Describe a local file (outline for .py, otherwise head preview). Accepts absolute paths.",
             "parameters": {
@@ -226,6 +247,7 @@ def replace_section(path: str, selector: str, value: str) -> Dict[str, Any]:
 
 # Tool execution dispatcher
 TOOL_FUNCTIONS = {
+    "rlm_repl": None,
     "describe_file": describe_file,
     "extract_section": extract_section,
     "replace_section": replace_section,
@@ -241,6 +263,11 @@ def execute_tool(tool_name: str, **kwargs) -> Any:
     if tool_name not in TOOL_FUNCTIONS:
         raise ValueError(f"Unknown tool: {tool_name}")
     func = TOOL_FUNCTIONS[tool_name]
+    if func is None and tool_name == "rlm_repl":
+        from hominem_agent.rlm.tool import rlm_repl
+
+        TOOL_FUNCTIONS["rlm_repl"] = rlm_repl
+        func = TOOL_FUNCTIONS[tool_name]
     if func is None and tool_name in {"search", "search_status"}:
         from hominem_agent.tools.yacy import search, search_status
 
